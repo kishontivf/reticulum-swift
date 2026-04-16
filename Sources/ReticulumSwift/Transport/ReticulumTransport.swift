@@ -1060,10 +1060,27 @@ public actor ReticulumTransport {
                     logger.debug("PathEntry NOT found for dest=\(destHex)")
                 }
 
+                // If the path entry references an interface we no longer have
+                // (e.g. stale path from a previous app run), invalidate it and
+                // fall back to broadcast so the packet still has a chance.
+                let resolvedEntry: PathEntry? = {
+                    guard let entry = pathEntry else { return nil }
+                    let outboundId = entry.interfaceId
+                    if !outboundId.isEmpty, interfaces[outboundId] == nil {
+                        logger.warning("Path entry references missing interface '\(outboundId)' — invalidating stale path to \(destHex)...")
+                        return nil
+                    }
+                    return entry
+                }()
+                if resolvedEntry == nil && pathEntry != nil {
+                    await pathTable.remove(destinationHash: packet.destination)
+                    await requestPath(for: packet.destination)
+                }
+
                 // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
                 // hops == 1 means destination is one hop away, send HEADER_1 directly
                 // hops > 1 means destination needs multi-hop routing via transport node
-                if let entry = pathEntry,
+                if let entry = resolvedEntry,
                    entry.hopCount > 1,
                    let nextHop = entry.nextHop {
                     // Convert to HEADER_2 for routed delivery (multi-hop)
@@ -1079,7 +1096,7 @@ public actor ReticulumTransport {
                     }
                 } else {
                     // Direct delivery (single hop or no path) - send as HEADER_1
-                    if let entry = pathEntry {
+                    if let entry = resolvedEntry {
                         if entry.hopCount > 1 && entry.nextHop == nil {
                             logger.warning("hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (transport will route)")
                         } else if entry.hopCount == 1 {
@@ -1395,16 +1412,23 @@ public actor ReticulumTransport {
         let interfaceId = pathEntry.interfaceId
         logger.debug("Found path to \(destHex)... via interface '\(interfaceId)'")
 
-        // Get the interface
+        // Get the interface. If it's missing (e.g. stored path references an
+        // interface from a previous app run), invalidate the stale path and
+        // re-request so a fresh path can be learned.
         guard let interface = interfaces[interfaceId] else {
-            logger.error("Interface '\(interfaceId)' not found in interfaces dict (have: \(Array(self.interfaces.keys)))")
-            throw TransportError.interfaceNotFound(id: interfaceId)
+            logger.warning("Interface '\(interfaceId)' not found (have: \(Array(self.interfaces.keys))) — invalidating stale path to \(destHex)...")
+            await pathTable.remove(destinationHash: destHash)
+            queuePendingPacket(packet, for: destHash)
+            await requestPath(for: destHash)
+            return
         }
 
-        // Check interface is connected
+        // Check interface is connected. If not, treat as transient — queue
+        // the packet but don't invalidate the path (interface may reconnect).
         guard interface.state == .connected else {
-            logger.error("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state)))")
-            throw TransportError.interfaceNotFound(id: interfaceId)
+            logger.warning("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state))) — queuing packet")
+            queuePendingPacket(packet, for: destHash)
+            return
         }
 
         // Send the packet
