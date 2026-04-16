@@ -238,34 +238,52 @@ public struct PathEntry: Codable, Sendable, Equatable {
     /// 3. NomadNet/propagation node format with name buried in complex structure
     public var displayName: String? {
         guard let data = appData, !data.isEmpty else { return nil }
+        let firstByte = data[data.startIndex]
 
-        // First try raw UTF-8 string
-        if let str = String(data: data, encoding: .utf8), !str.isEmpty {
-            // Check if it looks like valid text (not binary garbage)
-            let isPrintable = str.allSatisfy { $0.isLetter || $0.isNumber || $0.isPunctuation || $0.isWhitespace || $0 == "{" || $0 == "}" || $0 == "[" || $0 == "]" || $0 == ":" || $0 == "\"" }
-            if isPrintable {
-                return str
-            }
-        }
-
-        // Try msgpack format: [display_name, stamp_cost]
-        // Format: 92 (fixarray 2) | c4 XX (bin8 with XX bytes) | <string bytes> | c0 (nil)
-        if data.count >= 4 && data[0] == 0x92 {  // msgpack fixarray with 2 elements
-            if let name = extractMsgpackString(from: data, startingAt: 1) {
+        // Try msgpack structured formats first — they have unambiguous markers.
+        // LXMF delivery peers: 0x92 (fixarray 2) = [display_name, stamp_cost]
+        if firstByte == 0x92, data.count >= 4 {
+            if let name = extractMsgpackString(from: data, startingAt: 1),
+               !name.isEmpty {
                 return name
             }
         }
 
-        // Propagation node format: 97 (fixarray 7) with name in element[6] metadata dict
-        // Element[6] is a msgpack map with key 0x01 (PN_META_NAME) → name bytes
-        // Reference: Python LXMF.py pn_name_from_app_data()
-        if data.count >= 10 && data[0] == 0x97 {  // msgpack fixarray with 7 elements
-            if let name = extractPropagationNodeName(from: data) {
+        // LXMF propagation nodes: 0x97 (fixarray 7) with name buried in meta dict
+        if firstByte == 0x97, data.count >= 10 {
+            if let name = extractPropagationNodeName(from: data), !name.isEmpty {
                 return name
             }
+        }
+
+        // Fall back to raw UTF-8 (NomadNet nodes, transport node names, etc.).
+        // Reject only if the string contains control characters that would
+        // indicate binary garbage, NOT by whitelisting Unicode categories —
+        // that was rejecting valid names containing symbols like +, =, <, >, ^.
+        if let str = String(data: data, encoding: .utf8),
+           !str.isEmpty,
+           isLikelyPlainText(str) {
+            return str
         }
 
         return nil
+    }
+
+    /// Lenient printable check: reject strings that contain control characters
+    /// (other than whitespace) or a replacement character, which indicate
+    /// binary data rather than a real name.
+    private func isLikelyPlainText(_ str: String) -> Bool {
+        for scalar in str.unicodeScalars {
+            // U+FFFD REPLACEMENT CHARACTER — signals mis-decoded binary
+            if scalar.value == 0xFFFD { return false }
+            // Accept common whitespace explicitly
+            if scalar.value == 0x09 || scalar.value == 0x0A || scalar.value == 0x0D { continue }
+            // Reject C0/C1 controls (binary data or terminal escapes)
+            if scalar.value < 0x20 || (scalar.value >= 0x7F && scalar.value < 0xA0) {
+                return false
+            }
+        }
+        return true
     }
 
     /// Extract a msgpack string starting at the given offset.
