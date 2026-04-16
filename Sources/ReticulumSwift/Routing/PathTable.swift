@@ -17,6 +17,14 @@ import Foundation
 import SQLite3
 import os.log
 
+/// SQLite destructor sentinel meaning "copy the value; caller's buffer may be freed".
+/// SQLITE_STATIC is 0 (default when nil is passed). SQLITE_TRANSIENT is -1.
+/// This MUST be used whenever the value is backed by a Swift temporary buffer
+/// (e.g. `sqlite3_bind_text(..., someSwiftString, ...)`), otherwise SQLite
+/// holds a dangling pointer and reads corrupted bytes when the statement
+/// actually executes.
+private let SQLITE_TRANSIENT = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
 private let logger = Logger(subsystem: "net.reticulum", category: "PathTable")
 
 // MARK: - Path Table Errors
@@ -561,14 +569,14 @@ public actor PathTable {
         _ = entry.publicKeys.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 2, ptr.baseAddress, Int32(entry.publicKeys.count), nil)
         }
-        sqlite3_bind_text(stmt, 3, entry.interfaceId, -1, nil)
+        sqlite3_bind_text(stmt, 3, entry.interfaceId, -1, SQLITE_TRANSIENT)
         sqlite3_bind_int(stmt, 4, Int32(entry.hopCount))
         sqlite3_bind_double(stmt, 5, entry.timestamp.timeIntervalSince1970)
         sqlite3_bind_double(stmt, 6, entry.expires.timeIntervalSince1970)
 
         // random_blobs as JSON text
         let blobsJson = Self.encodeRandomBlobs(entry.randomBlobs)
-        sqlite3_bind_text(stmt, 7, blobsJson, -1, nil)
+        sqlite3_bind_text(stmt, 7, blobsJson, -1, SQLITE_TRANSIENT)
 
         if let ratchet = entry.ratchet {
             _ = ratchet.withUnsafeBytes { ptr in
