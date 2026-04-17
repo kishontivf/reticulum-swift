@@ -1425,9 +1425,15 @@ public actor ReticulumTransport {
 
         // Check interface is connected. If not, treat as transient — queue
         // the packet but don't invalidate the path (interface may reconnect).
+        // Also kick off a path re-request: if topology changed and the
+        // destination is now reachable via a different interface, the new
+        // announce will arrive and flush the queue. Without this, a queued
+        // packet can sit indefinitely if the interface never reconnects and
+        // the remote node doesn't happen to re-announce on its own.
         guard interface.state == .connected else {
-            logger.warning("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state))) — queuing packet")
+            logger.warning("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state))) — queuing packet and re-requesting path")
             queuePendingPacket(packet, for: destHash)
+            await requestPath(for: destHash)
             return
         }
 
