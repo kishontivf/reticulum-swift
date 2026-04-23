@@ -1060,10 +1060,42 @@ public actor ReticulumTransport {
                     logger.debug("PathEntry NOT found for dest=\(destHex)")
                 }
 
+                // If the path entry references an interface we no longer have
+                // (e.g. stale path from a previous app run), invalidate it and
+                // request a fresh path. We queue the packet in that case so
+                // processPendingPackets can re-send it once a new path arrives,
+                // instead of falling through to a broadcast.
+                let resolvedEntry: PathEntry? = {
+                    guard let entry = pathEntry else { return nil }
+                    let outboundId = entry.interfaceId
+                    if !outboundId.isEmpty, interfaces[outboundId] == nil {
+                        logger.warning("Path entry references missing interface '\(outboundId)' — invalidating stale path to \(destHex)...")
+                        return nil
+                    }
+                    return entry
+                }()
+                let hadStalePath = resolvedEntry == nil && pathEntry != nil
+                if hadStalePath, let staleInterfaceId = pathEntry?.interfaceId {
+                    // Queue FIRST — before any await that releases the actor. Both
+                    // pathTable.remove and requestPath have real suspension points;
+                    // an announce arriving during either would trigger
+                    // processPendingPackets on an empty queue, stranding this
+                    // packet until the next unsolicited announce.
+                    //
+                    // Use the conditional remove so that if an announce did arrive
+                    // during the suspension and replaced the entry with a fresh
+                    // interface id, we don't erase the just-learned path.
+                    queuePendingPacket(packet, for: packet.destination)
+                    await pathTable.remove(destinationHash: packet.destination, ifInterface: staleInterfaceId)
+                    await requestPath(for: packet.destination)
+                    logger.info("Queuing packet to \(destHex)... after invalidating stale path; broadcasting skipped")
+                    return
+                }
+
                 // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
                 // hops == 1 means destination is one hop away, send HEADER_1 directly
                 // hops > 1 means destination needs multi-hop routing via transport node
-                if let entry = pathEntry,
+                if let entry = resolvedEntry,
                    entry.hopCount > 1,
                    let nextHop = entry.nextHop {
                     // Convert to HEADER_2 for routed delivery (multi-hop)
@@ -1079,7 +1111,7 @@ public actor ReticulumTransport {
                     }
                 } else {
                     // Direct delivery (single hop or no path) - send as HEADER_1
-                    if let entry = pathEntry {
+                    if let entry = resolvedEntry {
                         if entry.hopCount > 1 && entry.nextHop == nil {
                             logger.warning("hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (transport will route)")
                         } else if entry.hopCount == 1 {
@@ -1395,16 +1427,34 @@ public actor ReticulumTransport {
         let interfaceId = pathEntry.interfaceId
         logger.debug("Found path to \(destHex)... via interface '\(interfaceId)'")
 
-        // Get the interface
+        // Get the interface. If it's missing (e.g. stored path references an
+        // interface from a previous app run), invalidate the stale path and
+        // re-request so a fresh path can be learned.
         guard let interface = interfaces[interfaceId] else {
-            logger.error("Interface '\(interfaceId)' not found in interfaces dict (have: \(Array(self.interfaces.keys)))")
-            throw TransportError.interfaceNotFound(id: interfaceId)
+            logger.warning("Interface '\(interfaceId)' not found (have: \(Array(self.interfaces.keys))) — invalidating stale path to \(destHex)...")
+            // Queue before any await to avoid the actor-reentrancy race where
+            // an announce arriving during pathTable.remove or requestPath
+            // triggers processPendingPackets on an empty queue. Use the
+            // conditional remove so a fresh announce that landed during our
+            // suspension isn't overwritten by our invalidation.
+            queuePendingPacket(packet, for: destHash)
+            await pathTable.remove(destinationHash: destHash, ifInterface: interfaceId)
+            await requestPath(for: destHash)
+            return
         }
 
-        // Check interface is connected
+        // Check interface is connected. If not, treat as transient — queue
+        // the packet but don't invalidate the path (interface may reconnect).
+        // Also kick off a path re-request: if topology changed and the
+        // destination is now reachable via a different interface, the new
+        // announce will arrive and flush the queue. Without this, a queued
+        // packet can sit indefinitely if the interface never reconnects and
+        // the remote node doesn't happen to re-announce on its own.
         guard interface.state == .connected else {
-            logger.error("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state)))")
-            throw TransportError.interfaceNotFound(id: interfaceId)
+            logger.warning("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state))) — queuing packet and re-requesting path")
+            queuePendingPacket(packet, for: destHash)
+            await requestPath(for: destHash)
+            return
         }
 
         // Send the packet
@@ -3072,9 +3122,14 @@ public actor ReticulumTransport {
         let hexPrefix = destinationHash.prefix(4).map { String(format: "%02x", $0) }.joined()
         logger.info("Processing \(packets.count, privacy: .public) pending packet(s) for \(hexPrefix, privacy: .public)...")
 
+        // Re-route through send(packet:) rather than sendViaPath directly so
+        // HEADER_1 packets get the proper convertToHeader2 treatment when the
+        // freshly-learned path has hopCount > 1. Calling sendViaPath on a
+        // HEADER_1 packet would transmit the wrong header type to the next
+        // transport node.
         for packet in packets {
             do {
-                try await sendViaPath(packet)
+                try await send(packet: packet)
                 logger.debug("Pending packet sent successfully")
             } catch {
                 logger.warning("Failed to send pending packet: \(error.localizedDescription, privacy: .public)")
@@ -3093,6 +3148,15 @@ public actor ReticulumTransport {
     /// - Returns: Array of queued packets, or nil if none
     public func getPendingPackets(for destinationHash: Data) -> [Packet]? {
         return pendingPackets[destinationHash]
+    }
+
+    /// Test hook: synchronously process queued packets for a destination.
+    /// Production code flushes the queue as a side effect of recording a new
+    /// path (see `recordPath` call sites) — this entry point lets unit tests
+    /// exercise the flush behavior without reconstructing the full announce
+    /// pipeline.
+    internal func testFlushPendingPackets(for destinationHash: Data) async {
+        await processPendingPackets(for: destinationHash)
     }
 
     // MARK: - Path Request Handler
