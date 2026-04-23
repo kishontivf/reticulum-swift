@@ -1062,7 +1062,9 @@ public actor ReticulumTransport {
 
                 // If the path entry references an interface we no longer have
                 // (e.g. stale path from a previous app run), invalidate it and
-                // fall back to broadcast so the packet still has a chance.
+                // request a fresh path. We queue the packet in that case so
+                // processPendingPackets can re-send it once a new path arrives,
+                // instead of falling through to a broadcast.
                 let resolvedEntry: PathEntry? = {
                     guard let entry = pathEntry else { return nil }
                     let outboundId = entry.interfaceId
@@ -1072,9 +1074,13 @@ public actor ReticulumTransport {
                     }
                     return entry
                 }()
-                if resolvedEntry == nil && pathEntry != nil {
+                let hadStalePath = resolvedEntry == nil && pathEntry != nil
+                if hadStalePath {
                     await pathTable.remove(destinationHash: packet.destination)
                     await requestPath(for: packet.destination)
+                    queuePendingPacket(packet, for: packet.destination)
+                    logger.info("Queuing packet to \(destHex)... after invalidating stale path; broadcasting skipped")
+                    return
                 }
 
                 // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
