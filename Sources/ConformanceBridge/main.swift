@@ -1610,6 +1610,13 @@ func handleCommand(_ req: Request) throws -> Result {
             "value": num(valid ? zeros : 0)
         ]
 
+    case "behavioral_start",
+         "behavioral_stop",
+         "behavioral_attach_mock_interface",
+         "behavioral_inject",
+         "behavioral_drain_tx":
+        return try handleBehavioralCommand(req.command, p)
+
     default:
         throw BridgeError.unknownCommand(req.command)
     }
