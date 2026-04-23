@@ -148,9 +148,11 @@ public actor AnnounceTable {
             retransmitTimeout = now
             retries = TransportConstants.PATHFINDER_R
         } else {
-            // Random jitter before first retransmission, plus any extra delay (E6)
-            // Python Transport.py:1764: retransmit_timeout = now + pathfinder_G + random() * pathfinder_RW
-            retransmitTimeout = now.addingTimeInterval(extraDelay + TransportConstants.PATHFINDER_G + Double.random(in: 0...TransportConstants.PATHFINDER_RW))
+            // Random jitter before first retransmission, plus any extra delay (E6).
+            // Python Transport.py:1728: retransmit_timeout = now + rand() * PATHFINDER_RW
+            // (PATHFINDER_G is added by Python only on *subsequent* retries after a
+            // successful rebroadcast, not on the initial insert.)
+            retransmitTimeout = now.addingTimeInterval(extraDelay + Double.random(in: 0...TransportConstants.PATHFINDER_RW))
             retries = 0
         }
 
