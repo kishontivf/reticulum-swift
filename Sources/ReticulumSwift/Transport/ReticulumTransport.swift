@@ -1075,14 +1075,18 @@ public actor ReticulumTransport {
                     return entry
                 }()
                 let hadStalePath = resolvedEntry == nil && pathEntry != nil
-                if hadStalePath {
+                if hadStalePath, let staleInterfaceId = pathEntry?.interfaceId {
                     // Queue FIRST — before any await that releases the actor. Both
                     // pathTable.remove and requestPath have real suspension points;
                     // an announce arriving during either would trigger
                     // processPendingPackets on an empty queue, stranding this
                     // packet until the next unsolicited announce.
+                    //
+                    // Use the conditional remove so that if an announce did arrive
+                    // during the suspension and replaced the entry with a fresh
+                    // interface id, we don't erase the just-learned path.
                     queuePendingPacket(packet, for: packet.destination)
-                    await pathTable.remove(destinationHash: packet.destination)
+                    await pathTable.remove(destinationHash: packet.destination, ifInterface: staleInterfaceId)
                     await requestPath(for: packet.destination)
                     logger.info("Queuing packet to \(destHex)... after invalidating stale path; broadcasting skipped")
                     return
@@ -1430,9 +1434,11 @@ public actor ReticulumTransport {
             logger.warning("Interface '\(interfaceId)' not found (have: \(Array(self.interfaces.keys))) — invalidating stale path to \(destHex)...")
             // Queue before any await to avoid the actor-reentrancy race where
             // an announce arriving during pathTable.remove or requestPath
-            // triggers processPendingPackets on an empty queue.
+            // triggers processPendingPackets on an empty queue. Use the
+            // conditional remove so a fresh announce that landed during our
+            // suspension isn't overwritten by our invalidation.
             queuePendingPacket(packet, for: destHash)
-            await pathTable.remove(destinationHash: destHash)
+            await pathTable.remove(destinationHash: destHash, ifInterface: interfaceId)
             await requestPath(for: destHash)
             return
         }

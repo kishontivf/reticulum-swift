@@ -781,6 +781,26 @@ public actor PathTable {
         removeFromDatabase(destinationHash)
     }
 
+    /// Atomically remove a path only if it currently references the given
+    /// interface id. Use when invalidating a stale entry whose interface is
+    /// missing: if a fresh announce for the same destination has replaced the
+    /// entry with a different interface id, this call becomes a no-op so the
+    /// freshly-learned path is preserved.
+    ///
+    /// - Parameters:
+    ///   - destinationHash: 16-byte destination hash
+    ///   - interfaceId: the interface id the stale entry was expected to reference
+    /// - Returns: true if the entry was removed, false if it was preserved or absent
+    @discardableResult
+    public func remove(destinationHash: Data, ifInterface interfaceId: String) -> Bool {
+        guard let current = paths[destinationHash], current.interfaceId == interfaceId else {
+            return false
+        }
+        paths.removeValue(forKey: destinationHash)
+        removeFromDatabase(destinationHash)
+        return true
+    }
+
     /// Remove all paths from the table and database.
     public func removeAll() {
         paths.removeAll()
