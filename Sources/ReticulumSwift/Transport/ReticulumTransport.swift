@@ -3150,6 +3150,15 @@ public actor ReticulumTransport {
         return pendingPackets[destinationHash]
     }
 
+    /// Test hook: synchronously process queued packets for a destination.
+    /// Production code flushes the queue as a side effect of recording a new
+    /// path (see `recordPath` call sites) — this entry point lets unit tests
+    /// exercise the flush behavior without reconstructing the full announce
+    /// pipeline.
+    internal func testFlushPendingPackets(for destinationHash: Data) async {
+        await processPendingPackets(for: destinationHash)
+    }
+
     // MARK: - Path Request Handler
 
     /// Register the PLAIN destination for receiving path requests from other nodes.
