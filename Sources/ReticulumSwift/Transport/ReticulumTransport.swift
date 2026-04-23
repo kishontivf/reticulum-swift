@@ -3108,9 +3108,14 @@ public actor ReticulumTransport {
         let hexPrefix = destinationHash.prefix(4).map { String(format: "%02x", $0) }.joined()
         logger.info("Processing \(packets.count, privacy: .public) pending packet(s) for \(hexPrefix, privacy: .public)...")
 
+        // Re-route through send(packet:) rather than sendViaPath directly so
+        // HEADER_1 packets get the proper convertToHeader2 treatment when the
+        // freshly-learned path has hopCount > 1. Calling sendViaPath on a
+        // HEADER_1 packet would transmit the wrong header type to the next
+        // transport node.
         for packet in packets {
             do {
-                try await sendViaPath(packet)
+                try await send(packet: packet)
                 logger.debug("Pending packet sent successfully")
             } catch {
                 logger.warning("Failed to send pending packet: \(error.localizedDescription, privacy: .public)")
