@@ -1076,9 +1076,14 @@ public actor ReticulumTransport {
                 }()
                 let hadStalePath = resolvedEntry == nil && pathEntry != nil
                 if hadStalePath {
+                    // Order matters: queue BEFORE awaiting requestPath. Otherwise
+                    // the actor releases during requestPath's interface.send
+                    // suspension; an announce that arrives during that window
+                    // triggers processPendingPackets on an empty queue, stranding
+                    // this packet until the next unsolicited announce.
                     await pathTable.remove(destinationHash: packet.destination)
-                    await requestPath(for: packet.destination)
                     queuePendingPacket(packet, for: packet.destination)
+                    await requestPath(for: packet.destination)
                     logger.info("Queuing packet to \(destHex)... after invalidating stale path; broadcasting skipped")
                     return
                 }
