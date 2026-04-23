@@ -1076,13 +1076,13 @@ public actor ReticulumTransport {
                 }()
                 let hadStalePath = resolvedEntry == nil && pathEntry != nil
                 if hadStalePath {
-                    // Order matters: queue BEFORE awaiting requestPath. Otherwise
-                    // the actor releases during requestPath's interface.send
-                    // suspension; an announce that arrives during that window
-                    // triggers processPendingPackets on an empty queue, stranding
-                    // this packet until the next unsolicited announce.
-                    await pathTable.remove(destinationHash: packet.destination)
+                    // Queue FIRST — before any await that releases the actor. Both
+                    // pathTable.remove and requestPath have real suspension points;
+                    // an announce arriving during either would trigger
+                    // processPendingPackets on an empty queue, stranding this
+                    // packet until the next unsolicited announce.
                     queuePendingPacket(packet, for: packet.destination)
+                    await pathTable.remove(destinationHash: packet.destination)
                     await requestPath(for: packet.destination)
                     logger.info("Queuing packet to \(destHex)... after invalidating stale path; broadcasting skipped")
                     return
@@ -1428,8 +1428,11 @@ public actor ReticulumTransport {
         // re-request so a fresh path can be learned.
         guard let interface = interfaces[interfaceId] else {
             logger.warning("Interface '\(interfaceId)' not found (have: \(Array(self.interfaces.keys))) — invalidating stale path to \(destHex)...")
-            await pathTable.remove(destinationHash: destHash)
+            // Queue before any await to avoid the actor-reentrancy race where
+            // an announce arriving during pathTable.remove or requestPath
+            // triggers processPendingPackets on an empty queue.
             queuePendingPacket(packet, for: destHash)
+            await pathTable.remove(destinationHash: destHash)
             await requestPath(for: destHash)
             return
         }
