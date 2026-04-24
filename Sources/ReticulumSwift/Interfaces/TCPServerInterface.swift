@@ -68,12 +68,19 @@ public final class TCPSpawnedPeerInterface: NetworkInterface, @unchecked Sendabl
         return _bytesSent
     }
 
+    /// Fired exactly once when this peer transitions to `.disconnected`.
+    /// The parent server uses this to evict the peer from its
+    /// `_spawnedPeers` map so the dictionary doesn't grow unbounded over
+    /// the lifetime of the listener.
+    var onDisconnect: ((String) -> Void)?
+
     // MARK: - Internal mutable state (lock-guarded)
     private let lock = NSLock()
     private var _state: InterfaceState = .disconnected
     private var _bytesSent: UInt64 = 0
     private var _modeOverride: InterfaceMode?
     private var _delegate: InterfaceDelegate?
+    private var _firedDisconnect: Bool = false
     private let connection: NWConnection
     private let queue: DispatchQueue
     private var framed: FramedTransport?
@@ -200,11 +207,25 @@ public final class TCPSpawnedPeerInterface: NetworkInterface, @unchecked Sendabl
 
     private func setState(_ new: InterfaceState) {
         let d: InterfaceDelegate?
+        let disconnectCb: ((String) -> Void)?
         lock.lock()
         _state = new
         d = _delegate
+        // Fire onDisconnect exactly once per peer lifetime so the parent
+        // server can evict us from its _spawnedPeers map. Without this
+        // eviction, disconnected peers accumulate indefinitely over the
+        // server's lifetime — send() would silently try to deliver to
+        // them on every subsequent broadcast and spawnedPeers iteration
+        // (e.g. wire_set_interface_mode) would walk stale entries.
+        if new == .disconnected, !_firedDisconnect {
+            _firedDisconnect = true
+            disconnectCb = onDisconnect
+        } else {
+            disconnectCb = nil
+        }
         lock.unlock()
         d?.interface(id: id, didChangeState: new)
+        disconnectCb?(id)
     }
 }
 
@@ -449,6 +470,17 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
         // config.mode while the parent is in an override state).
         if let override = modeOverride {
             peer.modeOverride = override
+        }
+        // Evict on disconnect so the _spawnedPeers map doesn't grow
+        // unbounded over the listener's lifetime. Without this, every
+        // broadcast send() would silently try to deliver to peers that
+        // have long since gone away, and spawnedPeers iterators (e.g.
+        // wire_set_interface_mode) would walk stale entries.
+        peer.onDisconnect = { [weak self] id in
+            guard let self else { return }
+            self.lock.lock()
+            self._spawnedPeers.removeValue(forKey: id)
+            self.lock.unlock()
         }
         lock.lock()
         _spawnedPeers[spawnedId] = peer
