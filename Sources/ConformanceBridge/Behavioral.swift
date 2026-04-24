@@ -16,6 +16,7 @@
 //  Protocol reference: reticulum-conformance/reference/behavioral_transport.py
 //
 
+import CryptoKit
 import Foundation
 import ReticulumSwift
 
@@ -85,14 +86,36 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
 // MARK: - Instance registry
 
 /// State for a single behavioral_start handle.
+///
+/// `interfaces` is serialized by a dedicated lock rather than relying on the
+/// main readLine-loop's dispatch ordering. Bridge commands happen on that
+/// loop but `startRetransmissionLoop` spins a background Task on the actor
+/// that can race here if future changes move interface reads off the I/O
+/// thread.
 final class BehavioralInstance: @unchecked Sendable {
     let transport: ReticulumTransport
     let identity: Identity
-    var interfaces: [String: BehavioralMockInterface] = [:]
+    private var _interfaces: [String: BehavioralMockInterface] = [:]
+    private let interfacesLock = NSLock()
 
     init(transport: ReticulumTransport, identity: Identity) {
         self.transport = transport
         self.identity = identity
+    }
+
+    func setInterface(_ iface: BehavioralMockInterface, forId id: String) {
+        interfacesLock.lock(); defer { interfacesLock.unlock() }
+        _interfaces[id] = iface
+    }
+
+    func interface(forId id: String) -> BehavioralMockInterface? {
+        interfacesLock.lock(); defer { interfacesLock.unlock() }
+        return _interfaces[id]
+    }
+
+    func interfaceIds() -> [String] {
+        interfacesLock.lock(); defer { interfacesLock.unlock() }
+        return Array(_interfaces.keys)
     }
 }
 
@@ -116,6 +139,13 @@ private func parseInterfaceMode(_ raw: String) -> InterfaceMode {
     }
 }
 
+/// Maximum wall-clock wait for any blockingAsync operation. Bridge commands
+/// should complete within a couple of seconds; anything longer indicates a
+/// hung actor (e.g. startRetransmissionLoop deadlocking). Throw rather than
+/// block indefinitely so a flaky Transport bug doesn't turn into a wedged
+/// conformance runner that has to be SIGKILLed.
+private let blockingAsyncTimeout: DispatchTimeInterval = .seconds(30)
+
 /// Run an async operation to completion from a synchronous context.
 /// Bridge commands are dispatched synchronously by main.swift's readLine
 /// loop, but ReticulumTransport is an actor — this is the bridge between
@@ -132,15 +162,25 @@ func blockingAsync<T>(_ op: @Sendable @escaping () async throws -> T) throws -> 
         }
         sem.signal()
     }
-    sem.wait()
-    return try box.get()
+    switch sem.wait(timeout: .now() + blockingAsyncTimeout) {
+    case .success:
+        return try box.get()
+    case .timedOut:
+        throw BridgeError.invalidData("blockingAsync timed out after \(blockingAsyncTimeout) — bridge actor likely hung")
+    }
 }
 
 private final class ResultBox<T>: @unchecked Sendable {
     private var value: Swift.Result<T, Error>?
     private let lock = NSLock()
     func set(_ v: Swift.Result<T, Error>) { lock.lock(); value = v; lock.unlock() }
-    func get() throws -> T { lock.lock(); defer { lock.unlock() }; return try value!.get() }
+    func get() throws -> T {
+        lock.lock(); defer { lock.unlock() }
+        guard let value else {
+            throw BridgeError.invalidData("ResultBox.get called before set — async op did not signal")
+        }
+        return try value.get()
+    }
 }
 
 // MARK: - Command dispatch
@@ -155,8 +195,13 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
 
         let identity: Identity
         if let seed = seedHex {
+            // seed is already hex-decoded bytes (getHexOptional decodes the
+            // 128-char hex string). We check the decoded byte count (64 =
+            // 32-byte encryption seed + 32-byte signing seed).
             guard seed.count == 64 else {
-                throw BridgeError.invalidData("identity_seed must be 64 bytes (32 enc + 32 sig)")
+                throw BridgeError.invalidData(
+                    "identity_seed must decode to 64 bytes (32 encryption + 32 signing) — got \(seed.count)-byte decoded value from hex input"
+                )
             }
             identity = try Identity(privateKeyBytes: seed)
         } else {
@@ -190,8 +235,9 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         behavioralLock.unlock()
         guard let inst else { return ["stopped": boolean(false)] }
 
+        let idsToRemove = inst.interfaceIds()
         try blockingAsync {
-            for ifaceId in inst.interfaces.keys {
+            for ifaceId in idsToRemove {
                 await inst.transport.removeInterface(id: ifaceId)
             }
             await inst.transport.stopRetransmissionLoop()
@@ -211,7 +257,12 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             throw BridgeError.invalidData("Unknown handle: \(handle)")
         }
 
-        let ifaceId = Data((0..<6).map { _ in UInt8.random(in: 0...255) }).map { String(format: "%02x", $0) }.joined()
+        // Generate 6 random bytes, use them for both the hex id and the
+        // 16-byte truncated-SHA256 interface hash. Hashing the raw bytes
+        // keeps the hash stable across hex-decoding boundaries and avoids
+        // the earlier bug where Data(ifaceId.utf8) hashed the ASCII form.
+        let idBytes = Data((0..<6).map { _ in UInt8.random(in: 0...255) })
+        let ifaceId = idBytes.map { String(format: "%02x", $0) }.joined()
         let iface = BehavioralMockInterface(
             id: ifaceId,
             name: name,
@@ -222,11 +273,11 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         try blockingAsync {
             try await inst.transport.addInterface(iface)
         }
-        inst.interfaces[ifaceId] = iface
+        inst.setInterface(iface, forId: ifaceId)
 
         return [
             "iface_id": .string(ifaceId),
-            "interface_hash": hex(Data(SHA256.hash(data: Data(ifaceId.utf8))).prefix(16))
+            "interface_hash": hex(Data(SHA256.hash(data: idBytes)).prefix(16))
         ]
 
     case "behavioral_inject":
@@ -237,7 +288,7 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         behavioralLock.lock()
         let inst = behavioralInstances[handle]
         behavioralLock.unlock()
-        guard let inst, let iface = inst.interfaces[ifaceId] else {
+        guard let inst, let iface = inst.interface(forId: ifaceId) else {
             throw BridgeError.invalidData("Unknown handle or iface_id")
         }
 
@@ -251,7 +302,7 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         behavioralLock.lock()
         let inst = behavioralInstances[handle]
         behavioralLock.unlock()
-        guard let inst, let iface = inst.interfaces[ifaceId] else {
+        guard let inst, let iface = inst.interface(forId: ifaceId) else {
             throw BridgeError.invalidData("Unknown handle or iface_id")
         }
 
@@ -262,7 +313,3 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         throw BridgeError.unknownCommand(command)
     }
 }
-
-// Use CryptoKit's SHA256 for the interface_hash derivation. Kept minimal —
-// the test harness only uses this for display/debug, not byte-level comparison.
-import CryptoKit
