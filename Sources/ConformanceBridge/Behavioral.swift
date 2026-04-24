@@ -67,6 +67,17 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
 
     // Test harness hooks
 
+    /// Fire the delegate's `didReceivePacket` as if `raw` arrived on the wire.
+    ///
+    /// This is intentionally fire-and-forget: `TransportDelegateWrapper.interface`
+    /// spawns a `Task { await transport.handleReceivedData(...) }` to cross back
+    /// into the actor, so packet processing happens asynchronously even on return.
+    /// Behavioral tests sleep between inject and drain_tx (see reference impl's
+    /// `behavioral_transport.py` — PATHFINDER_RW + job-loop window) to let that
+    /// Task run. A synchronous inject→drain barrier would either require
+    /// awaiting on the actor (which negates the point of a synchronous bridge
+    /// command) or reaching into Transport's internal job loop, which would
+    /// couple the bridge to Transport-private scheduling.
     func inject(_ raw: Data) {
         let d: InterfaceDelegate?
         lock.lock()
