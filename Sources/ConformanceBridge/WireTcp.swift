@@ -280,6 +280,15 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         try blockingAsync {
             await transport.setTransportEnabled(true, identity: identity)
             await transport.startRetransmissionLoop()
+            // Register the RNS `rnstransport.path.request` callback so
+            // this peer answers incoming path requests with cached
+            // announces and forwards unknown-destination PRs to other
+            // interfaces. Without this, every wire test that asserts on
+            // PR behaviour (test_roaming_loop_prevention_positive_companion,
+            // test_discover_paths_for_mode_gating) fails because Swift's
+            // `handlePathRequest` is never invoked. PipePeer already
+            // does this at startup for the same reason.
+            await transport.registerPathRequestHandler()
         }
 
         // Build the server's InterfaceConfig.
@@ -383,6 +392,15 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         try blockingAsync {
             await transport.setTransportEnabled(true, identity: identity)
             await transport.startRetransmissionLoop()
+            // Register the RNS `rnstransport.path.request` callback so
+            // this peer answers incoming path requests with cached
+            // announces and forwards unknown-destination PRs to other
+            // interfaces. Without this, every wire test that asserts on
+            // PR behaviour (test_roaming_loop_prevention_positive_companion,
+            // test_discover_paths_for_mode_gating) fails because Swift's
+            // `handlePathRequest` is never invoked. PipePeer already
+            // does this at startup for the same reason.
+            await transport.registerPathRequestHandler()
         }
 
         let ifaceId = "wire-client-\(newHandle())"
