@@ -1790,14 +1790,17 @@ public actor ReticulumTransport {
 
             logger.info("Sending PROOF (\(proofData.count) bytes) for link \(linkIdHex)")
 
-            // Send PROOF via the interface that received the request
-            if let interface = interfaces[interfaceId] {
-                // For TCP, we need to use framed transport
-                if let tcpInterface = interface as? TCPInterface {
-                    try await tcpInterface.send(proofData)
-                } else {
-                    try await interface.send(proofData)
-                }
+            // Send PROOF via the interface that received the request.
+            // Route through sendToInterface (NOT interface.send directly)
+            // so applyIFAC runs on the outbound bytes. Calling
+            // interface.send directly skipped IFAC, producing a raw
+            // LINKPROOF that every IFAC-configured peer rejected with
+            // "IFAC validation failed" — specifically breaking 3-peer
+            // IFAC link establishment, since in that topology the
+            // LINKPROOF has to traverse a middle transport which drops
+            // the packet for missing IFAC before it reaches the sender.
+            if interfaces[interfaceId] != nil {
+                try await sendToInterface(proofData, interfaceId: interfaceId)
             } else {
                 // Broadcast to all interfaces as fallback
                 try await sendRawBytes(proofData)
