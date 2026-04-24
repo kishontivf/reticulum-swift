@@ -257,13 +257,15 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
         return Array(_spawnedPeers.values)
     }
 
-    /// Aggregate tx-bytes across the server + all spawned peers.
-    /// Used by wire_tx_bytes to answer "did this listen-side peer emit
-    /// any wire traffic" without the test having to introspect
-    /// per-connection state.
+    /// Aggregate tx-bytes across all spawned peers.
+    ///
+    /// The server's `send(_:)` fan-outs delegate to each peer's `send()`,
+    /// and each peer increments its own `bytesSent` counter — so the per-peer
+    /// sum is already the full server-side TX total. A parallel server-level
+    /// counter would double-count every byte.
     public var totalBytesSent: UInt64 {
         lock.lock(); defer { lock.unlock() }
-        return _bytesSent + _spawnedPeers.values.reduce(0) { $0 + $1.bytesSent }
+        return _spawnedPeers.values.reduce(0) { $0 + $1.bytesSent }
     }
 
     // MARK: - Callbacks set by the bridge
@@ -284,7 +286,6 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
     private var _state: InterfaceState = .disconnected
     private var _modeOverride: InterfaceMode?
     private var _delegate: InterfaceDelegate?
-    private var _bytesSent: UInt64 = 0
     private var _spawnedPeers: [String: TCPSpawnedPeerInterface] = [:]
     private var listener: NWListener?
     private let queue: DispatchQueue
@@ -328,9 +329,6 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
                 tcpServerLogger.debug("Send to spawned peer \(peer.id, privacy: .public) failed: \(String(describing: error), privacy: .public)")
             }
         }
-        lock.lock()
-        _bytesSent += UInt64(data.count)
-        lock.unlock()
     }
 
     public func setDelegate(_ delegate: InterfaceDelegate) async {
@@ -347,24 +345,31 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
     /// during wire_start_tcp_server handling without blockingAsync overhead
     /// (connect() is async; start() isn't).
     public func start() throws {
+        // Hold the lock across the entire "guard nil → create NWListener →
+        // assign listener" critical region. Previously we released the lock
+        // between the guard and the assignment, which let two concurrent
+        // starters both pass the nil-guard, each build an NWListener, and
+        // race on the same bind port (one would fail silently). Start is
+        // only called from wire_start_tcp_server today, but the concurrency
+        // hazard is cheap to close and removes a footgun for future callers.
         lock.lock()
-        guard listener == nil else { lock.unlock(); return }
-        lock.unlock()
+        if listener != nil {
+            lock.unlock()
+            return
+        }
 
         let port = NWEndpoint.Port(integerLiteral: config.port)
         let params = NWParameters.tcp
-        // Bind to loopback explicitly by setting allowLocalEndpointReuse
-        // AND the required_interface_type to .loopback isn't exposed; the
-        // correct way is to pass the IPv4 address as a required local
-        // endpoint on the underlying IPOptions. NWListener on `params, on:
-        // port` inherently binds on all interfaces; we accept that here
-        // because the conformance bridge is a short-lived loopback-only
-        // process. Cross-impl wire tests use 127.0.0.1:port on the client
-        // side so off-box traffic doesn't reach this listener anyway.
+        // NWListener on `params, on: port` inherently binds on all
+        // interfaces; we accept that here because the conformance bridge is
+        // a short-lived loopback-only process. Cross-impl wire tests use
+        // 127.0.0.1:port on the client side so off-box traffic doesn't
+        // reach this listener anyway.
         let l: NWListener
         do {
             l = try NWListener(using: params, on: port)
         } catch {
+            lock.unlock()
             throw InterfaceError.connectionFailed(underlying: "NWListener init: \(error.localizedDescription)")
         }
         l.stateUpdateHandler = { [weak self] state in
@@ -384,7 +389,6 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
         l.newConnectionHandler = { [weak self] conn in
             self?.accept(conn)
         }
-        lock.lock()
         listener = l
         _state = .connecting
         lock.unlock()

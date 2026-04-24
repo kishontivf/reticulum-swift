@@ -17,7 +17,7 @@ jobs:
   conformance:
     name: Conformance (Swift)
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +53,7 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install pytest
+      - run: pip install pytest pytest-timeout
 
       - name: Run conformance tests
         working-directory: reticulum-conformance
@@ -67,7 +67,13 @@ jobs:
         # tests/lxmf/ is the LXMF-layer conformance suite owned by LXMF-swift;
         # it rides the same bridge but has its own CI target. Keep the
         # reticulum-swift CI focused on RNS-layer parity.
-        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short
+        #
+        # --timeout=60 caps any individual test that wedges (resource-multihop
+        # can hang for minutes on a failed transfer) so a single hung case
+        # doesn't consume the entire workflow budget and timeout-kill the
+        # whole run at 20 minutes. Without this, previously-passing tests
+        # downstream of the hung one never get a chance to report.
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short --timeout=60
 
       - name: Run integration tests (IFAC pipe)
         working-directory: reticulum-conformance

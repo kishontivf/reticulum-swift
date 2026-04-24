@@ -159,7 +159,13 @@ private func resetWireState() {
 
 /// Fixed salt constant shared across all Reticulum implementations.
 /// Python: RNS.Reticulum.IFAC_SALT (Reticulum.py:152).
-private let ifacSalt = Data(hexString: "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
+private let ifacSalt: Data = {
+    // The bridge's top-level `hexToBytes` helper already handles odd input
+    // gracefully; reuse it rather than a force-unwrapping parser so a typo
+    // in this literal becomes a test failure (empty Data → IFAC mismatch),
+    // not a crash at bridge startup.
+    hexToBytes("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
+}()
 
 /// Derive the 64-byte IFAC key from a network name and passphrase.
 ///
@@ -191,21 +197,6 @@ private func deriveIfacKey(networkName: String, passphrase: String) -> Data? {
     )
 }
 
-/// Parse a hex string into a Data. Crashes on malformed input — only used
-/// for the hardcoded IFAC_SALT constant at module init, where a bad string
-/// would be a local bug, not a runtime edge.
-private extension Data {
-    init(hexString: String) {
-        var data = Data()
-        var s = Substring(hexString)
-        while s.count >= 2 {
-            let byteStr = String(s.prefix(2))
-            s = s.dropFirst(2)
-            data.append(UInt8(byteStr, radix: 16)!)
-        }
-        self = data
-    }
-}
 
 // MARK: - Interface mode parsing
 
@@ -421,10 +412,21 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             try await transport.addInterface(client)
         }
 
-        // Give the outbound TCP a tick to actually connect before we
-        // return — tests routinely announce immediately and expect the
-        // wire to carry the packet.
-        Thread.sleep(forTimeInterval: 0.5)
+        // Wait for the NWConnection to actually finish its handshake before
+        // we return. TCPInterface.connect() kicks off the connection
+        // asynchronously and returns immediately, so without a wait the
+        // very next wire_announce might send before the wire is up and
+        // the bytes would be silently dropped. Poll on TCPInterface.state
+        // with a capped deadline rather than sleeping a fixed interval:
+        // fast hosts return quickly, slow/loaded CI hosts get the time
+        // they need, and the cap prevents a stalled NWConnection from
+        // hanging the bridge command loop.
+        let connectDeadline = Date().addingTimeInterval(5.0)
+        while Date() < connectDeadline {
+            let ready: Bool = try blockingAsync { await client.state == .connected }
+            if ready { break }
+            Thread.sleep(forTimeInterval: 0.02)
+        }
 
         let handle = newHandle()
         let inst = WireInstance(
