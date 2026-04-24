@@ -1617,6 +1617,27 @@ func handleCommand(_ req: Request) throws -> Result {
          "behavioral_drain_tx":
         return try handleBehavioralCommand(req.command, p)
 
+    case "wire_start_tcp_server",
+         "wire_start_tcp_client",
+         "wire_stop",
+         "wire_announce",
+         "wire_poll_path",
+         "wire_read_path_entry",
+         "wire_has_discovery_path_request",
+         "wire_has_announce_table_entry",
+         "wire_read_announce_table_timestamp",
+         "wire_tx_bytes",
+         "wire_read_path_random_hash",
+         "wire_request_path",
+         "wire_set_interface_mode",
+         "wire_listen",
+         "wire_link_open",
+         "wire_link_send",
+         "wire_link_poll",
+         "wire_resource_send",
+         "wire_resource_poll":
+        return try handleWireCommand(req.command, p)
+
     default:
         throw BridgeError.unknownCommand(req.command)
     }

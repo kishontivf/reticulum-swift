@@ -58,10 +58,16 @@ jobs:
       - name: Run conformance tests
         working-directory: reticulum-conformance
         env:
-          CONFORMANCE_BRIDGE_CMD: ${{ github.workspace }}/reticulum-swift-lib/.build/release/ConformanceBridge
+          # Per-impl override: the fresh-built Swift bridge is used for
+          # swift peers; reference peers fall back to the Python RNS bridge
+          # so cross-impl parametrization exercises both stacks.
+          CONFORMANCE_SWIFT_BRIDGE_CMD: ${{ github.workspace }}/reticulum-swift-lib/.build/release/ConformanceBridge
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        run: python3 -m pytest tests/ --impl=swift -v --tb=short
+        # tests/lxmf/ is the LXMF-layer conformance suite owned by LXMF-swift;
+        # it rides the same bridge but has its own CI target. Keep the
+        # reticulum-swift CI focused on RNS-layer parity.
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short
 
       - name: Run integration tests (IFAC pipe)
         working-directory: reticulum-conformance

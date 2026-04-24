@@ -2982,6 +2982,54 @@ public actor ReticulumTransport {
         return announceHandler
     }
 
+    /// Get the announce table for direct access.
+    ///
+    /// Exposed primarily for conformance bridge observables —
+    /// path-response answering logic enqueues cached announces here
+    /// for re-transmission. Absence after a path-request is how tests
+    /// distinguish "refused to answer" from "normal quiescence".
+    public func getAnnounceTable() -> AnnounceTable {
+        return announceTable
+    }
+
+    // MARK: - Observability for conformance bridge
+
+    /// True if the path table has a route to `destinationHash`.
+    public func hasPath(for destinationHash: Data) async -> Bool {
+        return await pathTable.hasPath(for: destinationHash)
+    }
+
+    /// Hop count to `destinationHash`, or nil if no path is known.
+    public func hopsTo(_ destinationHash: Data) async -> UInt8? {
+        return await pathTable.lookup(destinationHash: destinationHash)?.hopCount
+    }
+
+    /// Full path entry for `destinationHash`, or nil if no path is known.
+    public func pathEntry(for destinationHash: Data) async -> PathEntry? {
+        return await pathTable.lookup(destinationHash: destinationHash)
+    }
+
+    /// True if a pending discovery path request exists for `destinationHash`.
+    ///
+    /// Exposed for path-discovery conformance tests that assert mode-gated
+    /// recursive forwarding fired (or didn't) by observing the
+    /// discoveryPathRequests map.
+    public func hasDiscoveryPathRequest(for destinationHash: Data) -> Bool {
+        return discoveryPathRequests[destinationHash] != nil
+    }
+
+    /// Send an unconditional path-request packet, bypassing the throttle
+    /// and recent-request guards in `requestPath(for:)`.
+    ///
+    /// Matches Python `RNS.Transport.request_path` semantics: always emit
+    /// a packet on the wire. Tests for the "fresh PR for already-known
+    /// destination" path use this to avoid the early-skip guard.
+    public func sendPathRequestUnconditional(for destinationHash: Data) async {
+        // Force a re-request by clearing the cooldown entry first.
+        pathRequestTimestamps.removeValue(forKey: destinationHash)
+        await requestPath(for: destinationHash)
+    }
+
     /// Record a path entry in the path table.
     ///
     /// Convenience method for recording paths from validated announces.

@@ -1086,6 +1086,38 @@ public actor Link {
         self.resourceCallbacks = callbacks
     }
 
+    /// Send a plaintext payload over the link as a single DATA packet.
+    ///
+    /// Mirrors Python `Link.send(...)`: encrypts the plaintext with the
+    /// link's session key, wraps it in a CONTEXT_NONE DATA packet addressed
+    /// to `linkId`, and dispatches via `sendCallback`. Used by the
+    /// conformance bridge's `wire_link_send` to deliver small single-packet
+    /// payloads; for larger arbitrary-size data use `sendResource` instead.
+    ///
+    /// - Parameter plaintext: Unencrypted payload bytes
+    /// - Throws: LinkError if the link is not active or encryption fails
+    public func send(_ plaintext: Data) async throws {
+        guard state.isEstablished else { throw LinkError.notActive }
+        guard let sendCallback else { throw LinkError.notActive }
+        let ciphertext = try encrypt(plaintext)
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            transportType: .broadcast,
+            destinationType: .link,
+            packetType: .data,
+            hopCount: 0
+        )
+        let packet = Packet(
+            header: header,
+            destination: linkId,
+            context: 0x00,
+            data: ciphertext
+        )
+        try await sendCallback(packet.encode())
+    }
+
     /// Send a resource over the link.
     ///
     /// Creates a new outbound resource, prepares it, sends the advertisement,
