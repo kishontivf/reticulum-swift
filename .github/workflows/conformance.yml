@@ -68,12 +68,16 @@ jobs:
         # it rides the same bridge but has its own CI target. Keep the
         # reticulum-swift CI focused on RNS-layer parity.
         #
-        # --timeout=60 caps any individual test that wedges (resource-multihop
-        # can hang for minutes on a failed transfer) so a single hung case
+        # --timeout=180 caps any individual test that wedges (resource-multihop
+        # can hang indefinitely on a failed transfer) so a single hung case
         # doesn't consume the entire workflow budget and timeout-kill the
-        # whole run at 20 minutes. Without this, previously-passing tests
-        # downstream of the hung one never get a chance to report.
-        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short --timeout=60
+        # whole run. 180 s tolerates the slowest passing cases:
+        # test_large_resource_multihop transfers 256 KB through a 2-hop link
+        # and takes ~60-90 s per variant on a macos-15 runner; all 8
+        # variants pass reliably at this cap. Previous 60 s cap was too
+        # tight and caused 4 of those 8 to fail as "Timeout" instead of
+        # completing.
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short --timeout=180
 
       - name: Run integration tests (IFAC pipe)
         working-directory: reticulum-conformance
