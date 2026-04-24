@@ -671,7 +671,8 @@ func handleCommand(_ req: Request) throws -> Result {
             "public_key": hex(publicKey),
             "name_hash": hex(nameHash),
             "random_hash": hex(randomHash),
-            "signature": hex(signature)
+            "signature": hex(signature),
+            "has_ratchet": boolean(hasRatchet)
         ]
         if let r = ratchet { result["ratchet"] = hex(r) }
         if let ad = appData, !ad.isEmpty { result["app_data"] = hex(ad) }
@@ -683,12 +684,16 @@ func handleCommand(_ req: Request) throws -> Result {
         let publicKey = try getHex(p, "public_key")
         let nameHash = try getHex(p, "name_hash")
         let randomHash = try getHex(p, "random_hash")
+        let ratchet = getHexOptional(p, "ratchet")
         let appData = getHexOptional(p, "app_data")
+        // Signed payload matches Python RNS: destHash || publicKey || nameHash
+        // || randomHash || (ratchet if present) || (appData if present).
         var signedData = Data()
         signedData.append(destHash)
         signedData.append(publicKey)
         signedData.append(nameHash)
         signedData.append(randomHash)
+        if let r = ratchet { signedData.append(r) }
         if let ad = appData { signedData.append(ad) }
         let sigPriv = privBytes.suffix(32)
         guard let sig = Ed25519Pure.sign(message: signedData, seed: Data(sigPriv)) else {
