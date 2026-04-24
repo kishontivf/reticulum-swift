@@ -209,6 +209,10 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             // seed is already hex-decoded bytes (getHexOptional decodes the
             // 128-char hex string). We check the decoded byte count (64 =
             // 32-byte encryption seed + 32-byte signing seed).
+            //
+            // This matches the Python reference (behavioral_transport.py
+            // cmd_behavioral_start): `seed = bytes.fromhex(identity_seed_hex);
+            // if len(seed) != 64: raise ValueError(...)`.
             guard seed.count == 64 else {
                 throw BridgeError.invalidData(
                     "identity_seed must decode to 64 bytes (32 encryption + 32 signing) — got \(seed.count)-byte decoded value from hex input"
