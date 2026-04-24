@@ -421,11 +421,29 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // fast hosts return quickly, slow/loaded CI hosts get the time
         // they need, and the cap prevents a stalled NWConnection from
         // hanging the bridge command loop.
+        //
+        // If the deadline passes without reaching .connected, throw a
+        // clear connect-timeout error rather than returning a handle
+        // that points at a broken interface — otherwise every downstream
+        // `wire_announce` / `wire_poll_path` would fail opaquely with
+        // "path not found" instead of surfacing the real cause.
         let connectDeadline = Date().addingTimeInterval(5.0)
+        var clientConnected = false
         while Date() < connectDeadline {
             let ready: Bool = try blockingAsync { await client.state == .connected }
-            if ready { break }
+            if ready { clientConnected = true; break }
             Thread.sleep(forTimeInterval: 0.02)
+        }
+        guard clientConnected else {
+            // Best-effort teardown so we don't leak a half-open interface.
+            try? blockingAsync {
+                let cid = await client.id
+                await transport.removeInterface(id: cid)
+                await client.disconnect()
+            }
+            throw BridgeError.invalidData(
+                "TCPInterface did not connect to \(targetHost):\(targetPort) within 5s"
+            )
         }
 
         let handle = newHandle()
@@ -886,21 +904,30 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             try await link.sendResource(data: payload)
         }
 
+        // Track the most-recent observed state separately from the
+        // terminal state. If the poll times out while the resource is
+        // still .transferring / .advertised, returning 0 (.none) in
+        // `status` would hide the actual stage the transfer got stuck
+        // in — report `lastSeen` instead so tests can distinguish
+        // "never started" from "stalled mid-transfer".
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
-        var finalState: ResourceState = .none
+        var lastSeen: ResourceState = .none
+        var terminalState: ResourceState?
         while Date() < deadline {
             let state: ResourceState = try blockingAsync { await resource.state }
+            lastSeen = state
             if state == .complete || state == .failed {
-                finalState = state
+                terminalState = state
                 break
             }
             Thread.sleep(forTimeInterval: 0.1)
         }
-        let timedOut = finalState != .complete && finalState != .failed
-        let success = finalState == .complete
+        let timedOut = terminalState == nil
+        let reportedState = terminalState ?? lastSeen
+        let success = reportedState == .complete
         return [
             "success": boolean(success),
-            "status": .int(finalState.rawValueForBridge),
+            "status": .int(reportedState.rawValueForBridge),
             "size": .int(payload.count),
             "timed_out": boolean(timedOut)
         ]
