@@ -94,15 +94,25 @@ enum JSONValue: Codable, Equatable {
 
 // MARK: - Hex Utilities
 
-func hexToBytes(_ hex: String) -> Data {
+/// Parse a hex string into bytes, returning nil on any non-hex character.
+///
+/// Each pair `[a-fA-F0-9]{2}` becomes one byte; trailing odd characters
+/// or any byte that isn't a valid hex pair causes a nil return rather
+/// than a trap. The earlier `UInt8(byte, radix: 16)!` form crashed the
+/// whole bridge process on a single malformed test fixture, masking the
+/// real diagnostic with a SIGTRAP. Returning Data? lets `getHex` raise
+/// a clean `BridgeError.invalidData` that the conformance runner can
+/// surface in test output.
+func hexToBytes(_ hex: String) -> Data? {
     var data = Data()
-    var hex = hex
-    while hex.count >= 2 {
-        let byte = String(hex.prefix(2))
-        hex = String(hex.dropFirst(2))
-        data.append(UInt8(byte, radix: 16)!)
+    var rest = Substring(hex)
+    while rest.count >= 2 {
+        let pair = String(rest.prefix(2))
+        rest = rest.dropFirst(2)
+        guard let byte = UInt8(pair, radix: 16) else { return nil }
+        data.append(byte)
     }
-    return data
+    return rest.isEmpty ? data : nil
 }
 
 func bytesToHex(_ data: Data) -> String {
@@ -115,7 +125,10 @@ func getHex(_ params: [String: JSONValue], _ key: String) throws -> Data {
     guard let val = params[key]?.stringValue else {
         throw BridgeError.missingParam(key)
     }
-    return hexToBytes(val)
+    guard let bytes = hexToBytes(val) else {
+        throw BridgeError.invalidData("Parameter \(key) is not a valid hex string")
+    }
+    return bytes
 }
 
 func getHexOptional(_ params: [String: JSONValue], _ key: String) -> Data? {

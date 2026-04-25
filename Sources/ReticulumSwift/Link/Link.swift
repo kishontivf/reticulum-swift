@@ -1098,7 +1098,13 @@ public actor Link {
     /// - Throws: LinkError if the link is not active or encryption fails
     public func send(_ plaintext: Data) async throws {
         guard state.isEstablished else { throw LinkError.notActive }
-        guard let sendCallback else { throw LinkError.notActive }
+        // sendCallback is wired in `initiateLink` / link-establishment paths
+        // before the link transitions to .active, so an active link with no
+        // callback indicates an internal wiring bug rather than a state
+        // problem. Surface that as `transportNotAvailable` so callers can
+        // distinguish "link closed" from "callback never set" without
+        // having to read the call site.
+        guard let sendCallback else { throw LinkError.transportNotAvailable }
         let ciphertext = try encrypt(plaintext)
 
         let header = PacketHeader(

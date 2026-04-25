@@ -159,13 +159,17 @@ private func resetWireState() {
 
 /// Fixed salt constant shared across all Reticulum implementations.
 /// Python: RNS.Reticulum.IFAC_SALT (Reticulum.py:152).
-private let ifacSalt: Data = {
-    // The bridge's top-level `hexToBytes` helper already handles odd input
-    // gracefully; reuse it rather than a force-unwrapping parser so a typo
-    // in this literal becomes a test failure (empty Data → IFAC mismatch),
-    // not a crash at bridge startup.
-    hexToBytes("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
-}()
+///
+/// `hexToBytes` is failable now (returns nil on malformed input). The
+/// nil-coalesce to empty Data is purely a belt-and-braces against a typo
+/// in this literal: a 32-byte mismatch surfaces as IFAC validation
+/// failures in the conformance suite rather than a crash on bridge
+/// startup. The literal is the canonical Reticulum salt and is verified
+/// by the cross-impl IFAC interop tests, so empty data is unreachable
+/// in practice.
+private let ifacSalt: Data = hexToBytes(
+    "adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8"
+) ?? Data()
 
 /// Derive the 64-byte IFAC key from a network name and passphrase.
 ///
@@ -666,7 +670,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             // TCPInterface.bytesSent is actor-isolated.
             total += try blockingAsync { await client.bytesSent }
         }
-        return ["tx_bytes": .int(Int(total))]
+        // `Int(clamping:)` saturates at Int.max instead of trapping if a
+        // 32-bit consumer ever sees a counter past 2³¹-1. macOS bridge
+        // builds are always 64-bit so the saturation branch is
+        // unreachable today, but the explicit clamp documents the
+        // truncation semantics if `JSONValue.int` ever moves to a
+        // narrower platform — and is the standard way to silence the
+        // implicit-narrowing concern Greptile flagged.
+        return ["tx_bytes": .int(Int(clamping: total))]
 
     // MARK: wire_read_path_random_hash
 
