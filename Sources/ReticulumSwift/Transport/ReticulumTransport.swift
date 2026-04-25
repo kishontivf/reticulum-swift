@@ -250,10 +250,12 @@ public actor ReticulumTransport {
     private static let PATH_REQUEST_GRACE: TimeInterval = 0.4
     private static let PATH_REQUEST_TIMEOUT: TimeInterval = 15.0
 
-    /// Interface ID that last delivered an inbound packet (set before dispatch).
-    /// Used by handlePathRequest to know which interface to avoid when forwarding.
-    /// Safe because this actor processes packets sequentially.
-    private var lastReceivedInterfaceId: String?
+    // (Removed `lastReceivedInterfaceId` global — the path-request handler
+    // now receives the inbound interface id directly through the callback
+    // chain via `packet.receivingInterface`. The old global raced when any
+    // other packet arrived between handler dispatch and the async
+    // handler's read, which let the hub leak path-response announces to
+    // peers other than the asker.)
 
     // MARK: - Transport Table Properties
 
@@ -1678,7 +1680,6 @@ public actor ReticulumTransport {
                 return
             }
 
-            lastReceivedInterfaceId = interfaceId  // Track for path request handler
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             logger.debug("DATA packet received: destType=\(String(describing: packet.header.destinationType)), dest=\(dataDestHex), ctx=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
             if packet.header.destinationType == .link {
@@ -2253,13 +2254,19 @@ public actor ReticulumTransport {
             }
         }
 
-        // Attach resolved interface name to packet before delivery
+        // Attach the receiving interface ID (NOT the human-readable name)
+        // to the packet before delivery. Callbacks (notably the path-request
+        // handler) need the stable id to look up the interface in the
+        // `interfaces` map and decide where to send a targeted response.
+        // Earlier code stored the name when available, which made
+        // `packet.receivingInterface` ambiguous (sometimes name, sometimes
+        // id) and forced handlers to fall back to the racy
+        // `lastReceivedInterfaceId` global instead — which let path-response
+        // routing leak to peers that just happened to be the most-recent
+        // sender of any packet at handler-dispatch time. If a caller wants
+        // a display name they can call `getInterfaceName(for:)`.
         var deliveryPacket = packet
-        if let name = await getInterfaceName(for: interfaceId) {
-            deliveryPacket.receivingInterface = name
-        } else {
-            deliveryPacket.receivingInterface = interfaceId
-        }
+        deliveryPacket.receivingInterface = interfaceId
 
         // Deliver decrypted data via callback manager
         logger.debug("Calling callbackManager.deliver() for destHash=\(hexPrefix)")
@@ -3226,11 +3233,17 @@ public actor ReticulumTransport {
         pathRequestDestination = pathReqDest
         registerDestination(pathReqDest)
 
-        // Register callback for incoming path requests
+        // Register callback for incoming path requests. Capture the
+        // receiving interface id from the packet at callback time so the
+        // async handler doesn't have to read a racy global — `packet`
+        // arrives with `receivingInterface` set to the interface id by
+        // `deliverToLocalDestination`, which is stable across concurrent
+        // arrivals on different interfaces.
         await callbackManager.registerAsync(destinationHash: pathReqDest.hash) { [weak self] data, packet in
             guard let self = self else { return }
+            let recvIface = packet.receivingInterface
             Task {
-                await self.handlePathRequest(data: data)
+                await self.handlePathRequest(data: data, receivingInterfaceId: recvIface)
             }
         }
 
@@ -3249,7 +3262,7 @@ public actor ReticulumTransport {
     /// 3. Transport enabled → forward request on all other interfaces (discovery)
     ///
     /// Reference: Python Transport.py:2646-2820
-    private func handlePathRequest(data: Data) async {
+    private func handlePathRequest(data: Data, receivingInterfaceId: String? = nil) async {
         guard data.count >= TRUNCATED_HASH_LENGTH else { return }
 
         let destinationHash = Data(data.prefix(TRUNCATED_HASH_LENGTH))
@@ -3282,7 +3295,15 @@ public actor ReticulumTransport {
         }
 
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        let receivingInterfaceId = lastReceivedInterfaceId
+        // Use the per-packet receivingInterfaceId captured by the caller
+        // (the registerPathRequestHandler closure reads
+        // `packet.receivingInterface` at callback time and passes it
+        // through). The previous implementation read a `lastReceivedInterfaceId`
+        // global, which races whenever any other packet arrives between
+        // the path-request landing and the async handler running — and the
+        // hub-routing-isolation test catches exactly that race by bouncing
+        // keepalive traffic through a witness peer between asker→hub PR
+        // delivery and hub→asker response dispatch.
         onDiagnostic?("[PATH_REQ] for \(destHex) from interface \(receivingInterfaceId ?? "unknown")")
 
         // E12: Track local path requests (no transport_id = local origin)
