@@ -1042,7 +1042,9 @@ func handleCommand(_ req: Request) throws -> Result {
         let randomHash = try getHex(p, "random_hash")
         var hashmap = Data()
         for partHex in partsHex {
-            let partData = hexToBytes(partHex)
+            guard let partData = hexToBytes(partHex) else {
+                throw BridgeError.invalidData("parts[] contains an entry that is not a valid hex string: \(partHex.prefix(16))…")
+            }
             let hash = ResourceHashmap.partHash(partData, randomHash: randomHash)
             hashmap.append(hash)
         }
@@ -1207,7 +1209,12 @@ func handleCommand(_ req: Request) throws -> Result {
         let interfaceHash = try getHex(p, "interface_hash")
         let packetHash = try getHex(p, "packet_hash")
         // Serialize as msgpack array: [dest_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
-        let randomBlobValues: [MessagePackValue] = randomBlobsHex.map { .binary(hexToBytes($0)) }
+        let randomBlobValues: [MessagePackValue] = try randomBlobsHex.map {
+            guard let bytes = hexToBytes($0) else {
+                throw BridgeError.invalidData("random_blobs[] contains a non-hex entry")
+            }
+            return .binary(bytes)
+        }
         let entry: [MessagePackValue] = [
             .binary(destHash),
             .double(timestamp),
@@ -1279,7 +1286,12 @@ func handleCommand(_ req: Request) throws -> Result {
 
     case "packet_hashlist_pack":
         let hashesHex = getStringArray(p, "hashes")
-        let hashValues: [MessagePackValue] = hashesHex.map { .binary(hexToBytes($0)) }
+        let hashValues: [MessagePackValue] = try hashesHex.map {
+            guard let bytes = hexToBytes($0) else {
+                throw BridgeError.invalidData("hashes[] contains a non-hex entry")
+            }
+            return .binary(bytes)
+        }
         let packed = packMsgPack(.array(hashValues))
         return [
             "serialized": hex(packed),
@@ -1308,7 +1320,10 @@ func handleCommand(_ req: Request) throws -> Result {
     case "ifac_derive_key":
         let ifacOrigin = try getHex(p, "ifac_origin")
         // IFAC key derivation: HKDF(ifac_origin, salt=IFAC_SALT, length=64)
-        let ifacSalt = hexToBytes("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
+        // The literal is a hardcoded constant — `?? Data()` is unreachable
+        // unless someone introduces a typo in this file, in which case the
+        // resulting key mismatch surfaces in the IFAC interop tests.
+        let ifacSalt = hexToBytes("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8") ?? Data()
         let ifacKey = KeyDerivation.deriveKey(length: 64, inputKeyMaterial: ifacOrigin, salt: ifacSalt, context: nil)
         return [
             "ifac_key": hex(ifacKey),
