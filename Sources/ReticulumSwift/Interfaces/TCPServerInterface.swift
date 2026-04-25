@@ -514,7 +514,13 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
 /// is born from an NWListener and arrives in .ready state. We just need
 /// to drive the receive loop and expose a send method so FramedTransport
 /// can wrap us exactly like it wraps TCPTransport.
-final class NWInboundConnectionTransport: Transport {
+final class NWInboundConnectionTransport: Transport, @unchecked Sendable {
+    // All mutations of `state` happen on `queue`. `disconnect()` from any
+    // caller hops onto the queue before mutating, so it can never race the
+    // receive-loop callback that also writes to `state` and is itself
+    // dispatched onto the same queue. Reads from outside the queue are
+    // benign (callers only inspect `state` for diagnostics) and the value
+    // is a value type, so torn reads aren't a correctness issue here.
     var state: TransportState = .connected
     var onStateChange: ((TransportState) -> Void)?
     var onDataReceived: ((Data) -> Void)?
@@ -543,9 +549,19 @@ final class NWInboundConnectionTransport: Transport {
     }
 
     func disconnect() {
-        connection.cancel()
-        state = .disconnected
-        onStateChange?(.disconnected)
+        // Mutate state on the same queue that the receive-loop callback
+        // runs on, so the two write paths can't race. Cancellation of the
+        // NWConnection itself is thread-safe, but the `state =` and
+        // `onStateChange?(...)` callout were not — Greptile flagged this
+        // as a Thread-Sanitizer-visible data race on heavily-loaded CI
+        // runners. Synchronizing through `queue` matches how
+        // `startReceiving` already serializes its own state transitions.
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.connection.cancel()
+            self.state = .disconnected
+            self.onStateChange?(.disconnected)
+        }
     }
 
     private func startReceiving() {
