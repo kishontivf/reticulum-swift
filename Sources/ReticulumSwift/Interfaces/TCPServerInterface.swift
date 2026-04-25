@@ -464,13 +464,6 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
             connection: connection,
             queue: queue
         )
-        // If the parent has a modeOverride, seed the child with the same
-        // value so freshly-spawned peers observe the runtime mode from
-        // birth (avoids a window where a new peer briefly reports
-        // config.mode while the parent is in an override state).
-        if let override = modeOverride {
-            peer.modeOverride = override
-        }
         // Evict on disconnect so the _spawnedPeers map doesn't grow
         // unbounded over the listener's lifetime. Without this, every
         // broadcast send() would silently try to deliver to peers that
@@ -482,7 +475,19 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
             self._spawnedPeers.removeValue(forKey: id)
             self.lock.unlock()
         }
+        // Seed the child with the parent's modeOverride and insert it
+        // into _spawnedPeers under a single lock acquisition. A
+        // concurrent wire_set_interface_mode that snapshots peers
+        // either runs entirely before this block (and we read its
+        // newly-written _modeOverride here) or entirely after (and it
+        // sees the new peer in its snapshot and applies the new mode
+        // itself). Splitting the read of _modeOverride and the insert
+        // would let a mode update slip between them and leave the new
+        // peer with a stale mode until the next mode-set call.
         lock.lock()
+        if let override = _modeOverride {
+            peer.modeOverride = override
+        }
         _spawnedPeers[spawnedId] = peer
         lock.unlock()
 

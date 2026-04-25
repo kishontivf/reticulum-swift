@@ -3035,9 +3035,18 @@ public actor ReticulumTransport {
     /// a packet on the wire. Tests for the "fresh PR for already-known
     /// destination" path use this to avoid the early-skip guard.
     public func sendPathRequestUnconditional(for destinationHash: Data) async {
-        // Force a re-request by clearing the cooldown entry first.
-        pathRequestTimestamps.removeValue(forKey: destinationHash)
+        // Force a re-request by clearing the cooldown entry first, but
+        // remember the previous timestamp so we can put it back if
+        // `requestPath(for:)` returns without writing a fresh one.
+        // Otherwise an early-return path inside `requestPath` would
+        // permanently strip this destination's throttle slot, letting
+        // every subsequent regular path-request bypass the cooldown
+        // until something else re-populates it.
+        let previous = pathRequestTimestamps.removeValue(forKey: destinationHash)
         await requestPath(for: destinationHash)
+        if pathRequestTimestamps[destinationHash] == nil, let previous {
+            pathRequestTimestamps[destinationHash] = previous
+        }
     }
 
     /// Record a path entry in the path table.

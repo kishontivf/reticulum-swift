@@ -589,11 +589,14 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // Map interfaceId back to the human-readable name the test asserts
         // on (e.g., "Wire TCP Server" / "Wire TCP Client"). TCPInterface is
         // an actor, so read its identity via blockingAsync.
+        //
+        // Server-role instances only register spawned peers with the
+        // Transport (see wire_start_tcp_server above) — the parent
+        // TCPServerInterface itself is never an interface of record, so
+        // entry.interfaceId can only ever match a spawned peer here.
         let ifaceName: JSONValue
         if let server = inst.serverInterface {
-            if entry.interfaceId == server.id {
-                ifaceName = .string(server.config.name)
-            } else if let peer = server.spawnedPeers.first(where: { $0.id == entry.interfaceId }) {
+            if let peer = server.spawnedPeers.first(where: { $0.id == entry.interfaceId }) {
                 ifaceName = .string(peer.config.name)
             } else {
                 ifaceName = .null
