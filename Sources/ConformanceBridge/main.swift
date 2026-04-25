@@ -104,15 +104,36 @@ enum JSONValue: Codable, Equatable {
 /// a clean `BridgeError.invalidData` that the conformance runner can
 /// surface in test output.
 func hexToBytes(_ hex: String) -> Data? {
+    // Walk over UTF-8 bytes, not Substring. `Substring.count` is O(n)
+    // because Swift has to step through grapheme/UTF-16 boundaries,
+    // turning the per-iteration `rest.count >= 2` check into the
+    // outer of an O(n²) loop — which torches the bridge on large
+    // hex payloads (e.g. wire_resource_send with 256 KB of data
+    // arrives as 524288 hex chars and spends ~120 s doing nothing
+    // but counting). UTF-8 byte access is O(1).
+    let bytes = Array(hex.utf8)
+    guard bytes.count.isMultiple(of: 2) else { return nil }
+
     var data = Data()
-    var rest = Substring(hex)
-    while rest.count >= 2 {
-        let pair = String(rest.prefix(2))
-        rest = rest.dropFirst(2)
-        guard let byte = UInt8(pair, radix: 16) else { return nil }
-        data.append(byte)
+    data.reserveCapacity(bytes.count / 2)
+    var i = 0
+    while i < bytes.count {
+        guard let high = nibble(bytes[i]),
+              let low = nibble(bytes[i + 1]) else { return nil }
+        data.append((high << 4) | low)
+        i += 2
     }
-    return rest.isEmpty ? data : nil
+    return data
+}
+
+@inline(__always)
+private func nibble(_ b: UInt8) -> UInt8? {
+    switch b {
+    case 0x30...0x39: return b - 0x30           // '0'-'9'
+    case 0x41...0x46: return b - 0x41 + 10      // 'A'-'F'
+    case 0x61...0x66: return b - 0x61 + 10      // 'a'-'f'
+    default: return nil
+    }
 }
 
 func bytesToHex(_ data: Data) -> String {
