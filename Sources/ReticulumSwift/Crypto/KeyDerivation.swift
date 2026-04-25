@@ -55,6 +55,15 @@ public enum KeyDerivation {
     /// Each block: HMAC(PRK, previous || context || counter)
     /// Note: Standard RFC 5869 would be HMAC(PRK, previous || info || counter)
     /// RNS uses "context" instead of "info" and the semantics may differ.
+    ///
+    /// The counter byte wraps mod 256 to match Python RNS's
+    /// `bytes([(i + 1) % (0xFF+1)])` formulation (hkdf.py:59). Strict
+    /// RFC 5869 caps output at 255 * HashLen = 8160 bytes, but RNS lets
+    /// the counter wrap so HKDF is defined for arbitrary lengths — this
+    /// matters for IFAC mask derivation on link DATA packets whose
+    /// per-packet raw + ifacSize can exceed 8160 when the link's
+    /// negotiated MDU is in the 8 KB range. A plain `counter += 1` on
+    /// UInt8 traps on overflow in Swift, crashing the whole process.
     private static func expandKey(prk: SymmetricKey, context: Data?, length: Int) -> Data {
         var output = Data()
         var previousBlock = Data()
@@ -72,7 +81,7 @@ public enum KeyDerivation {
             let code = HMAC<SHA256>.authenticationCode(for: hmacInput, using: prk)
             previousBlock = Data(code)
             output.append(previousBlock)
-            counter += 1
+            counter = counter &+ 1
         }
 
         return output.prefix(length)

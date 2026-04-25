@@ -250,10 +250,12 @@ public actor ReticulumTransport {
     private static let PATH_REQUEST_GRACE: TimeInterval = 0.4
     private static let PATH_REQUEST_TIMEOUT: TimeInterval = 15.0
 
-    /// Interface ID that last delivered an inbound packet (set before dispatch).
-    /// Used by handlePathRequest to know which interface to avoid when forwarding.
-    /// Safe because this actor processes packets sequentially.
-    private var lastReceivedInterfaceId: String?
+    // (Removed `lastReceivedInterfaceId` global — the path-request handler
+    // now receives the inbound interface id directly through the callback
+    // chain via `packet.receivingInterface`. The old global raced when any
+    // other packet arrived between handler dispatch and the async
+    // handler's read, which let the hub leak path-response announces to
+    // peers other than the asker.)
 
     // MARK: - Transport Table Properties
 
@@ -1678,7 +1680,6 @@ public actor ReticulumTransport {
                 return
             }
 
-            lastReceivedInterfaceId = interfaceId  // Track for path request handler
             let dataDestHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             logger.debug("DATA packet received: destType=\(String(describing: packet.header.destinationType)), dest=\(dataDestHex), ctx=0x\(String(format: "%02x", packet.context)), dataLen=\(packet.data.count)")
             if packet.header.destinationType == .link {
@@ -1790,14 +1791,17 @@ public actor ReticulumTransport {
 
             logger.info("Sending PROOF (\(proofData.count) bytes) for link \(linkIdHex)")
 
-            // Send PROOF via the interface that received the request
-            if let interface = interfaces[interfaceId] {
-                // For TCP, we need to use framed transport
-                if let tcpInterface = interface as? TCPInterface {
-                    try await tcpInterface.send(proofData)
-                } else {
-                    try await interface.send(proofData)
-                }
+            // Send PROOF via the interface that received the request.
+            // Route through sendToInterface (NOT interface.send directly)
+            // so applyIFAC runs on the outbound bytes. Calling
+            // interface.send directly skipped IFAC, producing a raw
+            // LINKPROOF that every IFAC-configured peer rejected with
+            // "IFAC validation failed" — specifically breaking 3-peer
+            // IFAC link establishment, since in that topology the
+            // LINKPROOF has to traverse a middle transport which drops
+            // the packet for missing IFAC before it reaches the sender.
+            if interfaces[interfaceId] != nil {
+                try await sendToInterface(proofData, interfaceId: interfaceId)
             } else {
                 // Broadcast to all interfaces as fallback
                 try await sendRawBytes(proofData)
@@ -2250,13 +2254,19 @@ public actor ReticulumTransport {
             }
         }
 
-        // Attach resolved interface name to packet before delivery
+        // Attach the receiving interface ID (NOT the human-readable name)
+        // to the packet before delivery. Callbacks (notably the path-request
+        // handler) need the stable id to look up the interface in the
+        // `interfaces` map and decide where to send a targeted response.
+        // Earlier code stored the name when available, which made
+        // `packet.receivingInterface` ambiguous (sometimes name, sometimes
+        // id) and forced handlers to fall back to the racy
+        // `lastReceivedInterfaceId` global instead — which let path-response
+        // routing leak to peers that just happened to be the most-recent
+        // sender of any packet at handler-dispatch time. If a caller wants
+        // a display name they can call `getInterfaceName(for:)`.
         var deliveryPacket = packet
-        if let name = await getInterfaceName(for: interfaceId) {
-            deliveryPacket.receivingInterface = name
-        } else {
-            deliveryPacket.receivingInterface = interfaceId
-        }
+        deliveryPacket.receivingInterface = interfaceId
 
         // Deliver decrypted data via callback manager
         logger.debug("Calling callbackManager.deliver() for destHash=\(hexPrefix)")
@@ -2982,6 +2992,63 @@ public actor ReticulumTransport {
         return announceHandler
     }
 
+    /// Get the announce table for direct access.
+    ///
+    /// Exposed primarily for conformance bridge observables —
+    /// path-response answering logic enqueues cached announces here
+    /// for re-transmission. Absence after a path-request is how tests
+    /// distinguish "refused to answer" from "normal quiescence".
+    public func getAnnounceTable() -> AnnounceTable {
+        return announceTable
+    }
+
+    // MARK: - Observability for conformance bridge
+
+    /// True if the path table has a route to `destinationHash`.
+    public func hasPath(for destinationHash: Data) async -> Bool {
+        return await pathTable.hasPath(for: destinationHash)
+    }
+
+    /// Hop count to `destinationHash`, or nil if no path is known.
+    public func hopsTo(_ destinationHash: Data) async -> UInt8? {
+        return await pathTable.lookup(destinationHash: destinationHash)?.hopCount
+    }
+
+    /// Full path entry for `destinationHash`, or nil if no path is known.
+    public func pathEntry(for destinationHash: Data) async -> PathEntry? {
+        return await pathTable.lookup(destinationHash: destinationHash)
+    }
+
+    /// True if a pending discovery path request exists for `destinationHash`.
+    ///
+    /// Exposed for path-discovery conformance tests that assert mode-gated
+    /// recursive forwarding fired (or didn't) by observing the
+    /// discoveryPathRequests map.
+    public func hasDiscoveryPathRequest(for destinationHash: Data) -> Bool {
+        return discoveryPathRequests[destinationHash] != nil
+    }
+
+    /// Send an unconditional path-request packet, bypassing the throttle
+    /// and recent-request guards in `requestPath(for:)`.
+    ///
+    /// Matches Python `RNS.Transport.request_path` semantics: always emit
+    /// a packet on the wire. Tests for the "fresh PR for already-known
+    /// destination" path use this to avoid the early-skip guard.
+    public func sendPathRequestUnconditional(for destinationHash: Data) async {
+        // Force a re-request by clearing the cooldown entry first, but
+        // remember the previous timestamp so we can put it back if
+        // `requestPath(for:)` returns without writing a fresh one.
+        // Otherwise an early-return path inside `requestPath` would
+        // permanently strip this destination's throttle slot, letting
+        // every subsequent regular path-request bypass the cooldown
+        // until something else re-populates it.
+        let previous = pathRequestTimestamps.removeValue(forKey: destinationHash)
+        await requestPath(for: destinationHash)
+        if pathRequestTimestamps[destinationHash] == nil, let previous {
+            pathRequestTimestamps[destinationHash] = previous
+        }
+    }
+
     /// Record a path entry in the path table.
     ///
     /// Convenience method for recording paths from validated announces.
@@ -3175,11 +3242,17 @@ public actor ReticulumTransport {
         pathRequestDestination = pathReqDest
         registerDestination(pathReqDest)
 
-        // Register callback for incoming path requests
+        // Register callback for incoming path requests. Capture the
+        // receiving interface id from the packet at callback time so the
+        // async handler doesn't have to read a racy global — `packet`
+        // arrives with `receivingInterface` set to the interface id by
+        // `deliverToLocalDestination`, which is stable across concurrent
+        // arrivals on different interfaces.
         await callbackManager.registerAsync(destinationHash: pathReqDest.hash) { [weak self] data, packet in
             guard let self = self else { return }
+            let recvIface = packet.receivingInterface
             Task {
-                await self.handlePathRequest(data: data)
+                await self.handlePathRequest(data: data, receivingInterfaceId: recvIface)
             }
         }
 
@@ -3198,7 +3271,7 @@ public actor ReticulumTransport {
     /// 3. Transport enabled → forward request on all other interfaces (discovery)
     ///
     /// Reference: Python Transport.py:2646-2820
-    private func handlePathRequest(data: Data) async {
+    private func handlePathRequest(data: Data, receivingInterfaceId: String? = nil) async {
         guard data.count >= TRUNCATED_HASH_LENGTH else { return }
 
         let destinationHash = Data(data.prefix(TRUNCATED_HASH_LENGTH))
@@ -3231,7 +3304,15 @@ public actor ReticulumTransport {
         }
 
         let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        let receivingInterfaceId = lastReceivedInterfaceId
+        // Use the per-packet receivingInterfaceId captured by the caller
+        // (the registerPathRequestHandler closure reads
+        // `packet.receivingInterface` at callback time and passes it
+        // through). The previous implementation read a `lastReceivedInterfaceId`
+        // global, which races whenever any other packet arrives between
+        // the path-request landing and the async handler running — and the
+        // hub-routing-isolation test catches exactly that race by bouncing
+        // keepalive traffic through a witness peer between asker→hub PR
+        // delivery and hub→asker response dispatch.
         onDiagnostic?("[PATH_REQ] for \(destHex) from interface \(receivingInterfaceId ?? "unknown")")
 
         // E12: Track local path requests (no transport_id = local origin)

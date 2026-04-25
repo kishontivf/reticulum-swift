@@ -94,15 +94,46 @@ enum JSONValue: Codable, Equatable {
 
 // MARK: - Hex Utilities
 
-func hexToBytes(_ hex: String) -> Data {
+/// Parse a hex string into bytes, returning nil on any non-hex character.
+///
+/// Each pair `[a-fA-F0-9]{2}` becomes one byte; trailing odd characters
+/// or any byte that isn't a valid hex pair causes a nil return rather
+/// than a trap. The earlier `UInt8(byte, radix: 16)!` form crashed the
+/// whole bridge process on a single malformed test fixture, masking the
+/// real diagnostic with a SIGTRAP. Returning Data? lets `getHex` raise
+/// a clean `BridgeError.invalidData` that the conformance runner can
+/// surface in test output.
+func hexToBytes(_ hex: String) -> Data? {
+    // Walk over UTF-8 bytes, not Substring. `Substring.count` is O(n)
+    // because Swift has to step through grapheme/UTF-16 boundaries,
+    // turning the per-iteration `rest.count >= 2` check into the
+    // outer of an O(n²) loop — which torches the bridge on large
+    // hex payloads (e.g. wire_resource_send with 256 KB of data
+    // arrives as 524288 hex chars and spends ~120 s doing nothing
+    // but counting). UTF-8 byte access is O(1).
+    let bytes = Array(hex.utf8)
+    guard bytes.count.isMultiple(of: 2) else { return nil }
+
     var data = Data()
-    var hex = hex
-    while hex.count >= 2 {
-        let byte = String(hex.prefix(2))
-        hex = String(hex.dropFirst(2))
-        data.append(UInt8(byte, radix: 16)!)
+    data.reserveCapacity(bytes.count / 2)
+    var i = 0
+    while i < bytes.count {
+        guard let high = nibble(bytes[i]),
+              let low = nibble(bytes[i + 1]) else { return nil }
+        data.append((high << 4) | low)
+        i += 2
     }
     return data
+}
+
+@inline(__always)
+private func nibble(_ b: UInt8) -> UInt8? {
+    switch b {
+    case 0x30...0x39: return b - 0x30           // '0'-'9'
+    case 0x41...0x46: return b - 0x41 + 10      // 'A'-'F'
+    case 0x61...0x66: return b - 0x61 + 10      // 'a'-'f'
+    default: return nil
+    }
 }
 
 func bytesToHex(_ data: Data) -> String {
@@ -115,7 +146,10 @@ func getHex(_ params: [String: JSONValue], _ key: String) throws -> Data {
     guard let val = params[key]?.stringValue else {
         throw BridgeError.missingParam(key)
     }
-    return hexToBytes(val)
+    guard let bytes = hexToBytes(val) else {
+        throw BridgeError.invalidData("Parameter \(key) is not a valid hex string")
+    }
+    return bytes
 }
 
 func getHexOptional(_ params: [String: JSONValue], _ key: String) -> Data? {
@@ -1029,7 +1063,9 @@ func handleCommand(_ req: Request) throws -> Result {
         let randomHash = try getHex(p, "random_hash")
         var hashmap = Data()
         for partHex in partsHex {
-            let partData = hexToBytes(partHex)
+            guard let partData = hexToBytes(partHex) else {
+                throw BridgeError.invalidData("parts[] contains an entry that is not a valid hex string: \(partHex.prefix(16))…")
+            }
             let hash = ResourceHashmap.partHash(partData, randomHash: randomHash)
             hashmap.append(hash)
         }
@@ -1194,7 +1230,12 @@ func handleCommand(_ req: Request) throws -> Result {
         let interfaceHash = try getHex(p, "interface_hash")
         let packetHash = try getHex(p, "packet_hash")
         // Serialize as msgpack array: [dest_hash, timestamp, received_from, hops, expires, random_blobs, interface_hash, packet_hash]
-        let randomBlobValues: [MessagePackValue] = randomBlobsHex.map { .binary(hexToBytes($0)) }
+        let randomBlobValues: [MessagePackValue] = try randomBlobsHex.map {
+            guard let bytes = hexToBytes($0) else {
+                throw BridgeError.invalidData("random_blobs[] contains a non-hex entry")
+            }
+            return .binary(bytes)
+        }
         let entry: [MessagePackValue] = [
             .binary(destHash),
             .double(timestamp),
@@ -1266,7 +1307,12 @@ func handleCommand(_ req: Request) throws -> Result {
 
     case "packet_hashlist_pack":
         let hashesHex = getStringArray(p, "hashes")
-        let hashValues: [MessagePackValue] = hashesHex.map { .binary(hexToBytes($0)) }
+        let hashValues: [MessagePackValue] = try hashesHex.map {
+            guard let bytes = hexToBytes($0) else {
+                throw BridgeError.invalidData("hashes[] contains a non-hex entry")
+            }
+            return .binary(bytes)
+        }
         let packed = packMsgPack(.array(hashValues))
         return [
             "serialized": hex(packed),
@@ -1295,7 +1341,10 @@ func handleCommand(_ req: Request) throws -> Result {
     case "ifac_derive_key":
         let ifacOrigin = try getHex(p, "ifac_origin")
         // IFAC key derivation: HKDF(ifac_origin, salt=IFAC_SALT, length=64)
-        let ifacSalt = hexToBytes("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8")
+        // The literal is a hardcoded constant — `?? Data()` is unreachable
+        // unless someone introduces a typo in this file, in which case the
+        // resulting key mismatch surfaces in the IFAC interop tests.
+        let ifacSalt = hexToBytes("adf54d882c9a9b80771eb4995d702d4a3e733391b2a0f53f416d9f907e55cff8") ?? Data()
         let ifacKey = KeyDerivation.deriveKey(length: 64, inputKeyMaterial: ifacOrigin, salt: ifacSalt, context: nil)
         return [
             "ifac_key": hex(ifacKey),
@@ -1616,6 +1665,27 @@ func handleCommand(_ req: Request) throws -> Result {
          "behavioral_inject",
          "behavioral_drain_tx":
         return try handleBehavioralCommand(req.command, p)
+
+    case "wire_start_tcp_server",
+         "wire_start_tcp_client",
+         "wire_stop",
+         "wire_announce",
+         "wire_poll_path",
+         "wire_read_path_entry",
+         "wire_has_discovery_path_request",
+         "wire_has_announce_table_entry",
+         "wire_read_announce_table_timestamp",
+         "wire_tx_bytes",
+         "wire_read_path_random_hash",
+         "wire_request_path",
+         "wire_set_interface_mode",
+         "wire_listen",
+         "wire_link_open",
+         "wire_link_send",
+         "wire_link_poll",
+         "wire_resource_send",
+         "wire_resource_poll":
+        return try handleWireCommand(req.command, p)
 
     default:
         throw BridgeError.unknownCommand(req.command)

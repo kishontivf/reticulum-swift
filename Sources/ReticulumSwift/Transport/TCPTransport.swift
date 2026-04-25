@@ -210,7 +210,13 @@ public final class TCPTransport: Transport {
 
     private func updateState(_ newState: TransportState) {
         state = newState
-        DispatchQueue.main.async { [weak self] in
+        // Invoke the callback on our dedicated connection queue rather
+        // than DispatchQueue.main. The UI-oriented original implementation
+        // assumed a main run loop was live, but that breaks non-UI hosts
+        // (daemons, CLI bridges) where the main thread is blocked on
+        // stdin / other work and the main queue never drains — which
+        // would leave this interface stuck in .connecting forever.
+        connectionQueue.async { [weak self] in
             guard let self = self else { return }
             self.onStateChange?(newState)
         }

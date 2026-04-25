@@ -17,7 +17,7 @@ jobs:
   conformance:
     name: Conformance (Swift)
     runs-on: macos-15
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,15 +53,31 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install pytest
+      - run: pip install pytest pytest-timeout
 
       - name: Run conformance tests
         working-directory: reticulum-conformance
         env:
-          CONFORMANCE_BRIDGE_CMD: ${{ github.workspace }}/reticulum-swift-lib/.build/release/ConformanceBridge
+          # Per-impl override: the fresh-built Swift bridge is used for
+          # swift peers; reference peers fall back to the Python RNS bridge
+          # so cross-impl parametrization exercises both stacks.
+          CONFORMANCE_SWIFT_BRIDGE_CMD: ${{ github.workspace }}/reticulum-swift-lib/.build/release/ConformanceBridge
           PYTHON_RNS_PATH: ${{ github.workspace }}/Reticulum
           PYTHON_LXMF_PATH: ${{ github.workspace }}/LXMF
-        run: python3 -m pytest tests/ --impl=swift -v --tb=short
+        # tests/lxmf/ is the LXMF-layer conformance suite owned by LXMF-swift;
+        # it rides the same bridge but has its own CI target. Keep the
+        # reticulum-swift CI focused on RNS-layer parity.
+        #
+        # --timeout=180 caps any individual test that wedges (resource-multihop
+        # can hang indefinitely on a failed transfer) so a single hung case
+        # doesn't consume the entire workflow budget and timeout-kill the
+        # whole run. 180 s tolerates the slowest passing cases:
+        # test_large_resource_multihop transfers 256 KB through a 2-hop link
+        # and takes ~60-90 s per variant on a macos-15 runner; all 8
+        # variants pass reliably at this cap. Previous 60 s cap was too
+        # tight and caused 4 of those 8 to fail as "Timeout" instead of
+        # completing.
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short --timeout=180
 
       - name: Run integration tests (IFAC pipe)
         working-directory: reticulum-conformance

@@ -1086,6 +1086,44 @@ public actor Link {
         self.resourceCallbacks = callbacks
     }
 
+    /// Send a plaintext payload over the link as a single DATA packet.
+    ///
+    /// Mirrors Python `Link.send(...)`: encrypts the plaintext with the
+    /// link's session key, wraps it in a CONTEXT_NONE DATA packet addressed
+    /// to `linkId`, and dispatches via `sendCallback`. Used by the
+    /// conformance bridge's `wire_link_send` to deliver small single-packet
+    /// payloads; for larger arbitrary-size data use `sendResource` instead.
+    ///
+    /// - Parameter plaintext: Unencrypted payload bytes
+    /// - Throws: LinkError if the link is not active or encryption fails
+    public func send(_ plaintext: Data) async throws {
+        guard state.isEstablished else { throw LinkError.notActive }
+        // sendCallback is wired in `initiateLink` / link-establishment paths
+        // before the link transitions to .active, so an active link with no
+        // callback indicates an internal wiring bug rather than a state
+        // problem. Surface that as `transportNotAvailable` so callers can
+        // distinguish "link closed" from "callback never set" without
+        // having to read the call site.
+        guard let sendCallback else { throw LinkError.transportNotAvailable }
+        let ciphertext = try encrypt(plaintext)
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            transportType: .broadcast,
+            destinationType: .link,
+            packetType: .data,
+            hopCount: 0
+        )
+        let packet = Packet(
+            header: header,
+            destination: linkId,
+            context: 0x00,
+            data: ciphertext
+        )
+        try await sendCallback(packet.encode())
+    }
+
     /// Send a resource over the link.
     ///
     /// Creates a new outbound resource, prepares it, sends the advertisement,
@@ -1128,14 +1166,28 @@ public actor Link {
         }
         // BZ2 compression disabled: our BZ2 output may not decompress correctly on
         // the Python receiver. Disable until interop is verified with E2E tests.
-        // Using global MDU (464) as partSize — this is the max unencrypted payload
-        // for resource data parts (context 0x01, not link-encrypted).
-        try await resource.prepare(partSize: MDU, linkEncrypt: { plaintext in
+        //
+        // partSize MUST equal the link's negotiated MDU. Python's
+        // Resource.accept computes `total_parts = ceil(transferSize / link.mdu)`
+        // using the receiver's own negotiated link.mdu (Resource.py:188).
+        // If the sender splits into parts sized by a different value (e.g.,
+        // the global Reticulum MDU of 464), the receiver will allocate a
+        // differently-sized hashmap slot array and then IndexError when
+        // hashmap_update tries to store the sender's actual hash count.
+        // Python swallows that exception and drops the resource silently
+        // ("Could not decode resource advertisement, dropping resource" at
+        // DEBUG level), stalling the transfer in `.advertised` state.
+        //
+        // `self.mdu` is updated by MTU discovery in processProof, so by the
+        // time sendResource runs the link's MDU reflects whatever MTU the
+        // peers agreed on during link establishment.
+        let partSize = self.mdu
+        try await resource.prepare(partSize: partSize, linkEncrypt: { plaintext in
             return try encryptToken.encrypt(plaintext)
         }, autoCompress: false)
         let numParts = await resource.numParts
         let transferSize = await resource.transferSize
-        linkLogger.info("Resource prepared: \(numParts, privacy: .public) parts, partSize=\(MDU, privacy: .public), transferSize=\(transferSize, privacy: .public), compressed=false")
+        linkLogger.info("Resource prepared: \(numParts, privacy: .public) parts, partSize=\(partSize, privacy: .public), transferSize=\(transferSize, privacy: .public), compressed=false")
 
         // Store resource (hash is available after prepare)
         let hash = await resource.hash ?? Data()

@@ -334,6 +334,15 @@ public actor AnnounceTable {
         return entries[destinationHash] != nil
     }
 
+    /// Timestamp (as seconds-since-epoch) of an announce table entry, or nil if absent.
+    ///
+    /// Exposed for conformance bridge observables — tests distinguish
+    /// "entry is the original retransmit slot" from "entry was replaced
+    /// by a path-request answer" by comparing timestamps before/after a PR.
+    public func entryTimestamp(_ destinationHash: Data) -> Date? {
+        return entries[destinationHash]?.timestamp
+    }
+
     /// Number of entries in the table.
     public var count: Int {
         entries.count
