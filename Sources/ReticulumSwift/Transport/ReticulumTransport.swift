@@ -2279,9 +2279,14 @@ public actor ReticulumTransport {
 
         // Send proof back for SINGLE destination opportunistic packets.
         // Python Transport calls packet.prove() after local delivery for SINGLE destinations.
-        // Proof format: HEADER_1 / PROOF / BROADCAST / PLAIN
+        // Proof format: HEADER_1 / PROOF / BROADCAST / SINGLE
         //   destination = packet.getTruncatedHash() (16 bytes)
         //   data        = identity.sign(packet.getFullHash()) (64 bytes)
+        //
+        // Reference: Python RNS/Packet.py ProofDestination.type = RNS.Destination.SINGLE.
+        // The destinationType MUST be .single (not .plain) — the wire-format flag is set
+        // from the proof destination's type, and using .plain produces a malformed proof
+        // that Python/Android receivers cannot validate against the original packet.
         if packet.header.destinationType == .single,
            let identity = destination.identity,
            identity.hasPrivateKeys {
@@ -2292,7 +2297,7 @@ public actor ReticulumTransport {
                     hasContext: false,
                     hasIFAC: false,
                     transportType: .broadcast,
-                    destinationType: .plain,
+                    destinationType: .single,
                     packetType: .proof,
                     hopCount: 0
                 )
@@ -2304,8 +2309,12 @@ public actor ReticulumTransport {
                     data: signature
                 )
                 let encoded = proofPacket.encode()
-                if let iface = interfaces[interfaceId] {
-                    try await iface.send(encoded)
+                // Route through sendToInterface (NOT interface.send directly) so applyIFAC
+                // runs on the outbound bytes. Calling iface.send directly skips IFAC and
+                // produces a raw proof that IFAC-configured peers reject as "IFAC validation
+                // failed" — the same anti-pattern previously fixed for LINKPROOF send.
+                if interfaces[interfaceId] != nil {
+                    try await sendToInterface(encoded, interfaceId: interfaceId)
                     logger.debug("Proof sent for packet \(hexPrefix), sig=\(signature.prefix(8).map { String(format: "%02x", $0) }.joined())...")
                 }
             } catch {
