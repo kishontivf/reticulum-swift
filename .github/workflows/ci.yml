@@ -26,5 +26,40 @@ jobs:
       - name: Build
         run: swift build
 
-      - name: Test
-        run: swift test
+      - name: Test (with coverage)
+        # Bridge interop tests (Tests/ReticulumSwiftTests/Interop/**) skip
+        # cleanly via XCTSkipUnless when ~/repos/Reticulum and the LXMF
+        # Python package are absent — which they are on a default
+        # macos-15 runner. So `swift test` runs the full RNS-layer suite
+        # here, with the Python bridge tests skipped. The conformance
+        # workflow (.github/workflows/conformance.yml) is what exercises
+        # the bridge against pinned reference repos.
+        run: swift test --enable-code-coverage
+
+      - name: Export coverage report (lcov)
+        run: |
+          XCTEST_BIN=$(find .build -type d -name '*.xctest' | head -1)
+          if [ -d "$XCTEST_BIN/Contents/MacOS" ]; then
+            BIN_PATH="$XCTEST_BIN/Contents/MacOS/$(basename "$XCTEST_BIN" .xctest)"
+          else
+            BIN_PATH="$XCTEST_BIN"
+          fi
+          PROF_DATA=$(find .build -name 'default.profdata' | head -1)
+          echo "Test binary: $BIN_PATH"
+          echo "Profile data: $PROF_DATA"
+          xcrun llvm-cov export \
+            "$BIN_PATH" \
+            -instr-profile="$PROF_DATA" \
+            -ignore-filename-regex='\.build|Tests' \
+            -format=lcov \
+            > coverage.lcov
+          xcrun llvm-cov report \
+            "$BIN_PATH" \
+            -instr-profile="$PROF_DATA" \
+            -ignore-filename-regex='\.build|Tests'
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: coverage.lcov
+          fail_ci_if_error: false
