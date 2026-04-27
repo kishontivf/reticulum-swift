@@ -146,6 +146,67 @@ final class LinkProveTests: XCTestCase {
             "signing key. If this fails, python peers will reject the proof.")
     }
 
+    // MARK: - Test 1b: provePacket rejects initiator-side use
+
+    func testProvePacketRejectsInitiator() async throws {
+        // The initiator's `localIdentity` is the initiator's own
+        // identity, NOT the destination identity. Python's
+        // `validate_link_proof` verifies signatures with
+        // `link.destination.identity.verify(...)` — so an initiator-
+        // produced signature fails verification silently. Catch this
+        // misuse early at the call site instead of letting LXMF DIRECT
+        // outbound stall on a mysteriously-never-delivered message.
+        let initiatorIdentity = Identity()
+        let remoteIdentity = Identity()
+        let remoteDest = Destination(
+            identity: remoteIdentity,
+            appName: "test",
+            aspects: ["initiator-guard"]
+        )
+        let link = Link(destination: remoteDest, identity: initiatorIdentity)
+        // Force state past the pending guard — the initiator check
+        // should fire BEFORE the state guard, so the link being
+        // .active vs not is irrelevant for this test.
+        await link._setStateForTesting(.active)
+        await link.setSendCallback { _ in /* should never be called */ }
+
+        let dataHeader = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            transportType: .broadcast,
+            destinationType: .link,
+            packetType: .data,
+            hopCount: 0
+        )
+        let inbound = Packet(
+            header: dataHeader,
+            destination: Data(repeating: 0xab, count: 16),
+            context: 0x00,
+            data: Data("anything".utf8)
+        )
+
+        do {
+            try await link.provePacket(inbound)
+            XCTFail("provePacket on an initiator link must throw — calling " +
+                    "it would sign with the wrong key and silently fail " +
+                    "verification on the responder side")
+        } catch let error as LinkError {
+            // We use `invalidState(expected:"responder", actual:"initiator")`
+            // to telegraph the misuse. Any other LinkError implies the
+            // initiator guard regressed and a different earlier guard
+            // tripped instead.
+            switch error {
+            case .invalidState(let expected, let actual):
+                XCTAssertEqual(expected, "responder")
+                XCTAssertEqual(actual, "initiator")
+            default:
+                XCTFail("provePacket initiator-guard threw the wrong " +
+                        "LinkError variant: \(error). Expected " +
+                        "`invalidState(expected: responder, actual: initiator)`.")
+            }
+        }
+    }
+
     // MARK: - Test 2: handleDataProof fires pendingProofCallbacks
 
     func testRegisterProofCallbackFiresOnLinkContextProof() async throws {

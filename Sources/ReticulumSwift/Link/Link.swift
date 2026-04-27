@@ -1153,6 +1153,20 @@ public actor Link {
     ///
     /// - Parameter packet: the inbound packet that should be proven
     public func provePacket(_ packet: Packet) async throws {
+        // Initiators must not call provePacket. The signature is
+        // produced with `localIdentity`, but the Python sender on
+        // an initiator-attached link verifies with
+        // `link.destination.identity.verify(...)` — i.e., the
+        // *responder's* identity public key. An initiator-side
+        // proof would sign with the wrong key and silently fail
+        // verification on the peer (no thrown error, no callback
+        // fired). LXMF DIRECT only ever needs the responder to
+        // prove packets, so reject this misuse loudly here rather
+        // than letting it become a confusing "messages send but
+        // never deliver" failure mode.
+        guard !initiator else {
+            throw LinkError.invalidState(expected: "responder", actual: "initiator")
+        }
         guard state.isEstablished else { throw LinkError.notActive }
         guard let sendCallback else { throw LinkError.transportNotAvailable }
 
