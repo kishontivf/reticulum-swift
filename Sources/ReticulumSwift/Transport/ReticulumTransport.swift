@@ -924,8 +924,15 @@ public actor ReticulumTransport {
             logger.info("Proof confirmed delivery for packetHash=\(proofHex)")
             continuation.resume(returning: true)
         } else {
+            // Don't say "no match" here — the callback-style API
+            // (`pendingProofCallbacks`, used by LXMF DIRECT) is
+            // checked next and is the common path for link-context
+            // proofs. A bare "no pending proof match" log on a
+            // successful callback dispatch misleads anyone triaging
+            // a delivery problem into thinking nothing handled the
+            // proof.
             let pendingHashes = pendingPacketProofs.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-            logger.debug("No pending proof match for \(proofHex). Pending hashes: \(pendingHashes)")
+            logger.debug("No continuation-style proof match for \(proofHex). Checking callback API. Pending continuations: \(pendingHashes)")
         }
 
         // ALSO check the callback-style API. LXMF DIRECT-small uses
