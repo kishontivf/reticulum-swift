@@ -34,6 +34,13 @@ import XCTest
 import CryptoKit
 @testable import ReticulumSwift
 
+// `_setStateForTesting` (used to bring a Link to `.active` without
+// running the LRRTT handshake) is wrapped in `#if DEBUG` on the
+// implementation side. Wrap the test class in the same guard so
+// `swift test -c release` doesn't fail to compile — default
+// `swift test` runs debug, but releasing the suite from this
+// dependency would otherwise leave a fragile hidden contract.
+#if DEBUG
 final class LinkProveTests: XCTestCase {
 
     // MARK: - Test 1: provePacket wire format
@@ -338,3 +345,4 @@ private actor CapturedSends {
         return copy
     }
 }
+#endif

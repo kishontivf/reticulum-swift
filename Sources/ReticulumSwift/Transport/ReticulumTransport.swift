@@ -948,6 +948,18 @@ public actor ReticulumTransport {
             logger.info("Matched delivery proof callback (link) for \(proofHex), invoking callback")
             Task { await entry.callback() }
         }
+
+        // Sweep expired callbacks here too. The non-link proof path
+        // already does this around line 1693, but if a Swift LXMF
+        // DIRECT proof is dropped on the wire, the registered
+        // callback would otherwise sit in the dict until an
+        // unrelated non-link PROOF arrived to trigger cleanup —
+        // a subtle leak under intermittent loss. 5-minute TTL
+        // matches the non-link sweep.
+        let now = Date()
+        pendingProofCallbacks = pendingProofCallbacks.filter {
+            now.timeIntervalSince($0.value.registeredAt) < 300
+        }
     }
 
     /// Send raw packet bytes, optionally to a specific interface.
