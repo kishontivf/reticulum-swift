@@ -839,6 +839,18 @@ public actor Link {
         attachedInterfaceId = id
     }
 
+    #if DEBUG
+    /// Test-only helper that forces the link's state without running the
+    /// full LRRTT handshake. Skips the `transitionState` validity guard
+    /// so unit tests can stand a link up directly in `.active` and
+    /// exercise APIs (like `provePacket`) that gate on
+    /// `state.isEstablished`. Not for production use — wrapping this in
+    /// `#if DEBUG` keeps it out of release builds entirely.
+    func _setStateForTesting(_ newState: LinkState) {
+        state = newState
+    }
+    #endif
+
     // MARK: - Keep-Alive
 
     /// Start the keep-alive task.
