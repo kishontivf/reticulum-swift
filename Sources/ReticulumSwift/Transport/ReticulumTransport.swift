@@ -919,13 +919,46 @@ public actor ReticulumTransport {
         let proofHex = proofHash.prefix(8).map { String(format: "%02x", $0) }.joined()
         logger.debug("Received DATA proof, packetHash=\(proofHex)..., totalLen=\(proofData.count)")
 
-        // Check against pending packet proofs
+        // Check against pending packet proofs (continuation-style API)
         if let continuation = pendingPacketProofs.removeValue(forKey: proofHash) {
             logger.info("Proof confirmed delivery for packetHash=\(proofHex)")
             continuation.resume(returning: true)
         } else {
+            // Don't say "no match" here — the callback-style API
+            // (`pendingProofCallbacks`, used by LXMF DIRECT) is
+            // checked next and is the common path for link-context
+            // proofs. A bare "no pending proof match" log on a
+            // successful callback dispatch misleads anyone triaging
+            // a delivery problem into thinking nothing handled the
+            // proof.
             let pendingHashes = pendingPacketProofs.keys.map { $0.prefix(8).map { String(format: "%02x", $0) }.joined() }
-            logger.debug("No pending proof match for \(proofHex). Pending hashes: \(pendingHashes)")
+            logger.debug("No continuation-style proof match for \(proofHex). Checking callback API. Pending continuations: \(pendingHashes)")
+        }
+
+        // ALSO check the callback-style API. LXMF DIRECT-small uses
+        // `registerProofCallback(truncatedHash:)` to learn when its
+        // link-data packet has been proven; without this branch the
+        // callback dict would be checked only for non-link proofs and
+        // a DIRECT delivery proof would silently never advance the
+        // outbound message state to `.delivered`. Mirrors the symmetric
+        // check at the non-link proof path (callback + receipt are
+        // both fired non-exclusively).
+        let truncatedHash = Data(proofHash.prefix(TRUNCATED_HASH_LENGTH))
+        if let entry = pendingProofCallbacks.removeValue(forKey: truncatedHash) {
+            logger.info("Matched delivery proof callback (link) for \(proofHex), invoking callback")
+            Task { await entry.callback() }
+        }
+
+        // Sweep expired callbacks here too. The non-link proof path
+        // already does this around line 1693, but if a Swift LXMF
+        // DIRECT proof is dropped on the wire, the registered
+        // callback would otherwise sit in the dict until an
+        // unrelated non-link PROOF arrived to trigger cleanup —
+        // a subtle leak under intermittent loss. 5-minute TTL
+        // matches the non-link sweep.
+        let now = Date()
+        pendingProofCallbacks = pendingProofCallbacks.filter {
+            now.timeIntervalSince($0.value.registeredAt) < 300
         }
     }
 
@@ -2111,18 +2144,19 @@ public actor ReticulumTransport {
             let linkHex = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
             logger.info("Delivering \(plaintext.count, privacy: .public) bytes from link \(linkHex, privacy: .public)... to LXMF dest \(lxmfDestHex, privacy: .public)...")
 
-            // Deliver to the LXMF destination's callback
-            // Create a synthetic packet for the callback (preserving link context)
-            let syntheticPacket = Packet(
-                header: packet.header,
-                destination: lxmfDestHash,
-                transportAddress: nil,
-                context: packet.context,
-                data: plaintext
-            )
+            // Deliver to the LXMF destination's callback. Pass the
+            // ORIGINAL link packet — its destination is the linkId,
+            // and the LXMF delivery callback uses
+            // `packet.getFullHash()` / `getTruncatedHash()` to compute
+            // the proof reply. Rewriting `destination` to lxmfDestHash
+            // would change those hashes, so the proof we send back
+            // would not match the receipt the sender registered for
+            // the original link-DATA packet — DIRECT delivery would
+            // never advance to `delivered` for the sender even though
+            // the message arrived correctly.
             await callbackManager.deliver(
                 data: plaintext,
-                packet: syntheticPacket,
+                packet: packet,
                 to: lxmfDestHash
             )
         } catch {

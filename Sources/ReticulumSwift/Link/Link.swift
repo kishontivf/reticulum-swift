@@ -839,6 +839,18 @@ public actor Link {
         attachedInterfaceId = id
     }
 
+    #if DEBUG
+    /// Test-only helper that forces the link's state without running the
+    /// full LRRTT handshake. Skips the `transitionState` validity guard
+    /// so unit tests can stand a link up directly in `.active` and
+    /// exercise APIs (like `provePacket`) that gate on
+    /// `state.isEstablished`. Not for production use — wrapping this in
+    /// `#if DEBUG` keeps it out of release builds entirely.
+    func _setStateForTesting(_ newState: LinkState) {
+        state = newState
+    }
+    #endif
+
     // MARK: - Keep-Alive
 
     /// Start the keep-alive task.
@@ -1122,6 +1134,63 @@ public actor Link {
             data: ciphertext
         )
         try await sendCallback(packet.encode())
+    }
+
+    /// Prove a received packet over the link. Mirrors Python's
+    /// `RNS.Link.prove_packet`: signs the packet's full hash with the
+    /// destination identity's signing key (the responder reuses
+    /// `owner.identity.sig_prv`) and emits an unencrypted PROOF packet
+    /// addressed to the link itself, with explicit-format proof data
+    /// (32-byte hash + 64-byte signature).
+    ///
+    /// The python sender's outbound `PacketReceipt.validate_link_proof`
+    /// requires explicit format AND verifies the signature with the
+    /// peer's signing public key — which, for an outbound link, is the
+    /// remote destination identity's key. Sending an implicit (signature
+    /// only) proof or signing with a non-identity key would silently
+    /// fail validation on python and the message would never reach
+    /// `delivered`.
+    ///
+    /// - Parameter packet: the inbound packet that should be proven
+    public func provePacket(_ packet: Packet) async throws {
+        // Initiators must not call provePacket. The signature is
+        // produced with `localIdentity`, but the Python sender on
+        // an initiator-attached link verifies with
+        // `link.destination.identity.verify(...)` — i.e., the
+        // *responder's* identity public key. An initiator-side
+        // proof would sign with the wrong key and silently fail
+        // verification on the peer (no thrown error, no callback
+        // fired). LXMF DIRECT only ever needs the responder to
+        // prove packets, so reject this misuse loudly here rather
+        // than letting it become a confusing "messages send but
+        // never deliver" failure mode.
+        guard !initiator else {
+            throw LinkError.invalidState(expected: "responder", actual: "initiator")
+        }
+        guard state.isEstablished else { throw LinkError.notActive }
+        guard let sendCallback else { throw LinkError.transportNotAvailable }
+
+        let packetHash = packet.getFullHash()
+        let signature = try localIdentity.sign(packetHash)
+        var proofData = Data()
+        proofData.append(packetHash)
+        proofData.append(signature)
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            transportType: .broadcast,
+            destinationType: .link,
+            packetType: .proof,
+            hopCount: 0
+        )
+        let proofPacket = Packet(
+            header: header,
+            destination: linkId,
+            context: 0x00,
+            data: proofData
+        )
+        try await sendCallback(proofPacket.encode())
     }
 
     /// Send a resource over the link.
