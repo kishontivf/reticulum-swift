@@ -1124,6 +1124,49 @@ public actor Link {
         try await sendCallback(packet.encode())
     }
 
+    /// Prove a received packet over the link. Mirrors Python's
+    /// `RNS.Link.prove_packet`: signs the packet's full hash with the
+    /// destination identity's signing key (the responder reuses
+    /// `owner.identity.sig_prv`) and emits an unencrypted PROOF packet
+    /// addressed to the link itself, with explicit-format proof data
+    /// (32-byte hash + 64-byte signature).
+    ///
+    /// The python sender's outbound `PacketReceipt.validate_link_proof`
+    /// requires explicit format AND verifies the signature with the
+    /// peer's signing public key — which, for an outbound link, is the
+    /// remote destination identity's key. Sending an implicit (signature
+    /// only) proof or signing with a non-identity key would silently
+    /// fail validation on python and the message would never reach
+    /// `delivered`.
+    ///
+    /// - Parameter packet: the inbound packet that should be proven
+    public func provePacket(_ packet: Packet) async throws {
+        guard state.isEstablished else { throw LinkError.notActive }
+        guard let sendCallback else { throw LinkError.transportNotAvailable }
+
+        let packetHash = packet.getFullHash()
+        let signature = try localIdentity.sign(packetHash)
+        var proofData = Data()
+        proofData.append(packetHash)
+        proofData.append(signature)
+
+        let header = PacketHeader(
+            headerType: .header1,
+            hasContext: false,
+            transportType: .broadcast,
+            destinationType: .link,
+            packetType: .proof,
+            hopCount: 0
+        )
+        let proofPacket = Packet(
+            header: header,
+            destination: linkId,
+            context: 0x00,
+            data: proofData
+        )
+        try await sendCallback(proofPacket.encode())
+    }
+
     /// Send a resource over the link.
     ///
     /// Creates a new outbound resource, prepares it, sends the advertisement,
