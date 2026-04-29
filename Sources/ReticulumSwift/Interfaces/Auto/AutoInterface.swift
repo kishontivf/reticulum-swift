@@ -133,6 +133,20 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     /// Callback when a peer interface is removed — Transport unregisters it
     private var onPeerRemoved: ((String) -> Void)?
 
+    /// Optional outbound hook installed via `beginTunnelMode(send:)`.
+    ///
+    /// When non-nil, `send(_:)` skips the per-peer UDP fan-out and
+    /// hands the raw packet bytes to this hook. Used by clients that
+    /// own a separate transport channel (e.g. iOS Network Extension
+    /// VPN tunnel that does its own multicast).
+    private var outboundHook: (@Sendable (Data) async -> Void)?
+
+    /// Reconnect task spawned by `endTunnelMode`. Held so a fast
+    /// follow-up `beginTunnelMode` can cancel it before it spawns
+    /// peer/announce jobs that would otherwise leak past the new
+    /// tunnel-mode entry.
+    private var pendingReconnectTask: Task<Void, Never>?
+
     // MARK: - Background Tasks
 
     private var announceTask: Task<Void, Never>?
@@ -295,9 +309,101 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     /// The parent AutoInterface coordinates discovery only. Data is routed
     /// through the per-peer sub-interfaces that Transport manages directly.
     public func send(_ data: Data) async throws {
+        // Tunnel-mode short-circuit: a host (e.g. iOS Network Extension
+        // manager) owns the actual multicast socket. Hand the raw
+        // packet bytes off; the hook fans out via the tunnel.
+        if let hook = outboundHook {
+            await hook(data)
+            return
+        }
+
         // Broadcast: send to all peers via their data sockets
         for (_, peer) in spawnedInterfaces {
             try? await peer.send(data)
+        }
+    }
+
+    // MARK: - Tunnel Mode
+
+    /// Route outbound traffic through an external channel (e.g. an iOS
+    /// Network Extension multicast listener) instead of this interface's
+    /// own per-peer UDP sockets.
+    ///
+    /// Disconnects from local sockets, marks the interface
+    /// `.connected` so upstream routing keeps using it, and stores the
+    /// hook. Reverse with `endTunnelMode()`.
+    ///
+    /// - Parameter hook: Closure that receives raw Reticulum packet
+    ///   bytes (no framing — UDP preserves boundaries). Forwards e.g.
+    ///   to a VPN extension via `sendProviderMessage`.
+    public func beginTunnelMode(send hook: @escaping @Sendable (Data) async -> Void) async {
+        // Cancel any reconnect task left over from a recent
+        // `endTunnelMode`. Without this, a fast off→on toggle could
+        // let the previous warmup-sleep wake AFTER tunnel mode was
+        // re-entered and start peer/announce jobs that would orphan
+        // until the next teardown.
+        pendingReconnectTask?.cancel()
+        pendingReconnectTask = nil
+
+        // Tear down local sockets / receive tasks WITHOUT firing a
+        // .disconnected delegate transition. If we delegated to
+        // `disconnect()` here it would notify the delegate twice
+        // (.disconnected then immediately .connected), and any
+        // delegate that drops the interface from its routing table on
+        // .disconnected would create a window where outbound packets
+        // are dropped despite the tunnel being seamlessly active.
+        announceTask?.cancel()
+        peerJobsTask?.cancel()
+        for task in mcastReceiveTasks.values { task.cancel() }
+        for task in ucastReceiveTasks.values { task.cancel() }
+        for task in dataReceiveTasks.values { task.cancel() }
+        mcastReceiveTasks.removeAll()
+        ucastReceiveTasks.removeAll()
+        dataReceiveTasks.removeAll()
+
+        for (addr, peer) in spawnedInterfaces {
+            await peer.disconnect()
+            onPeerRemoved?(peer.id)
+            logger.info("Removed peer \(addr, privacy: .public)")
+        }
+        spawnedInterfaces.removeAll()
+        peers.removeAll()
+
+        for (_, fd) in multicastSockets { UDPSocketHelper.close(fd) }
+        for (_, fd) in unicastSockets { UDPSocketHelper.close(fd) }
+        for (_, fd) in dataSockets { UDPSocketHelper.close(fd) }
+        multicastSockets.removeAll()
+        unicastSockets.removeAll()
+        dataSockets.removeAll()
+        adoptedInterfaces.removeAll()
+        ownAddresses.removeAll()
+
+        outboundHook = hook
+        let wasConnected = state == .connected
+        state = .connected
+        if !wasConnected {
+            delegateRef?.delegate?.interface(id: id, didChangeState: .connected)
+        }
+    }
+
+    /// Exit tunnel mode and resume managing local UDP sockets directly.
+    ///
+    /// Returns as soon as the delegate has been notified of the
+    /// `.disconnected` transition. Reconnection (which contains a
+    /// warmup `Task.sleep`) is kicked off in a detached task so the
+    /// caller — typically an `NEPacketTunnelProvider.stopTunnel`
+    /// handler that needs to complete promptly — isn't held up for
+    /// the multi-second warmup window.
+    public func endTunnelMode() async {
+        outboundHook = nil
+        state = .disconnected
+        delegateRef?.delegate?.interface(id: id, didChangeState: .disconnected)
+        // Cancel any earlier reconnect task before spawning a fresh
+        // one; otherwise a back-to-back endTunnelMode call could
+        // leave two competing connect() flows in flight.
+        pendingReconnectTask?.cancel()
+        pendingReconnectTask = Task { [weak self] in
+            try? await self?.connect()
         }
     }
 
