@@ -278,13 +278,44 @@ public actor ReticulumTransport {
     /// Uses Ed25519Pure (deterministic RFC 8032) for IFAC interop with Python.
     private var ifacSigningSeeds: [String: Data] = [:]
 
-    /// Called when a new sub-interface is added (e.g., BLE peer connects).
-    /// The app layer hooks this to trigger a full announce (with display name, ratchet, etc.).
-    private var onInterfaceAdded: (@Sendable (String) async -> Void)?
+    /// Called when a peer-spawning interface (AutoInterface / BLEInterface /
+    /// MPCInterface) accepts a new peer. Distinct from `onInterfaceConnected`:
+    /// `onInterfacePeerSpawned` fires on the *parent's* peer-add hook the
+    /// moment a peer is registered, before the peer's own transport
+    /// necessarily reaches `.connected`. App-side this is the right hook for
+    /// "fire an announce when a new peer joins" so the new peer learns us
+    /// even if their TCP/UDP child handshake races our state-change observer.
+    private var onInterfacePeerSpawned: (@Sendable (String) async -> Void)?
 
-    /// Set the callback for when a new sub-interface is added.
+    /// Called when any registered interface (or peer-child interface)
+    /// transitions to `.connected`. This includes TCP reconnects, RNode
+    /// reconnects, and the `.connected` transition of peer-children spawned
+    /// by AutoInterface / BLEInterface. App-side this is the hook for
+    /// "fire an announce on every (re)connect of a stable interface" — for
+    /// peer-spawn semantics use `onInterfacePeerSpawned` instead.
+    private var onInterfaceConnected: (@Sendable (String) async -> Void)?
+
+    /// Set the callback for when a peer is spawned on AutoInterface /
+    /// BLEInterface / MPCInterface. See `onInterfacePeerSpawned`.
+    public func setOnInterfacePeerSpawned(_ callback: (@Sendable (String) async -> Void)?) {
+        self.onInterfacePeerSpawned = callback
+    }
+
+    /// Set the callback for when any interface transitions to `.connected`.
+    /// See `onInterfaceConnected`.
+    public func setOnInterfaceConnected(_ callback: (@Sendable (String) async -> Void)?) {
+        self.onInterfaceConnected = callback
+    }
+
+    /// Compatibility shim: the legacy `setOnInterfaceAdded` registered a
+    /// single callback that was invoked from BOTH the peer-spawn paths and
+    /// the state-change-to-connected path. Existing callers that haven't
+    /// been migrated to the split callbacks above get the same behavior by
+    /// having this setter wire the same closure to both new hooks.
+    @available(*, deprecated, message: "Use setOnInterfacePeerSpawned and/or setOnInterfaceConnected for granular control")
     public func setOnInterfaceAdded(_ callback: (@Sendable (String) async -> Void)?) {
-        self.onInterfaceAdded = callback
+        self.onInterfacePeerSpawned = callback
+        self.onInterfaceConnected = callback
     }
 
     /// Diagnostic callback for packet receive events (set by app layer).
@@ -390,7 +421,7 @@ public actor ReticulumTransport {
                 guard let self = self else { return }
                 Task {
                     try? await self.addInterface(peer)
-                    await self.onInterfaceAdded?(peer.id)
+                    await self.onInterfacePeerSpawned?(peer.id)
                 }
             },
             onPeerRemoved: { [weak self] peerId in
@@ -431,7 +462,7 @@ public actor ReticulumTransport {
                 guard let self = self else { return }
                 Task {
                     try? await self.addInterface(peer)
-                    await self.onInterfaceAdded?(peer.id)
+                    await self.onInterfacePeerSpawned?(peer.id)
                 }
             },
             onPeerRemoved: { [weak self] peerId in
@@ -469,7 +500,7 @@ public actor ReticulumTransport {
                 guard let self = self else { return }
                 Task {
                     try? await self.addInterface(peer)
-                    await self.onInterfaceAdded?(peer.id)
+                    await self.onInterfacePeerSpawned?(peer.id)
                 }
             },
             onPeerRemoved: { [weak self] peerId in
@@ -3596,14 +3627,15 @@ extension ReticulumTransport {
         logger.info("Interface \(id, privacy: .public) state: \(String(describing: state), privacy: .public)")
         onDiagnostic?("[IFACE] \(id) → \(state)")
 
-        // When any interface transitions to connected, fire onInterfaceAdded
+        // When any interface transitions to connected, fire onInterfaceConnected
         // so the app layer can send announces over the newly-available link.
-        // AutoInterface/BLE peers fire this via their onPeerAdded callbacks,
-        // but TCP interfaces only reach .connected asynchronously via this
-        // delegate method — without this, TCP connections never trigger announces.
+        // AutoInterface/BLE peers fire `onInterfacePeerSpawned` separately via
+        // their onPeerAdded hooks; both fire here too once the peer's child
+        // transport reaches .connected. App-side gating decides which trigger
+        // is meaningful.
         if case .connected = state {
             Task {
-                await self.onInterfaceAdded?(id)
+                await self.onInterfaceConnected?(id)
             }
         }
     }
