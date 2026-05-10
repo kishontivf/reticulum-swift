@@ -1241,53 +1241,57 @@ public actor ReticulumTransport {
         }
     }
 
-    /// Send link data packet with explicit destination hash for routing lookup.
+    /// Send link data packet on the link's attached interface.
     ///
-    /// Link DATA packets have linkId as their destination, but we need to look up
-    /// the path using the peer's destination hash (not the linkId) to determine
-    /// if multi-hop routing is needed.
+    /// Link DATA packets are ALWAYS sent as HEADER_1 to the link's
+    /// `attached_interface`, never converted to HEADER_2. This mirrors
+    /// python `Transport.outbound` (RNS/Transport.py:1063, 1122-1130):
+    /// the path-table lookup at :1063 keys on `packet.destination_hash`
+    /// which for link packets equals the link_id — and link_ids are
+    /// never inserted into the path_table. So python falls through to
+    /// the broadcast loop at :1122 where the LINK destination guard at
+    /// :1128-1130 forces transmission on `attached_interface` only.
+    ///
+    /// The transport node (e.g. rnsd between iPhone and the echo bot)
+    /// matches the inbound HEADER_1 packet's destination_hash against
+    /// its own `Transport.active_links` registry and forwards on the
+    /// peer's leg. Sending a HEADER_2 packet here breaks that path:
+    /// rnsd interprets HEADER_2 as a transport-routed packet, but the
+    /// destination_hash is a link_id (not a routable destination), and
+    /// the packet is silently dropped. This was the root cause of
+    /// `direct_echo` failing on the iOS smoke pipeline (state=SENT but
+    /// echo bot never received the message).
+    ///
+    /// The legacy `destinationHash` parameter is retained for API
+    /// stability but is no longer consulted; the link's
+    /// `attachedInterfaceId` (set during link establishment in
+    /// `handleLinkProof`) is the single source of truth for routing.
     ///
     /// - Parameters:
     ///   - packet: Link DATA packet (destination = linkId)
-    ///   - destinationHash: The peer's destination hash for path lookup
+    ///   - destinationHash: Retained for API stability; unused.
     /// - Throws: TransportError if no interfaces available or send fails
     public func sendLinkData(packet: Packet, destinationHash: Data) async throws {
         guard !interfaces.isEmpty else {
             throw TransportError.noInterfacesAvailable
         }
 
-        // M3: Check if the link has an attached interface for targeted send
         let linkId = packet.destination
+        let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
         let attachedId = await activeLinks[linkId]?.attachedInterfaceId
 
-        // Look up path using the DESTINATION hash (not the linkId)
-        // M4: Convert to HEADER_2 only when hops > 1 (Python Transport.py:~500)
-        if let pathEntry = await pathTable.lookup(destinationHash: destinationHash),
-           pathEntry.hopCount > 1,
-           let nextHop = pathEntry.nextHop {
-            // Convert to HEADER_2 for routed delivery
-            let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
-            let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
-            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
-            logger.debug("Link DATA: converting to HEADER_2, linkId=\(linkIdHex), destHash=\(destHex), nextHop=\(nextHopHex), hops=\(pathEntry.hopCount)")
-            // M1/M3: Send on specific interface
-            let outboundId = attachedId ?? (pathEntry.interfaceId.isEmpty ? nil : pathEntry.interfaceId)
-            if let outboundId {
-                try await sendToInterface(routedPacket.encode(), interfaceId: outboundId)
-            } else {
-                try await sendToAllInterfaces(routedPacket)
-            }
+        if let attachedId {
+            logger.debug("Link DATA: HEADER_1 to attached interface, linkId=\(linkIdHex), iface=\(attachedId)")
+            try await sendToInterface(packet.encode(), interfaceId: attachedId)
         } else {
-            // Direct delivery (no multi-hop) - send as HEADER_1
-            let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
-            logger.debug("Link DATA: sending as HEADER_1, linkId=\(linkIdHex)")
-            // M3: Use attached interface if known
-            if let attachedId {
-                try await sendToInterface(packet.encode(), interfaceId: attachedId)
-            } else {
-                try await sendToAllInterfaces(packet)
-            }
+            // Link has no attached interface yet (race during establishment,
+            // or link was created without going through the standard
+            // request/proof handshake). Mirror python's broadcast-fallback
+            // behavior at Transport.py:1122-1130 — but log a warning since
+            // a properly established link should always have an attached
+            // interface by the time DATA is sent.
+            logger.warning("Link DATA: linkId=\(linkIdHex) has no attached interface; broadcasting as HEADER_1")
+            try await sendToAllInterfaces(packet)
         }
     }
 
