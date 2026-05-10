@@ -33,7 +33,10 @@ gate them independently behind separate user-facing settings
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)
 
 **Site:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
-`sendLinkData(packet:destinationHash:)`.
+`sendLinkData(packet:)` (was `sendLinkData(packet:destinationHash:)`
+prior to this fix; the `destinationHash` parameter was the input the
+buggy path-table lookup consumed and was dropped to prevent
+regressions).
 
 **Python reference:** `RNS/Transport.py:1034-1130` — `Transport.outbound`.
 The path-table lookup at `:1063` keys on `packet.destination_hash`. For

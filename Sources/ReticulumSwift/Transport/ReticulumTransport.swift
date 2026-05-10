@@ -1262,16 +1262,9 @@ public actor ReticulumTransport {
     /// `direct_echo` failing on the iOS smoke pipeline (state=SENT but
     /// echo bot never received the message).
     ///
-    /// The legacy `destinationHash` parameter is retained for API
-    /// stability but is no longer consulted; the link's
-    /// `attachedInterfaceId` (set during link establishment in
-    /// `handleLinkProof`) is the single source of truth for routing.
-    ///
-    /// - Parameters:
-    ///   - packet: Link DATA packet (destination = linkId)
-    ///   - destinationHash: Retained for API stability; unused.
+    /// - Parameter packet: Link DATA packet (destination = linkId)
     /// - Throws: TransportError if no interfaces available or send fails
-    public func sendLinkData(packet: Packet, destinationHash: Data) async throws {
+    public func sendLinkData(packet: Packet) async throws {
         guard !interfaces.isEmpty else {
             throw TransportError.noInterfacesAvailable
         }
