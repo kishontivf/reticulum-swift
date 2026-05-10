@@ -61,8 +61,10 @@ without forwarding, echo bot's `on_delivery` never fires.
 
 **Fix:** `sendLinkData` now sends the unmodified HEADER_1 packet to
 the link's `attachedInterfaceId` (set during `handleLinkProof` /
-`handleLinkRequest`). The legacy `destinationHash` parameter is
-retained for API stability but unused; callers can pass any value.
+`handleLinkRequest`). The `destinationHash` parameter was removed;
+the public signature is now `sendLinkData(packet:)`. Any caller
+using the old `sendLinkData(packet:destinationHash:)` form will
+get a compile error and must be updated.
 Mirrors python `Transport.outbound:1122-1130`.
 
 **Why this needs a deviation entry even though it's a fix:** The
