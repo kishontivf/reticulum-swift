@@ -1277,14 +1277,15 @@ public actor ReticulumTransport {
             logger.debug("Link DATA: HEADER_1 to attached interface, linkId=\(linkIdHex), iface=\(attachedId)")
             try await sendToInterface(packet.encode(), interfaceId: attachedId)
         } else {
-            // Link has no attached interface yet (race during establishment,
-            // or link was created without going through the standard
-            // request/proof handshake). Mirror python's broadcast-fallback
-            // behavior at Transport.py:1122-1130 — but log a warning since
-            // a properly established link should always have an attached
-            // interface by the time DATA is sent.
-            logger.warning("Link DATA: linkId=\(linkIdHex) has no attached interface; broadcasting as HEADER_1")
-            try await sendToAllInterfaces(packet)
+            // Mirrors python `RNS/Transport.py:1124-1130`: every interface
+            // fails the `interface != packet.destination.attached_interface`
+            // guard when `attached_interface` is `None`, so the packet is
+            // not transmitted at all. Silent drop is correct — broadcasting
+            // here would spray link DATA across LoRa / BLE / other
+            // physical media a stale-or-unestablished link should not be
+            // touching. Logged as a warning so the case is debuggable, but
+            // wire behavior matches python.
+            logger.warning("Link DATA: linkId=\(linkIdHex) has no attached interface; dropping (matches python)")
         }
     }
 

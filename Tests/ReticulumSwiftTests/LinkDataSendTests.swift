@@ -15,14 +15,13 @@
 //    2. Link has an `attachedInterfaceId` → packet bytes land on
 //       that specific interface, never on others.
 //    3. Link is registered but has no attachedInterfaceId →
-//       broadcast fallback (mirrors python `Transport.outbound`
-//       RNS/Transport.py:1122-1130 LINK destination guard, which
-//       silently no-ops when attached_interface is nil; the swift
-//       port logs a warning + broadcasts so the packet at least
-//       has a chance of reaching the peer if the interface set is
-//       small).
+//       silent drop (mirrors python `Transport.outbound`
+//       RNS/Transport.py:1124-1130 LINK destination guard, which
+//       fails the `interface != attached_interface` test on every
+//       interface when attached_interface is None and so transmits
+//       on none of them).
 //
-//  Python reference: RNS/Transport.py:1063, 1122-1130.
+//  Python reference: RNS/Transport.py:1063, 1118-1135.
 //  See also `port-deviations.md` (the resolved deviation entry on
 //  this method and its predecessor sendLinkData(packet:destinationHash:)).
 //
@@ -176,20 +175,20 @@ final class LinkDataSendTests: XCTestCase {
             "HEADER_2-converted.")
     }
 
-    // MARK: - Test 3: no attached interface → broadcast fallback
+    // MARK: - Test 3: no attached interface → silent drop
 
     /// When a link is registered but has no `attachedInterfaceId`
     /// (e.g., a synthesized link in a test or a partial-establishment
-    /// state), the swift port broadcasts the packet on all interfaces
-    /// rather than dropping it on the floor. Python silently no-ops
-    /// in this case (the `if interface != attached_interface` guard
-    /// makes EVERY interface skip the transmit when attached_interface
-    /// is None), but the swift port treats this as a recoverable
-    /// configuration error: log a warning and broadcast as HEADER_1.
-    /// Documented in port-deviations.md.
-    func testSendLinkDataBroadcastsWhenLinkHasNoAttachedInterface() async throws {
-        let iface1 = MockInterface(id: "broadcast-iface-1")
-        let iface2 = MockInterface(id: "broadcast-iface-2")
+    /// state), the packet is silently NOT transmitted on any
+    /// interface. Mirrors python `Transport.outbound:1124-1130`:
+    /// every interface fails the `interface != attached_interface`
+    /// guard when `attached_interface` is `None`, so nothing is sent.
+    /// Broadcasting in this case would spray link DATA across LoRa
+    /// / BLE / other physical media that a stale-or-unestablished
+    /// link should not be touching.
+    func testSendLinkDataDropsWhenLinkHasNoAttachedInterface() async throws {
+        let iface1 = MockInterface(id: "no-attached-iface-1")
+        let iface2 = MockInterface(id: "no-attached-iface-2")
         let transport = ReticulumTransport()
         try await transport.addInterface(iface1)
         try await transport.addInterface(iface2)
@@ -206,23 +205,26 @@ final class LinkDataSendTests: XCTestCase {
         let sent1 = await iface1.drainSentPackets()
         let sent2 = await iface2.drainSentPackets()
 
-        XCTAssertEqual(sent1.count, 1,
-            "Broadcast fallback must transmit on every connected " +
-            "interface; iface1 got \(sent1.count) packets.")
-        XCTAssertEqual(sent2.count, 1,
-            "Broadcast fallback must transmit on every connected " +
-            "interface; iface2 got \(sent2.count) packets.")
+        XCTAssertEqual(sent1.count, 0,
+            "Link with no attached_interface must silently drop " +
+            "(python Transport.py:1124-1130). iface1 got " +
+            "\(sent1.count) packets — broadcast regression.")
+        XCTAssertEqual(sent2.count, 0,
+            "Link with no attached_interface must silently drop " +
+            "(python Transport.py:1124-1130). iface2 got " +
+            "\(sent2.count) packets — broadcast regression.")
     }
 
-    // MARK: - Test 4: link not in activeLinks → broadcast fallback
+    // MARK: - Test 4: link not in activeLinks → silent drop
 
     /// When the packet's destination (linkId) doesn't match any
     /// registered link in `activeLinks`, the lookup returns nil.
-    /// Same fallback behavior as the no-attached-interface case:
-    /// broadcast as HEADER_1 rather than drop. This covers the
-    /// `attachedId == nil` branch via a different code path
-    /// (no Link instance at all vs Link without attached interface).
-    func testSendLinkDataBroadcastsWhenLinkIdUnknown() async throws {
+    /// Same drop behavior as the no-attached-interface case: the
+    /// guarded `else` branch logs a warning and returns without
+    /// transmitting. Covers the `attachedId == nil` path via a
+    /// different code shape (no Link instance at all vs Link without
+    /// attached interface).
+    func testSendLinkDataDropsWhenLinkIdUnknown() async throws {
         let iface = MockInterface(id: "unknown-link-iface")
         let transport = ReticulumTransport()
         try await transport.addInterface(iface)
@@ -233,9 +235,10 @@ final class LinkDataSendTests: XCTestCase {
         try await transport.sendLinkData(packet: packet)
 
         let sent = await iface.drainSentPackets()
-        XCTAssertEqual(sent.count, 1,
-            "Unknown linkId should fall through to the broadcast " +
-            "branch and reach all interfaces; got \(sent.count) on " +
-            "the only registered interface.")
+        XCTAssertEqual(sent.count, 0,
+            "Unknown linkId must silently drop (no Link → " +
+            "attached_interface is effectively None → python " +
+            "Transport.py:1124-1130 transmits on no interface). " +
+            "Got \(sent.count) packets — broadcast regression.")
     }
 }
