@@ -254,7 +254,21 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// re-runs `setupTransport()` so the local `FramedTransport`
     /// reconnects to the configured host. Call when the tunnel is
     /// turned off so this interface owns its own socket again.
+    ///
+    /// Idempotent: a no-op when `beginTunnelMode(send:)` was never
+    /// called. Without this guard, a caller that fires `endTunnelMode`
+    /// unconditionally on a startup notification (e.g. iOS's initial
+    /// `.invalid` VPN status emitted on every cold start regardless
+    /// of user preference) would tear down a working local transport
+    /// it never put into tunnel mode — see the matching Columba-iOS
+    /// guard `isTunnelModeActive` in `AppServices.applyTunnelModeToInterfaces`
+    /// which exists because this method wasn't idempotent. Pinning the
+    /// idempotency contract here removes the need for that
+    /// downstream-caller workaround.
     public func endTunnelMode() async {
+        guard outboundHook != nil else {
+            return
+        }
         outboundHook = nil
         autoReconnect = true
         // Match the lifecycle a normal cold `connect()` produces:
