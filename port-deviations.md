@@ -28,6 +28,42 @@ fired from both kinds of trigger indistinguishably; the iOS app needs to
 gate them independently behind separate user-facing settings
 (`auto_announce_on_peer_spawned` vs `auto_announce_on_tcp_reconnect`).
 
+### `TCPInterface.beginTunnelMode(send:)` / `endTunnelMode()` — VPN-extension hook (new feature)
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/TCPInterface.swift` —
+`beginTunnelMode`, `endTunnelMode`, and the matching pair on
+`Sources/ReticulumSwift/Interfaces/Auto/AutoInterface.swift`.
+
+**Python reference:** No equivalent. Python's
+`RNS.Interfaces.TCPInterface` owns its socket directly with no notion of
+an outbound-write hook. The swift port needs this hook because iOS app
+extensions (`NEPacketTunnelProvider`) run in a separate process and own
+the authoritative network socket while the main app is suspended /
+backgrounded. When the extension is active, the main-process
+TCPInterface must tear down its own NWConnection and route outbound
+bytes through the extension's IPC instead. Python doesn't have an
+analogous process-split constraint — its Transport runs in one process
+and that process keeps running.
+
+**Reason:** Category (b) — new feature for the iOS port to support
+background-mode delivery via Network Extension. No python-side analog
+is meaningful.
+
+**Sub-deviation (`endTunnelMode()` idempotency, fix/end-tunnel-mode-idempotent
+2026-05-11):** `endTunnelMode()` now early-returns when `outboundHook ==
+nil` instead of unconditionally tearing down and re-creating the
+transport. The previous unconditional path was destructive when called
+on an interface that was never in tunnel mode (e.g. the iOS VPN status
+machinery emits a `.invalid` notification on every cold start regardless
+of whether the user has enabled the tunnel; the downstream caller —
+Columba-iOS `AppServices.applyTunnelModeToInterfaces` — would observe
+this `.invalid` and fire `endTunnelMode()` on every TCPInterface,
+killing every live NWConnection seconds after the Step 7 loop brought
+them up). The downstream `isTunnelModeActive` workaround in Columba-iOS
+exists specifically because this method wasn't idempotent; pinning the
+contract here is the correct fix and lets the workaround be deleted on
+the next Columba-iOS deps bump.
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)

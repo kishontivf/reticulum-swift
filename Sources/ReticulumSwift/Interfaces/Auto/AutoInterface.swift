@@ -395,6 +395,16 @@ public actor AutoInterface: @preconcurrency NetworkInterface {
     /// handler that needs to complete promptly — isn't held up for
     /// the multi-second warmup window.
     public func endTunnelMode() async {
+        // Idempotent: a no-op when tunnel mode was never entered.
+        // See the matching guard in TCPInterface.endTunnelMode and
+        // the deviation note in port-deviations.md (sub-deviation
+        // under "TCPInterface.beginTunnelMode / endTunnelMode") for
+        // the downstream-caller scenario this prevents (iOS VPN
+        // status `.invalid` notification firing on every cold start
+        // even when the user never enabled the tunnel).
+        guard outboundHook != nil else {
+            return
+        }
         outboundHook = nil
         state = .disconnected
         delegateRef?.delegate?.interface(id: id, didChangeState: .disconnected)
