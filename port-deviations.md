@@ -244,3 +244,44 @@ prior buggy implementation was itself an undocumented divergence
 (the python upstream has no path-table lookup for link DATA). This
 entry records the bug for future re-syncers and codifies the
 correct semantic so the divergence doesn't reappear.
+
+### L4 transport memory caps — audited, NOT ported (python-faithful); NE bound deferred to GATE
+
+**Sites:** none changed. Audit covered `Transport/FramedTransport.swift`
+(`receiveBuffer`), `Transport/ReticulumTransport.swift` (`pendingPackets`,
+`discoveryPathRequests`, `discoveryPrTags`), `Routing/PathTable.swift`, and
+`Link/Link.swift` (resource strategy).
+
+**Python reference:** `../Reticulum/RNS/Interfaces/TCPInterface.py:380-398`
+(HDLC read loop); `../Reticulum/RNS/Transport.py:121-128` (`path_requests` /
+`discovery_path_requests` dicts; `pending_discovery_prs = deque(maxlen=32)`);
+`Transport.py:788-799` (expiry culling).
+
+**Finding:** A planned hardening task ("L4") proposed bounding the HDLC
+`receiveBuffer`, an LRU cap on the pending-destination count, a hard entry
+ceiling on the path table, and a per-link concurrent-resource cap. Checked
+against the reference: python bounds NONE of these. The python HDLC read loop
+(`TCPInterface.py:382` `frame_buffer += data_in`) appends unconditionally and
+only trims when a complete `FLAG…FLAG` frame is found — the `HW_MTU` guard at
+`:362` lives in the KISS branch only, which `FramedTransport` (HDLC) does not
+mirror. The path table and `discovery_path_requests` are expiry-managed dicts
+with no count ceiling. `pending_discovery_prs` (the only count-capped structure,
+`deque(maxlen=32)`) is a work queue feeding a python worker thread; the swift
+port forwards path requests inline via async with no equivalent handoff queue to
+bound. Swift's existing `pendingPackets` per-destination cap (10) and
+`discoveryPrTags` cap already match-or-exceed python's bounding.
+
+**Decision (2026-06-02):** add NONE of the proposed caps — each would be a
+divergence from a reference that is itself unbounded / expiry-only. This entry
+exists so a future re-syncer does NOT "helpfully" re-add them believing they are
+missing: they are faithfully absent.
+
+**Deferred NE-hardening note:** the unbounded `receiveBuffer` is a genuine risk
+for the memory-constrained iOS Network Extension (~60 MB budget) that python's
+desktop reference never faced — a malicious relay streaming an unterminated HDLC
+frame could grow it without limit and trigger jetsam. Per owner decision this is
+NOT pre-emptively bounded (a speculative divergence); it is revisited at GATE
+Phase 1b (under-load NE memory measurement). If the NE actually OOMs on this
+path, an `HW_MTU`-style bound is added THEN as a measured, explicitly documented
+category-(a) divergence (a runtime constraint the python pattern cannot express
+in the NE sandbox), and this entry is updated to record it.
