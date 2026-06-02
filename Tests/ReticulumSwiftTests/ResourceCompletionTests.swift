@@ -14,7 +14,15 @@
 //  :715/721 → :723 and Link.link_closed :724-726), drop it from the link's tracking, run
 //  cleanup(), and fire resourceConcluded (which the LXMF handler ignores for a non-.complete
 //  resource). These tests pin the state-transition contract those paths rely on and that
-//  cleanup() is a safe no-op. Full Link/Resource integration is covered by the suite at large.
+//  cleanup() is safe/idempotent. Full Link/Resource integration is covered by the suite at
+//  large; resource SEGMENTATION (cleanup unlinking temp files) is covered by
+//  ResourceSegmentationTests.
+//
+//  NOTE: cleanup() is no longer a literal no-op (the disk-streaming work filled it in to
+//  close file handles + unlink staging/storagepath temp files). For an outbound resource
+//  that fits in a single in-RAM segment — as built here — there is no input file or
+//  storagepath, so cleanup() touches no disk and does not change state; the assertions
+//  below still hold.
 //
 
 import XCTest
@@ -69,8 +77,10 @@ final class ResourceCompletionTests: XCTestCase {
         XCTAssertFalse(state.isComplete)
     }
 
-    /// cleanup() is a safe, idempotent no-op today (the disk-streaming work fills it in) and
-    /// must not, by itself, change resource state.
+    /// cleanup() is idempotent and must not, by itself, change resource state. For a
+    /// single in-RAM-segment outbound resource (no staging file / storagepath) it is a
+    /// safe no-op on disk; the per-extension temp-file unlinking is exercised in
+    /// ResourceSegmentationTests.
     func testCleanupIsSafeNoOp() async throws {
         let resource = try await makeTransferringResource()
         await resource.cleanup()

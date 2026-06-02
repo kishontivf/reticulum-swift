@@ -257,6 +257,9 @@ extension ResourceAdvertisement {
     ///   - resourceHash: SHA256 hash of resource data (32 bytes)
     ///   - randomHash: Random collision-detection hash (4 bytes)
     ///   - hashmap: Full hashmap data (will be segmented)
+    ///   - originalHash: First-segment hash (python `o`). For single-segment or
+    ///     the first segment this equals `resourceHash`; later segments inherit
+    ///     the chain's first-segment hash (Resource.py:1286).
     ///   - segment: Current segment index (1-based)
     ///   - totalSegments: Total number of segments
     ///   - requestId: Associated request ID (16 bytes) or nil
@@ -270,6 +273,7 @@ extension ResourceAdvertisement {
         resourceHash: Data,
         randomHash: Data,
         hashmap: Data,
+        originalHash: Data? = nil,
         segment: Int,
         totalSegments: Int,
         requestId: Data?,
@@ -279,16 +283,19 @@ extension ResourceAdvertisement {
         // Calculate max hashmap length from link MDU
         let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: linkMDU)
 
-        // Get hashmap segment for this advertisement (0-based segment index)
+        // The advertisement carries only THIS resource segment's hashmap (which
+        // is itself the FIRST HMU chunk). python `ResourceAdvertisement.pack`
+        // (Resource.py:1333-1339) packs only the first HMU chunk (segment=0)
+        // into the advertisement; later HMU chunks ride RESOURCE_HMU packets.
         let hashmapChunk = ResourceHashmap.getHashmapSegment(
             hashmap: hashmap,
-            segment: segment - 1,  // Convert 1-based to 0-based
+            segment: 0,  // First HMU chunk only — matches python pack(segment=0)
             maxLength: maxLength
         ) ?? Data()  // Default to empty if out of range
 
-        // First segment uses resource hash as original hash
-        // Subsequent segments would use first segment's hash (not implemented yet)
-        let originalHash = resourceHash
+        // First/single segment uses its own hash as original_hash; later
+        // segments pass the inherited first-segment hash explicitly.
+        let resolvedOriginalHash = originalHash ?? resourceHash
 
         return ResourceAdvertisement(
             transferSize: transferSize,
@@ -296,7 +303,7 @@ extension ResourceAdvertisement {
             numParts: numParts,
             hash: resourceHash,
             randomHash: randomHash,
-            originalHash: originalHash,
+            originalHash: resolvedOriginalHash,
             segmentIndex: segment,
             totalSegments: totalSegments,
             requestId: requestId,

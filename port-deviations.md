@@ -99,6 +99,107 @@ fired — that leak is what this fixes.
    currently takes the ordinary corrupt path (drop + conclude, no reject/teardown — the
    same deferral as the rest of the corrupt-assembly handling above).
 
+### Resource SEGMENTATION — disk-streaming port (perf/resource-disk-streaming 2026-06-02)
+
+**Sites:** `Sources/ReticulumSwift/Resource/Resource.swift` — segmentation
+members, outbound segment init, `prepare()` + `resolveSegmentPlaintext()`,
+`stageInputFile()`/`openInputHandle()`, `getAdvertisement()`,
+`prepareNextSegment()` / `transferInputFileOwnership()` / `adoptInputFile()`,
+`assemble()` + `appendToStorage()`/`storageURL()`, `cleanup(abandonChain:)`;
+`Sources/ReticulumSwift/Resource/ResourceAdvertisement.swift` —
+`create(... originalHash: ...)`; `Sources/ReticulumSwift/Link/Link.swift` —
+`handleResourceProof` + `advertiseNextSegment`, `handleResourceData`
+segment-aware completion, cancel/reject/close cleanup calls.
+
+**Python reference:** `RNS/Resource.py` `__init__` staging (`:273-314`),
+`total_segments`/seek/read (`:285-313`), bytes→tempfile copy (`:274-279`),
+metadata prefix (`:266`, prepend `:331-333`), `assemble` (`:672-749`, append to
+storagepath `:708-710`, per-segment hash check `:694-695`, metadata strip
+`:696-704`, final-segment surface+unlink `:725-747`), `prove` (`:752-763`),
+`__prepare_next_segment` (`:765-780`) + its `advertise()` trigger (`:516-518`),
+`validate_proof` segment continuation (`:782-821`), `ResourceAdvertisement`
+fields (`:1281-1307`, `pack(segment=0)` `:1333-1339`), storagepath naming
+(`:199`).
+
+**Behavior (faithful):** data with `metadata_size + len(data) >
+MAX_EFFICIENT_SIZE` (1 MiB-1) is staged to a tempfile and split into a chain of
+`ceil(total_size / MAX_EFFICIENT_SIZE)` segments, each an independent `Resource`
+reading its plaintext chunk via seek/read from the shared input file (segment 1
+reads `MAX_EFFICIENT_SIZE - metadata_size`, later segments read
+`MAX_EFFICIENT_SIZE` from `first_read_size + (seek_index-1)*MAX_EFFICIENT_SIZE`).
+Each segment independently compresses/encrypts/hashes its chunk; the
+advertisement carries `i`=segment_index, `l`=total_segments, `o`=first-segment
+hash, `d`=total chain plaintext size, `s`/`x` flags. After a segment's proof
+validates, the next segment is prepared and advertised (re-keyed in
+`outboundResources` by its own hash). Inbound: each segment decrypts, validates
+`full_hash(plaintext+random_hash)==hash`, strips the metadata prefix on segment
+1, and APPENDS plaintext to a per-resource storagepath; the chain concludes
+(delivery + callback + unlink) only when `segment_index == total_segments`.
+Data <= MAX_EFFICIENT_SIZE keeps the single in-RAM segment path
+(`total_segments=1`, no tempfile) — no behavior change for small resources.
+
+**Deviations (category a — runtime/structural — and the noted new feature):**
+1. **Temp-file location.** Python uses `tempfile.TemporaryFile()` for the
+   outbound stage (`:277`) and `RNS.Reticulum.resourcepath + "/" +
+   original_hash.hex()` for the inbound storagepath (`:199`). This port has no
+   `resourcepath`; both live under `NSTemporaryDirectory()` (per-extension
+   private, sandbox-valid — already the pattern at `Link.swift:27`). OUTBOUND
+   staging is named `rns_resource_out_<uuid>` (a single Resource owns it; the
+   resource hash isn't known until after hashing). INBOUND storagepath is named
+   `rns_resource_in_<original_hash hex>` — DETERMINISTIC, no uuid, because each
+   inbound segment is a fresh `Resource` (one accepted advertisement per
+   segment) and they must all `open(...,"ab")`-append to the SAME file; a
+   per-instance uuid would break cross-segment append. This matches python's
+   hash-keyed storagepath exactly.
+2. **Staging deferred to `prepare()`.** Python decides staging in `__init__`
+   (`:273-314`). This port defers it to `prepare()` because staging needs the
+   part size + metadata size, which the swift port resolves at prepare-time, and
+   because the public `Resource(data:link:)` init is non-throwing/sync. Observable
+   wire output is identical.
+3. **Async next-segment preparation.** Python prepares the next segment on a
+   daemon thread (`__prepare_next_segment` via `threading.Thread`, `:517/768`)
+   and `validate_proof` busy-waits `while self.next_segment == None`
+   (`:811`). This port prepares it in an `async` call inside
+   `advertiseNextSegment` (actor-model equivalent); the next segment is never
+   advertised before its preparation completes, same as python.
+4. **`linkEncryptClosure` capture.** Python segments call
+   `self.link.encrypt(...)` directly (`:427`). The swift `Resource` doesn't reach
+   into `Link` for the token, so `prepare()` captures the `linkEncrypt` closure
+   and threads it to child segments via the segment initializer. No behavioral
+   change.
+5. **`assembledFileURL` (category b — new feature).** Python surfaces the
+   assembled resource as a file handle (`self.data = open(storagepath,"rb")`,
+   `:737`). This port preserves the existing in-RAM `assembledData: Data`
+   contract (reads the file back) AND adds `assembledFileURL: URL?` as a forward
+   hook so callers can stream large assembled resources from disk. NOTE: the URL
+   currently points at the storagepath which `cleanup()` unlinks on conclusion —
+   callers wanting the on-disk file must copy it out before the resource
+   concludes. A future change can defer the unlink when a file-consuming callback
+   is registered (mirroring python's `meta_storagepath`/callback split).
+6. **Inbound metadata parsed-and-dropped.** Python writes segment-1 metadata to
+   `meta_storagepath` and decodes it for the assembled callback (`:700-702`,
+   `:727-735`). This port has no metadata-consuming resource API yet, so the
+   receive path parses the 3-byte length + metadata bytes off segment 1 (so the
+   stored data stream matches python's `data = self.data[3+metadata_size:]`,
+   `:704`) but DROPS the metadata rather than persisting a sidecar. Outbound:
+   this port's callers attach no metadata (`metadata` stays empty,
+   `metadataSize=0`), so `total_size == data_size` and the `x` flag is unset —
+   identical wire output to python invoked without metadata. The receive-side
+   parsing exists purely for interop with a metadata-bearing python sender.
+7. **`cleanup(abandonChain:)` parameter.** Python unlinks the inbound storagepath
+   only after the final-segment callback (`:744`). This port adds an
+   `abandonChain` flag so abnormal teardown (corrupt segment, cancel, reject,
+   link close) unlinks a PARTIAL storagepath unconditionally to avoid leaking it;
+   normal per-segment conclusion still unlinks only on the final segment. No
+   wire/behavioral divergence — purely a temp-file lifecycle guard.
+8. **Per-segment size guard replaces whole-resource size check.** The prior swift
+   `assemble()` asserted `finalData.count == originalSize`. With segmentation,
+   `originalSize`/`d` is the WHOLE chain plaintext size, not a single segment's,
+   so that check is replaced by python's per-segment integrity check
+   (`full_hash(plaintext+random_hash)==hash`, `:694-695`) — strictly more
+   faithful. The encrypted-side `assembled.count == transferSize` check is
+   retained (transferSize is per-segment `t`).
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)

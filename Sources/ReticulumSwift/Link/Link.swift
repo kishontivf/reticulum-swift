@@ -1085,7 +1085,8 @@ public actor Link {
             Task {
                 for resource in inflightResources {
                     try? await resource.transitionState(to: .failed)
-                    await resource.cleanup()
+                    // Link is going away — abandon any partial inbound chain.
+                    await resource.cleanup(abandonChain: true)
                     await callbacks?.resourceConcluded(resource)
                 }
             }
@@ -1625,14 +1626,27 @@ public actor Link {
                     // doesn't surface that case distinctly — see port-deviations.md).
                     linkLogger.error("Resource assembly failed (corrupt): \(error, privacy: .public) — concluding without delivery")
                     try? await resource.transitionState(to: .failed)
-                    await resource.cleanup()
+                    // Abandon the whole chain: unlink the partial storagepath
+                    // even though this may be a non-final segment.
+                    await resource.cleanup(abandonChain: true)
                     await resourceCallbacks?.resourceConcluded(resource)
                     inboundResources.removeValue(forKey: hash)
                     return
                 }
 
-                resourceDebugLog("COMPLETE: assembled \(assembledData.count)B, sending proof")
-                linkLogger.info("Resource assembled \(assembledData.count, privacy: .public) bytes, sending proof")
+                // Segment bookkeeping: python assemble() runs proof for EVERY
+                // segment and calls resource_concluded(self) unconditionally
+                // (Resource.py:713/723), freeing the inbound slot so the next
+                // segment's advertisement can be accepted. Delivery + callback
+                // happen ONLY on the final segment (Resource.py:725-747); a
+                // non-final segment just logs "waiting for next segment"
+                // (Resource.py:748-749).
+                let segIndex = await resource.segmentIndex
+                let segTotal = await resource.totalSegments
+                let isFinalSegment = segIndex >= segTotal
+
+                resourceDebugLog("COMPLETE: segment \(segIndex)/\(segTotal), assembled \(assembledData.count)B, sending proof")
+                linkLogger.info("Resource segment \(segIndex, privacy: .public)/\(segTotal, privacy: .public) assembled \(assembledData.count, privacy: .public) bytes, sending proof")
                 // Proof is best-effort: the data is fully received, so deliver it even
                 // if the proof send fails (the sender re-requests / times out its proof).
                 do {
@@ -1641,6 +1655,20 @@ public actor Link {
                     linkLogger.error("Resource proof send failed (delivering anyway): \(error, privacy: .public)")
                 }
 
+                if !isFinalSegment {
+                    // python Resource.py:748-749: more segments to come. Free the
+                    // slot (resource_concluded), but DO NOT deliver, run the
+                    // app callback, or unlink the storagepath — the next
+                    // segment's fresh Resource appends to the same on-disk file
+                    // (keyed by original_hash). Conclude so a fresh advertisement
+                    // for the next segment is accepted.
+                    await resourceCallbacks?.resourceConcluded(resource)
+                    inboundResources.removeValue(forKey: hash)
+                    linkLogger.debug("Segment \(segIndex, privacy: .public)/\(segTotal, privacy: .public) received, awaiting next segment advertisement")
+                    return
+                }
+
+                // Final segment — deliver the fully assembled resource.
                 // If this resource is a response to a pending request,
                 // deliver the assembled data as the request response.
                 // Python: packed_response = umsgpack.packb([request_id, response])
@@ -1663,8 +1691,13 @@ public actor Link {
                     }
                 }
 
-                // Notify callback
+                // Notify callback (python final-segment callback, Resource.py:738)
                 await resourceCallbacks?.resourceConcluded(resource)
+
+                // Unlink the inbound storagepath now the data is surfaced
+                // (python os.unlink(storagepath), Resource.py:744) and close
+                // any handles.
+                await resource.cleanup()
 
                 // Remove from tracking
                 inboundResources.removeValue(forKey: hash)
@@ -1694,20 +1727,77 @@ public actor Link {
             // Match by resource hash (first 32 bytes of proof)
             if let resourceHash = await resource.hash, Data(proofHash) == resourceHash {
                 do {
-                    // Mark as complete
+                    // Mark as complete (python validate_proof :786)
                     try await resource.transitionState(to: .awaitingProof)
                     try await resource.transitionState(to: .complete)
 
-                    // Notify callback
+                    // Notify callback / conclude this segment (python
+                    // resource_concluded(self), Resource.py:787).
                     await resourceCallbacks?.resourceConcluded(resource)
 
-                    // Remove from tracking
+                    // Remove this segment from tracking
                     outboundResources.removeValue(forKey: hash)
+
+                    // Segment chaining (python validate_proof :788-821):
+                    // if segment_index == total_segments → done (close input
+                    // file via cleanup). Otherwise prepare (if not already) and
+                    // advertise the next segment, re-keying outboundResources by
+                    // the next segment's hash.
+                    let hasMore = await resource.hasMoreSegments
+                    if hasMore {
+                        await advertiseNextSegment(after: resource)
+                    } else {
+                        // Final segment concluded — close + unlink the staging
+                        // input file (python input_file close, Resource.py:796-797).
+                        await resource.cleanup()
+                    }
                 } catch {
                     // State transition failed
                 }
                 return
             }
+        }
+    }
+
+    /// Prepare (if needed) and advertise the next segment of a split outbound
+    /// resource, after the current segment's proof validated.
+    ///
+    /// Faithful port of python `validate_proof` segment-continuation branch
+    /// (Resource.py:804-821): ensure the next segment is prepared (python
+    /// eagerly prepares it on `advertise()`, Resource.py:516-518; this port
+    /// prepares lazily here if it wasn't), hand off the shared input file
+    /// (python nulls the current segment's `input_file`, Resource.py:816), then
+    /// `next_segment.advertise()` (Resource.py:821).
+    private func advertiseNextSegment(after current: Resource) async {
+        do {
+            // Ensure the next segment exists & is prepared (python :807-811).
+            guard let next = try await current.prepareNextSegment() else {
+                linkLogger.warning("No next segment to advertise despite hasMoreSegments")
+                return
+            }
+
+            // Hand off the staging input file so it survives until the final
+            // segment concludes (python input_file sharing + null-out :816).
+            await current.transferInputFileOwnership(to: next)
+
+            // Wire the next segment's send callback (creates link DATA packets),
+            // exactly as sendResource() does for the first segment.
+            await next.setSendCallback { [weak self] packetData in
+                guard let self = self else { throw LinkError.notActive }
+                try await self.sendResourcePacket(packetData)
+            }
+
+            // Track and advertise the next segment (python next_segment.advertise()
+            // :821). Re-key outboundResources by the next segment's own hash.
+            let nextHash = await next.hash ?? Data()
+            outboundResources[nextHash] = next
+            let nextIdx = await next.segmentIndex
+            let nextTotal = await next.totalSegments
+            let nextHashHex = nextHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            linkLogger.info("Advertising segment \(nextIdx, privacy: .public)/\(nextTotal, privacy: .public) hash=\(nextHashHex, privacy: .public)")
+            try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+        } catch {
+            linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
         }
     }
 
@@ -1783,6 +1873,8 @@ public actor Link {
                         try await resource.transitionState(to: .rejected)
                         await resourceCallbacks?.resourceConcluded(resource)
                     } catch {}
+                    // Terminal path: close + unlink staging tempfile.
+                    await resource.cleanup()
                     outboundResources.removeValue(forKey: hash)
                     return
                 }
@@ -1797,6 +1889,7 @@ public actor Link {
                     try await resource.transitionState(to: .rejected)
                     await resourceCallbacks?.resourceConcluded(resource)
                 } catch {}
+                await resource.cleanup()
                 outboundResources.removeValue(forKey: hash)
             }
         }
@@ -1820,6 +1913,7 @@ public actor Link {
                         try await resource.transitionState(to: .cancelled)
                         await resourceCallbacks?.resourceConcluded(resource)
                     } catch {}
+                    await resource.cleanup()
                     outboundResources.removeValue(forKey: hash)
                     return
                 }
@@ -1832,6 +1926,7 @@ public actor Link {
                         try await resource.transitionState(to: .cancelled)
                         await resourceCallbacks?.resourceConcluded(resource)
                     } catch {}
+                    await resource.cleanup(abandonChain: true)
                     inboundResources.removeValue(forKey: hash)
                     return
                 }

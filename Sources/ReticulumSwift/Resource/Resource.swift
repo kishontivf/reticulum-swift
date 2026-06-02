@@ -85,8 +85,104 @@ public actor Resource {
     /// Whether data was compressed
     public private(set) var compressed: Bool = false
 
-    /// Assembled data (available after assemble() completes successfully)
+    /// Assembled data (available after assemble() completes successfully).
+    ///
+    /// For multi-segment inbound transfers this is read back from the on-disk
+    /// `storagepath` after the final segment assembles. Mirrors python's
+    /// `self.data = open(self.storagepath, "rb")` surfacing (Resource.py:737),
+    /// while preserving the existing in-RAM `Data` contract for callers.
     public private(set) var assembledData: Data?
+
+    /// Forward hook: file URL of the assembled (decrypted, decompressed,
+    /// metadata-stripped) resource bytes for inbound transfers. New addition
+    /// (see port-deviations.md) — python surfaces a file handle
+    /// (Resource.py:737); we additionally expose the URL so callers can stream
+    /// large resources from disk instead of materializing `assembledData`.
+    public private(set) var assembledFileURL: URL?
+
+    // MARK: - Segmentation (Outbound)
+    //
+    // Faithful port of python RNS Resource segmentation (Resource.py:273-314,
+    // :765-821). Data larger than MAX_EFFICIENT_SIZE is staged (metadata+data)
+    // to a temp file and split into a chain of <=MAX_EFFICIENT_SIZE segments.
+    // Each segment is an independent Resource (own random_hash / hashmap /
+    // encryption) reading its plaintext chunk from the shared input file via
+    // seek/read, exactly as python's `Resource(self.input_file, ...)` does.
+
+    /// Outbound staging tempfile holding metadata||plaintext for split
+    /// resources. Mirrors python `self.input_file` (Resource.py:277, :314).
+    /// nil for single-segment (<=MAX_EFFICIENT_SIZE) transfers.
+    private var inputFileURL: URL?
+
+    /// Open read handle into `inputFileURL` for seek/read of segment chunks.
+    private var inputFileHandle: FileHandle?
+
+    /// Whether this segment owns `inputFileURL` (the first segment that staged
+    /// the file). Only the owner unlinks it on cleanup, so later segments
+    /// sharing the same file don't delete it out from under siblings — though
+    /// in practice segments are processed strictly sequentially.
+    private var ownsInputFile: Bool = false
+
+    /// Total plaintext size (metadata_size + data_size). Drives total_segments.
+    /// Mirrors python `self.total_size` (Resource.py:283).
+    private var totalPlaintextSize: Int = 0
+
+    /// Packed metadata prefix (3-byte big-endian length || msgpack) prepended
+    /// to segment 1 only. Mirrors python `self.metadata` (Resource.py:266).
+    /// Empty when there is no metadata.
+    private var metadata: Data = Data()
+
+    /// Size of the packed metadata prefix. Mirrors python `self.metadata_size`
+    /// (Resource.py:258, :267).
+    public private(set) var metadataSize: Int = 0
+
+    /// 1-based index of this segment. Mirrors python `self.segment_index`
+    /// (Resource.py:286/300).
+    public private(set) var segmentIndex: Int = 1
+
+    /// Total number of segments in the logical resource. Mirrors python
+    /// `self.total_segments` (Resource.py:286/299).
+    public private(set) var totalSegments: Int = 1
+
+    /// Whether this logical resource is split into >1 segment. Mirrors python
+    /// `self.split` (Resource.py:288/301).
+    public private(set) var split: Bool = false
+
+    /// First-segment hash, used as the `o` (original_hash) advertisement field
+    /// and the inbound storagepath key for every segment of the chain.
+    /// Mirrors python `self.original_hash` (Resource.py:446/448).
+    public private(set) var originalHash: Data?
+
+    /// Whether bz2 auto-compression was requested. Carried to next segments.
+    /// Mirrors python `self.auto_compress_option` (Resource.py:366).
+    private var autoCompressOption: Bool = true
+
+    /// The eagerly-prepared next segment (if any). Mirrors python
+    /// `self.next_segment` (Resource.py:255).
+    public private(set) var nextSegment: Resource?
+
+    /// Whether next-segment preparation has begun. Mirrors python
+    /// `self.preparing_next_segment` (Resource.py:254).
+    private var preparingNextSegment: Bool = false
+
+    /// Stored linkEncrypt closure so segments after the first can prepare
+    /// themselves (the Link passes it in once on the first segment). Swift
+    /// adaptation: python re-uses `self.link.encrypt` directly; the swift
+    /// Resource doesn't reach into Link for the token, so the closure is
+    /// captured here and threaded to child segments.
+    private var linkEncryptClosure: ((Data) throws -> Data)?
+
+    // MARK: - Segmentation (Inbound)
+
+    /// Inbound on-disk storagepath that decrypted plaintext is appended to as
+    /// each segment assembles. Mirrors python `self.storagepath`
+    /// (Resource.py:199, open("ab") at :708).
+    private var storageFileURL: URL?
+
+    /// Whether the inbound advertisement set the metadata flag (adv.x). Mirrors
+    /// python `self.has_metadata` (Resource.py:207-208). Used to strip the
+    /// metadata prefix from segment 1 during assemble (Resource.py:696).
+    private var inboundHasMetadata: Bool = false
 
     // MARK: - Parts
 
@@ -149,6 +245,13 @@ public actor Resource {
 
     /// Create outbound resource with data to send.
     ///
+    /// Mirrors python `Resource.__init__(data, link, ...)` for the entry path
+    /// where `data` is a bytes object (Resource.py:248, :316-323). The actual
+    /// segmentation/staging decision is deferred to `prepare()` (the swift
+    /// analog of where python's __init__ does its tempfile staging at
+    /// :273-314), because staging requires the metadata size and part size
+    /// which the swift port resolves at prepare-time.
+    ///
     /// - Parameters:
     ///   - data: Original data to transfer
     ///   - link: Associated link for transfer
@@ -167,12 +270,62 @@ public actor Resource {
         self.link = link
         self.requestId = requestId
         self.isResponse = isResponse
+        self.autoCompressOption = autoCompress
+        self.state = .none
+    }
+
+    /// Create an outbound *segment* resource backed by a shared input file.
+    ///
+    /// Faithful port of python `__prepare_next_segment` (Resource.py:765-780),
+    /// which constructs `Resource(self.input_file, self.link, ...,
+    /// segment_index = self.segment_index+1, original_hash=self.original_hash,
+    /// ...)`. The plaintext for this segment is read (via seek/read) from the
+    /// shared `inputFileURL` during `prepare()` → `resolveSegmentPlaintext()`.
+    ///
+    /// - Parameters:
+    ///   - inputFileURL: Shared staging file (metadata||plaintext).
+    ///   - totalPlaintextSize: metadata_size + data_size (python total_size).
+    ///   - metadataSize: Size of the metadata prefix (python sent_metadata_size).
+    ///   - segmentIndex: 1-based index of this segment.
+    ///   - originalHash: First segment's hash (python original_hash).
+    ///   - link: Associated link.
+    ///   - requestId: Associated request ID or nil.
+    ///   - isResponse: Whether this is a response resource.
+    ///   - autoCompress: Whether to attempt bz2 compression.
+    ///   - linkEncrypt: Closure to link-encrypt this segment's blob.
+    private init(
+        inputFileURL: URL,
+        totalPlaintextSize: Int,
+        metadataSize: Int,
+        segmentIndex: Int,
+        originalHash: Data?,
+        link: Link,
+        requestId: Data?,
+        isResponse: Bool,
+        autoCompress: Bool,
+        linkEncrypt: @escaping (Data) throws -> Data
+    ) {
+        self.inputFileURL = inputFileURL
+        self.totalPlaintextSize = totalPlaintextSize
+        self.metadataSize = metadataSize
+        self.segmentIndex = segmentIndex
+        self.originalHash = originalHash
+        self.link = link
+        self.requestId = requestId
+        self.isResponse = isResponse
+        self.autoCompressOption = autoCompress
+        self.linkEncryptClosure = linkEncrypt
         self.state = .none
     }
 
     // MARK: - Initialization (Inbound)
 
     /// Create inbound resource from advertisement.
+    ///
+    /// Mirrors python `Resource.accept` field assignment (Resource.py:174-205),
+    /// including the segmentation fields (`segment_index`=adv.i,
+    /// `total_segments`=adv.l, `split`=adv.l>1, `original_hash`=adv.o) that
+    /// drive multi-segment storagepath append/conclude logic.
     ///
     /// - Parameters:
     ///   - advertisement: Resource advertisement packet
@@ -188,6 +341,13 @@ public actor Resource {
         self.compressed = advertisement.flags.isCompressed
         self.link = link
         self.state = .advertised
+
+        // Segmentation fields (python Resource.accept :201-205, :207-208).
+        self.originalHash = advertisement.originalHash
+        self.segmentIndex = advertisement.segmentIndex
+        self.totalSegments = advertisement.totalSegments
+        self.split = advertisement.totalSegments > 1
+        self.inboundHasMetadata = advertisement.flags.hasMetadataFlag
 
         // Initialize parts array with nil placeholders
         self.parts = Array(repeating: nil, count: advertisement.numParts)
@@ -282,14 +442,14 @@ public actor Resource {
 
     /// Send resource advertisement over the link.
     ///
-    /// Prepares and sends the advertisement packet for segment 0 (initial segment).
+    /// Prepares and sends the advertisement packet for THIS resource segment.
     /// The advertisement contains resource metadata (size, hash, flags) and the
-    /// first hashmap chunk. For large resources requiring multiple segments,
-    /// additional segments are sent via sendHashmapUpdate().
+    /// first hashmap (HMU) chunk. A resource segment whose part count exceeds
+    /// HASHMAP_MAX_LEN ships its remaining hashmap via sendHashmapUpdate().
     ///
     /// Flow:
     /// 1. Check state is queued (after prepare())
-    /// 2. Get advertisement for segment 1 (first segment)
+    /// 2. Get advertisement for this segment (segmentIndex)
     /// 3. Encode with MessagePack
     /// 4. Frame with resourceAdvertisement context (0x01)
     /// 5. Send via callback (link encrypts and sends)
@@ -309,8 +469,11 @@ public actor Resource {
             throw ResourceError.transferFailed(reason: "No send callback set")
         }
 
-        // Get advertisement for first segment
-        let advertisement = try getAdvertisement(segment: 1, linkMDU: linkMDU)
+        // Get advertisement for THIS segment. python advertises with the
+        // segment's own index (ResourceAdvertisement(self), i=self.segment_index,
+        // Resource.py:1292); the hashmap chunk packed is always HMU-chunk 0
+        // (pack(segment=0), Resource.py:1333).
+        let advertisement = try getAdvertisement(segment: segmentIndex, linkMDU: linkMDU)
 
         // Encode with MessagePack
         let advertisementData = try advertisement.pack()
@@ -556,20 +719,31 @@ public actor Resource {
     ///   - partSize: Maximum part size (Link SDU/MDU)
     ///   - linkEncrypt: Closure to link-encrypt the data blob
     ///   - autoCompress: Whether to auto-compress data
-    public func prepare(partSize: Int, linkEncrypt: (Data) throws -> Data, autoCompress: Bool = true) throws {
+    public func prepare(partSize: Int, linkEncrypt: @escaping (Data) throws -> Data, autoCompress: Bool = true) throws {
         guard state == .none else {
             throw ResourceError.invalidState(expected: "none", actual: "\(state)")
         }
 
-        guard let data = originalData else {
-            throw ResourceError.transferFailed(reason: "No original data to prepare")
-        }
-
+        // Capture so child segments can prepare themselves without reaching
+        // into the Link for the token (see linkEncryptClosure note).
+        self.linkEncryptClosure = linkEncrypt
+        self.autoCompressOption = autoCompress
         self.partSize = partSize
 
-        // Step 1: Compress data if beneficial
+        // Resolve this segment's plaintext (metadata||chunk for segment 1, or
+        // just the chunk for later segments) and the chain's total_segments.
+        // Mirrors python __init__ staging (Resource.py:273-323): bytes data
+        // larger than MAX_EFFICIENT_SIZE is staged to a tempfile and split.
+        let segmentPlaintext = try resolveSegmentPlaintext()
+
+        // ---- From here down mirrors python __init__ :384-478 / the existing
+        // single-segment pipeline, but operating on THIS segment's plaintext. ----
+
+        // Step 1: Compress this segment's plaintext if beneficial.
+        // python only compresses when data_size <= auto_compress_limit
+        // (Resource.py:390); compress() already short-circuits on autoCompress.
         let compressionResult = try ResourceCompression.compress(
-            data,
+            segmentPlaintext,
             autoCompress: autoCompress
         )
         self.compressed = compressionResult.compressed
@@ -598,11 +772,19 @@ public actor Resource {
         }
         self.randomHash = randomBytes
 
-        // Step 6: Calculate resource hash = SHA256(original_data + random_hash)
-        // Python: self.hash = RNS.Identity.full_hash(data + self.random_hash)
-        var hashInput = Data(data) // original uncompressed data
+        // Step 6: Calculate resource hash = SHA256(segment_plaintext + random_hash)
+        // Python: self.hash = RNS.Identity.full_hash(data+self.random_hash)
+        // (Resource.py:441) where `data` is this segment's plaintext
+        // (metadata+chunk for segment 1, chunk otherwise — Resource.py:331-333).
+        var hashInput = Data(segmentPlaintext)
         hashInput.append(randomBytes)
         self.hash = Hashing.fullHash(hashInput)
+
+        // original_hash = first segment's hash; later segments inherit it
+        // (set in the segment initializer). python Resource.py:445-448.
+        if self.originalHash == nil {
+            self.originalHash = self.hash
+        }
 
         // Step 7: Generate hashmap from ENCRYPTED data parts + random_hash
         // Python: get_map_hash(encrypted_segment) = SHA256(encrypted_segment + random_hash)[:4]
@@ -617,6 +799,125 @@ public actor Resource {
 
         // Step 8: Transition to queued
         try transitionState(to: .queued)
+    }
+
+    /// Resolve this segment's plaintext bytes, staging to a tempfile and
+    /// computing `total_segments` for oversized data.
+    ///
+    /// Faithful port of python `Resource.__init__` data handling
+    /// (Resource.py:273-323):
+    /// - For a bytes payload whose `metadata_size + len(data)` exceeds
+    ///   MAX_EFFICIENT_SIZE, python copies it to a `tempfile.TemporaryFile()`
+    ///   (:274-279) and then takes the file branch.
+    /// - The file branch computes `total_segments = ((total_size-1)//
+    ///   MAX_EFFICIENT_SIZE)+1` (:299), seeks to this segment's position
+    ///   (:305-312) and reads its chunk (:313). Segment 1's first read is
+    ///   `MAX_EFFICIENT_SIZE - metadata_size` because the metadata prefix
+    ///   occupies part of the first segment's budget (:303,:307).
+    /// - The metadata prefix is prepended to the chunk for segment 1 only
+    ///   (:331-333) — note: python writes metadata into the staging file is
+    ///   NOT done; metadata lives in `self.metadata` and is concatenated after
+    ///   the read. The staging file holds ONLY the data bytes; segment seek
+    ///   positions therefore account for metadata_size via first_read_size.
+    private func resolveSegmentPlaintext() throws -> Data {
+        // Segment >1: read from the shared input file (set by the segment
+        // initializer). python file branch with segment_index > 1.
+        if segmentIndex > 1 {
+            guard let url = inputFileURL else {
+                throw ResourceError.transferFailed(reason: "Segment \(segmentIndex) has no input file")
+            }
+            // total_segments was computed by segment 1; recompute identically
+            // here so the advertisement carries the right value.
+            self.totalSegments = ((totalPlaintextSize - 1) / ResourceConstants.MAX_EFFICIENT_SIZE) + 1
+            self.split = true
+            let handle = try openInputHandle(url)
+            // python Resource.py:303,309-310:
+            //   first_read_size = MAX_EFFICIENT_SIZE - metadata_size
+            //   seek_position   = first_read_size + ((seek_index-1)*MAX_EFFICIENT_SIZE)
+            //   segment_read_size = MAX_EFFICIENT_SIZE
+            let firstReadSize = ResourceConstants.MAX_EFFICIENT_SIZE - metadataSize
+            let seekIndex = segmentIndex - 1
+            let seekPosition = firstReadSize + ((seekIndex - 1) * ResourceConstants.MAX_EFFICIENT_SIZE)
+            try handle.seek(toOffset: UInt64(seekPosition))
+            let chunk = (try handle.read(upToCount: ResourceConstants.MAX_EFFICIENT_SIZE)) ?? Data()
+            // Later segments carry no metadata prefix (python :331-333 only
+            // prepends when has_metadata AND we're building segment 1's data;
+            // for later segments self.metadata is empty).
+            return chunk
+        }
+
+        // Segment 1 (or single-segment). Need the source bytes.
+        guard let data = originalData else {
+            throw ResourceError.transferFailed(reason: "No original data to prepare")
+        }
+
+        let totalSize = data.count + metadataSize
+        self.totalPlaintextSize = totalSize
+
+        if totalSize <= ResourceConstants.MAX_EFFICIENT_SIZE {
+            // Single in-RAM segment — python :285-290. No tempfile.
+            self.totalSegments = 1
+            self.segmentIndex = 1
+            self.split = false
+            // python :331-333: prepend metadata prefix when present.
+            if metadataSize > 0 {
+                var out = Data(metadata)
+                out.append(data)
+                return out
+            }
+            return data
+        }
+
+        // Oversized: stage the DATA bytes to a tempfile and split.
+        // python :274-279 (copy bytes to tempfile) then :299-313 (file branch).
+        self.totalSegments = ((totalSize - 1) / ResourceConstants.MAX_EFFICIENT_SIZE) + 1
+        self.segmentIndex = 1
+        self.split = true
+
+        let url = try stageInputFile(data)
+        self.inputFileURL = url
+        self.ownsInputFile = true
+        // Release the in-RAM copy now that it's on disk — python `del
+        // original_data` (Resource.py:279) frees the in-RAM copy; the
+        // remaining segments stream from `input_file`.
+        self.originalData = nil
+
+        let handle = try openInputHandle(url)
+        // python :305-307: segment 1 seeks to 0 and reads first_read_size.
+        let firstReadSize = ResourceConstants.MAX_EFFICIENT_SIZE - metadataSize
+        try handle.seek(toOffset: 0)
+        let chunk = (try handle.read(upToCount: firstReadSize)) ?? Data()
+
+        // python :331-333: prepend metadata prefix to segment 1's chunk.
+        if metadataSize > 0 {
+            var out = Data(metadata)
+            out.append(chunk)
+            return out
+        }
+        return chunk
+    }
+
+    /// Stage `data` into a per-extension-private tempfile under
+    /// NSTemporaryDirectory(), named by original-hash-or-uuid. Returns its URL.
+    ///
+    /// Swift adaptation of python `tempfile.TemporaryFile()` (Resource.py:277)
+    /// — see port-deviations.md (temp-file location). We can't know the
+    /// resource hash before hashing, so the OUTBOUND staging file is named by
+    /// a fresh UUID (the inbound storagepath, which CAN use the hash, is named
+    /// by hash hex — matching python's resourcepath/<original_hash.hex()>).
+    private func stageInputFile(_ data: Data) throws -> URL {
+        let name = "rns_resource_out_\(UUID().uuidString)"
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name)
+        try data.write(to: url, options: .atomic)
+        return url
+    }
+
+    /// Open (or reuse) the read handle into the shared input file.
+    private func openInputHandle(_ url: URL) throws -> FileHandle {
+        if let h = inputFileHandle { return h }
+        let h = try FileHandle(forReadingFrom: url)
+        self.inputFileHandle = h
+        return h
     }
 
     /// Get part data at specified index.
@@ -658,10 +959,19 @@ public actor Resource {
             )
         }
 
-        // Calculate hashmap segments needed for HMU tracking
-        // NOTE: hashmap segments != resource segments. Python's "total_segments"
-        // in advertisements refers to data segments for >1MB transfers.
-        // For normal transfers (under MAX_EFFICIENT_SIZE=1MB), it's always 1.
+        guard let firstSegmentHash = originalHash else {
+            throw ResourceError.invalidState(
+                expected: "queued (original hash set)",
+                actual: "\(state)"
+            )
+        }
+
+        // Calculate hashmap segments needed for HMU tracking.
+        // NOTE: hashmap segments (HMU chunks) are DISTINCT from resource
+        // segments. A single resource segment whose part count exceeds
+        // HASHMAP_MAX_LEN still ships its hashmap across multiple HMU chunks;
+        // that is tracked here. Resource segmentation (data > MAX_EFFICIENT_SIZE)
+        // is tracked by segmentIndex/totalSegments below.
         let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: linkMDU)
         let hashmapSegments = ResourceHashmap.segmentCount(
             totalParts: numParts,
@@ -670,33 +980,136 @@ public actor Resource {
         // Cache for HMU tracking (number of hashmap chunks, not resource segments)
         self.totalHashmapSegments = hashmapSegments
 
-        // Create flags — "split" refers to resource segments, not hashmap segments
-        // Since we send all data in one resource transfer, split is always false
-        var flags = ResourceFlags(
+        // Flags. python sets s=split, x=has_metadata (Resource.py:1290-1291,
+        // packed at :1307). has_metadata is true on every segment of a
+        // metadata-bearing chain (sent_metadata_size>0 → Resource.py:271);
+        // here metadataSize>0 only ever holds for segment 1 in this port's
+        // current callers (no metadata API yet), so x tracks metadataSize>0.
+        let flags = ResourceFlags(
             encrypted: true,  // Always encrypted for link-based resources
             compressed: compressed,
-            split: false
+            split: split,
+            isResponse: isResponse,
+            hasMetadata: metadataSize > 0
         )
-        if isResponse {
-            flags.insert(.isResponse)
-        }
 
-        // Use factory method to create advertisement with proper segmentation
-        // segment=1, totalSegments=1 because this is a single resource transfer
-        // (hashmap segments are handled transparently via HMU packets)
+        // Faithful segment advertisement. `d`(dataSize) = total chain plaintext
+        // size (python self.d = resource.total_size, Resource.py:1282) — the
+        // SAME value for every segment. `o`(originalHash) = first segment hash
+        // (Resource.py:1286). `i`/`l` = this segment's index / chain total.
         return ResourceAdvertisement.create(
             transferSize: transferSize,
-            dataSize: originalSize,
+            dataSize: totalPlaintextSize,
             numParts: numParts,
             resourceHash: resourceHash,
             randomHash: randomHash,
             hashmap: hashmap,
-            segment: 1,
-            totalSegments: 1,
+            originalHash: firstSegmentHash,
+            segment: segment,
+            totalSegments: totalSegments,
             requestId: requestId,
             flags: flags,
             linkMDU: linkMDU
         )
+    }
+
+    // MARK: - Outbound Segmentation
+
+    /// Whether there are more segments after this one. Mirrors python
+    /// `self.segment_index < self.total_segments` (Resource.py:516, :788).
+    public var hasMoreSegments: Bool {
+        segmentIndex < totalSegments
+    }
+
+    /// Eagerly prepare the next segment as a new Resource backed by the shared
+    /// input file.
+    ///
+    /// Faithful port of python `__prepare_next_segment` (Resource.py:765-780):
+    /// constructs the next `Resource(self.input_file, self.link, ...,
+    /// segment_index=self.segment_index+1, original_hash=self.original_hash,
+    /// ...)`, then calls `prepare()` on it (python defers prepare to the new
+    /// Resource's __init__; in this port prepare() is a separate step, so we
+    /// invoke it here to materialize the next segment's hash/hashmap before
+    /// advertising). Idempotent: returns the already-prepared next segment.
+    ///
+    /// - Parameter linkEncrypt: closure to link-encrypt the segment's blob;
+    ///   defaults to the captured `linkEncryptClosure`.
+    /// - Returns: the prepared next-segment Resource, or nil if this is the
+    ///   final segment.
+    ///
+    /// Concurrency adaptation (see port-deviations.md): python prepares the
+    /// next segment on a daemon thread (`__prepare_next_segment` via
+    /// `threading.Thread`, Resource.py:517/768). This port prepares it inline
+    /// in an async call, which is the faithful actor-model equivalent — the
+    /// next segment isn't advertised until preparation completes either way.
+    @discardableResult
+    public func prepareNextSegment(linkEncrypt: ((Data) throws -> Data)? = nil) async throws -> Resource? {
+        guard hasMoreSegments else { return nil }
+        if let existing = nextSegment { return existing }
+
+        guard let link = link else {
+            throw ResourceError.transferFailed(reason: "No link for next segment preparation")
+        }
+        guard let url = inputFileURL else {
+            throw ResourceError.transferFailed(reason: "No input file for next segment preparation")
+        }
+        guard let encrypt = linkEncrypt ?? linkEncryptClosure else {
+            throw ResourceError.transferFailed(reason: "No linkEncrypt closure for next segment preparation")
+        }
+
+        self.preparingNextSegment = true
+
+        // python Resource.py:769-778
+        let next = Resource(
+            inputFileURL: url,
+            totalPlaintextSize: totalPlaintextSize,
+            metadataSize: metadataSize,
+            segmentIndex: segmentIndex + 1,
+            originalHash: originalHash,
+            link: link,
+            requestId: requestId,
+            isResponse: isResponse,
+            autoCompress: autoCompressOption,
+            linkEncrypt: encrypt
+        )
+        // Prepare the next segment now (reads its chunk via seek/read).
+        try await next.prepare(partSize: partSize, linkEncrypt: encrypt, autoCompress: autoCompressOption)
+
+        self.nextSegment = next
+        return next
+    }
+
+    /// Hand off ownership of the shared input file (and its open handle) to the
+    /// next segment, so the chain's staging tempfile survives until the LAST
+    /// segment concludes. Mirrors python's implicit sharing of `self.input_file`
+    /// across segments (the same file object is passed to each
+    /// `Resource(self.input_file, ...)`, Resource.py:769) and the close of it
+    /// only on the final segment's proof (Resource.py:796-797).
+    ///
+    /// Called by the Link right before advertising the next segment, paralleling
+    /// python `validate_proof` nulling out the current segment's `input_file`
+    /// (Resource.py:816) once the next segment holds it.
+    public func transferInputFileOwnership(to next: Resource) async {
+        // Close our own read handle (the next segment opens its own on demand);
+        // do NOT unlink — the next segment now owns the file.
+        try? inputFileHandle?.close()
+        inputFileHandle = nil
+        let url = inputFileURL
+        let owns = ownsInputFile
+        ownsInputFile = false
+        inputFileURL = nil
+        if let url = url {
+            await next.adoptInputFile(url, owns: owns)
+        }
+    }
+
+    /// Adopt the shared input file from the previous segment (assume ownership
+    /// so cleanup unlinks it once this segment — if final — concludes).
+    public func adoptInputFile(_ url: URL, owns: Bool) {
+        // Only set if not already pointing at it (prepareNextSegment already
+        // wired inputFileURL via the initializer); take over ownership flag.
+        if inputFileURL == nil { inputFileURL = url }
+        if owns { ownsInputFile = true }
     }
 
     // MARK: - Inbound Transfer
@@ -765,11 +1178,47 @@ public actor Resource {
 
     /// Release any disk / file-handle resources held by this transfer.
     ///
-    /// No-op today (transfers are buffered fully in memory). The resource
-    /// disk-streaming work fills this in to close open file handles and unlink
-    /// the inbound / outbound temp files. Safe to call multiple times.
-    public func cleanup() {
-        // Intentionally empty until resource disk-streaming lands.
+    /// Closes the outbound input-file read handle and unlinks the outbound
+    /// staging tempfile (only if this segment owns it) and the inbound
+    /// storagepath tempfile. Safe to call multiple times (idempotent).
+    ///
+    /// Mirrors python's resource teardown: the input_file is closed on the
+    /// final segment's proof (Resource.py:796-797) and the inbound storagepath
+    /// is unlinked after the assembled callback (Resource.py:744). This port
+    /// consolidates both into one idempotent method invoked on every terminal
+    /// path (complete, corrupt/.failed, link close, cancel, reject).
+    ///
+    /// - Parameter abandonChain: when true, unlink the inbound storagepath even
+    ///   for a NON-final segment. Used on abnormal teardown (corrupt segment,
+    ///   cancel, reject, link close) where the whole chain is being abandoned,
+    ///   so the partial on-disk file must not leak. Defaults to false so the
+    ///   normal per-segment conclusion only unlinks on the final segment
+    ///   (matching python's unlink-after-final-callback, Resource.py:744).
+    public func cleanup(abandonChain: Bool = false) {
+        // Close + unlink outbound input file (python input_file close :796-797).
+        try? inputFileHandle?.close()
+        inputFileHandle = nil
+        if ownsInputFile, let url = inputFileURL {
+            try? FileManager.default.removeItem(at: url)
+        }
+        inputFileURL = nil
+        ownsInputFile = false
+
+        // Unlink inbound storagepath (python os.unlink(storagepath) :744).
+        // Normal path: only the FINAL segment unlinks (earlier segments leave
+        // the file for the next segment to append to). Abnormal teardown
+        // (abandonChain) unlinks unconditionally so a partial file can't leak.
+        if let url = storageFileURL {
+            // The assembled bytes are already preserved in RAM (assembledData)
+            // by the time the final segment concludes, so unlinking here doesn't
+            // strand a reader. assembledFileURL still references the (now-removed)
+            // path as a forward hook — callers wanting the on-disk file must copy
+            // it out before the resource concludes (see port-deviations.md).
+            if abandonChain || segmentIndex >= totalSegments {
+                try? FileManager.default.removeItem(at: url)
+                storageFileURL = nil
+            }
+        }
     }
 
     /// Request next batch of parts from sender.
@@ -1154,16 +1603,34 @@ public actor Resource {
         }
     }
 
-    /// Assemble received parts into original data.
+    /// Assemble this segment's received parts and append the plaintext to the
+    /// per-resource on-disk storagepath.
     ///
-    /// Performs final assembly steps:
-    /// 1. Concatenate all parts in order
-    /// 2. Remove random hash prefix (4 bytes)
-    /// 3. Decompress if compressed flag is set
-    /// 4. Transition to complete state
+    /// Faithful port of python `Resource.assemble` (Resource.py:672-716):
+    /// 1. Join parts → stream; link-decrypt (`:676-679`).
+    /// 2. Strip the random-hash prefix (`:682`).
+    /// 3. Decompress if compressed, with the bz2 max-decompressed-size bound
+    ///    (`:684-692`).
+    /// 4. Validate `full_hash(self.data + random_hash) == self.hash` — the
+    ///    per-segment integrity check (`:694-695`). A mismatch is the CORRUPT
+    ///    path (`:715`); we throw, and the Link maps that to `.failed`.
+    /// 5. On segment 1 with metadata, split the 3-byte-length-prefixed metadata
+    ///    off the front (`:696-704`) — currently this port's senders attach no
+    ///    metadata, but the receive path mirrors python so interop with a
+    ///    metadata-bearing python sender works.
+    /// 6. Append the resulting plaintext to `storagepath` opened "ab"
+    ///    (`:708-710`), then mark COMPLETE.
     ///
-    /// - Returns: Original uncompressed data
-    /// - Throws: ResourceError if not all parts received or decompression fails
+    /// The chain-completion surfacing (read storagepath back, fire callback,
+    /// unlink) is the Link's responsibility (mirrors python `assemble`
+    /// `:725-747` running inside the same method, but split out here so the
+    /// Link owns inbound-resource lifecycle / dict bookkeeping).
+    ///
+    /// - Returns: For the FINAL segment, the fully assembled resource bytes
+    ///   (read back from storagepath). For non-final segments, this segment's
+    ///   plaintext chunk (the Link does not deliver it).
+    /// - Throws: ResourceError on missing parts, decrypt/decompress failure, or
+    ///   the per-segment hash-mismatch CORRUPT case.
     public func assemble() throws -> Data {
         guard state == .assembling || state == .awaitingProof else {
             throw ResourceError.invalidState(
@@ -1182,7 +1649,7 @@ public actor Resource {
             )
         }
 
-        // Step 1: Concatenate all parts
+        // Step 1: Concatenate all parts (python `stream = b"".join(self.parts)`)
         var assembled = Data()
         for part in parts {
             guard let partData = part else {
@@ -1191,17 +1658,16 @@ public actor Resource {
             assembled.append(partData)
         }
 
-        // Verify assembled data size matches transfer size
+        // Verify assembled (encrypted) size matches the advertised transfer
+        // size. python has no explicit check here, but transferSize is this
+        // segment's own `t`; a mismatch means lost/extra parts → corrupt.
         guard assembled.count == transferSize else {
             throw ResourceError.transferFailed(
                 reason: "Assembled size \(assembled.count) != transfer size \(transferSize)"
             )
         }
 
-        // Step 2: Link-decrypt the assembled data
-        // Python: if self.encrypted: data = self.link.decrypt(stream)
-        // Resource parts are transmitted encrypted; the link does NOT decrypt
-        // resource data packets (context 0x01 is passthrough).
+        // Step 2: Link-decrypt the assembled data (python `:678`).
         let decrypted: Data
         if let decrypt = decryptCallback {
             decrypted = try decrypt(assembled)
@@ -1209,7 +1675,7 @@ public actor Resource {
             decrypted = assembled
         }
 
-        // Step 3: Remove random hash prefix (4 bytes)
+        // Step 3: Remove random hash prefix (4 bytes) (python `:682`).
         guard decrypted.count >= ResourceConstants.RANDOM_HASH_SIZE else {
             throw ResourceError.transferFailed(
                 reason: "Decrypted data too short to contain random hash prefix"
@@ -1217,28 +1683,123 @@ public actor Resource {
         }
         let dataWithoutRandomHash = decrypted.dropFirst(ResourceConstants.RANDOM_HASH_SIZE)
 
-        // Step 4: Decompress if needed
-        let finalData: Data
+        // Step 4: Decompress if needed (python `:684-692`). This yields
+        // `self.data` — this segment's plaintext (metadata||chunk for seg 1).
+        let segmentPlaintext: Data
         if compressed {
-            // Bound decompression to the advertised size as the buffer hint and to
-            // AUTO_COMPRESS_MAX_SIZE as the hard cap (python max_decompressed_size,
-            // Resource.py:687), so an over-compressible payload can't exhaust memory.
-            finalData = try ResourceCompression.decompress(Data(dataWithoutRandomHash), expectedSize: originalSize)
+            // Bound decompression to AUTO_COMPRESS_MAX_SIZE (python
+            // max_decompressed_size, Resource.py:687). The buffer hint is the
+            // chain total `d` (originalSize) — an upper bound for any one
+            // segment's plaintext.
+            segmentPlaintext = try ResourceCompression.decompress(Data(dataWithoutRandomHash), expectedSize: originalSize)
         } else {
-            finalData = Data(dataWithoutRandomHash)
+            segmentPlaintext = Data(dataWithoutRandomHash)
         }
 
-        // Verify final data size matches original size
-        guard finalData.count == originalSize else {
-            throw ResourceError.transferFailed(
-                reason: "Final size \(finalData.count) != original size \(originalSize)"
-            )
+        // Step 5: Per-segment integrity check (python `:694-695`):
+        //   calculated_hash = full_hash(self.data + random_hash); == self.hash ?
+        if let randomHash = randomHash, let expectedHash = hash {
+            var hashInput = Data(segmentPlaintext)
+            hashInput.append(randomHash)
+            let calculatedHash = Hashing.fullHash(hashInput)
+            guard calculatedHash == expectedHash else {
+                // python CORRUPT branch (`:715`). Link maps to `.failed`.
+                throw ResourceError.transferFailed(
+                    reason: "Segment \(segmentIndex) hash mismatch (corrupt)"
+                )
+            }
         }
 
-        // Step 4: Store assembled data and transition to complete
-        self.assembledData = finalData
+        // Step 6: Strip metadata prefix on segment 1 (python `:696-704`:
+        // `if self.has_metadata and self.segment_index == 1:`).
+        var plaintextToStore = segmentPlaintext
+        if inboundHasMetadata, segmentIndex == 1, plaintextToStore.count >= 3 {
+            // 3-byte big-endian metadata length, then that many metadata bytes
+            // (python `:698-699`).
+            let b = plaintextToStore
+            let mlen = (Int(b[b.startIndex]) << 16) | (Int(b[b.startIndex + 1]) << 8) | Int(b[b.startIndex + 2])
+            if 3 + mlen <= plaintextToStore.count {
+                // python writes the metadata to meta_storagepath (`:700-702`)
+                // for the assembled callback. This port has no metadata-consuming
+                // callback yet, so the metadata bytes are parsed-and-dropped from
+                // the stored stream (see port-deviations.md). The remaining data
+                // (`data = self.data[3+metadata_size:]`, `:704`) is what's stored.
+                plaintextToStore = Data(plaintextToStore.dropFirst(3 + mlen))
+            }
+        }
+
+        // Step 7: Append plaintext to storagepath ("ab") (python `:708-710`).
+        try appendToStorage(plaintextToStore)
+
+        // Mark this segment COMPLETE (python `:711`).
         try transitionState(to: .complete)
 
-        return finalData
+        // Surface: on the final segment read the whole storagepath back; this
+        // mirrors python `self.data = open(self.storagepath, "rb")` (`:737`)
+        // while preserving the in-RAM `assembledData` contract. Non-final
+        // segments return their own plaintext (undelivered by the Link).
+        if segmentIndex == totalSegments {
+            let assembledURL = storageFileURL
+            let finalData: Data
+            if let url = assembledURL {
+                finalData = (try? Data(contentsOf: url)) ?? plaintextToStore
+            } else {
+                finalData = plaintextToStore
+            }
+            self.assembledData = finalData
+            self.assembledFileURL = assembledURL
+            return finalData
+        } else {
+            // Non-final segment: data continues accumulating on disk. Expose
+            // what we have so far for diagnostics; the Link awaits the next
+            // segment advertisement before concluding (python `:748-749`).
+            self.assembledFileURL = storageFileURL
+            return plaintextToStore
+        }
+    }
+
+    /// Append decrypted plaintext to the inbound storagepath, creating/opening
+    /// it in append mode. Faithful to python `open(self.storagepath,"ab")`
+    /// (Resource.py:708). The file is named by original-hash hex under
+    /// NSTemporaryDirectory() (see port-deviations.md for the path choice;
+    /// python uses RNS.Reticulum.resourcepath, Resource.py:199).
+    private func appendToStorage(_ data: Data) throws {
+        let url = try storageURL()
+        let fm = FileManager.default
+        // Segment 1 starts a fresh stream: remove any stale storagepath left by
+        // an aborted prior transfer of the same logical resource (python relies
+        // on unlink-after-completion + a random original_hash so this file
+        // never pre-exists; this is a defensive guard for the same-process
+        // crash-restart case and doesn't change observable wire behavior).
+        if segmentIndex == 1, fm.fileExists(atPath: url.path) {
+            try? fm.removeItem(at: url)
+        }
+        if !fm.fileExists(atPath: url.path) {
+            // Create empty file first so FileHandle(forWritingTo:) succeeds.
+            fm.createFile(atPath: url.path, contents: nil)
+        }
+        let handle = try FileHandle(forWritingTo: url)
+        defer { try? handle.close() }
+        try handle.seekToEnd()
+        try handle.write(contentsOf: data)
+    }
+
+    /// Resolve (memoized) the inbound storagepath URL.
+    ///
+    /// Keyed DETERMINISTICALLY by the chain's original_hash hex (NO uuid),
+    /// faithfully mirroring python `self.storagepath = resourcepath + "/" +
+    /// original_hash.hex()` (Resource.py:199). This determinism is REQUIRED for
+    /// multi-segment: each inbound segment is a fresh `Resource` (the Link
+    /// accepts a new advertisement per segment), and they must all append to
+    /// the SAME file — so the key cannot include a per-instance uuid. (The
+    /// OUTBOUND staging file, owned by a single Resource, does use a uuid; see
+    /// port-deviations.md for the per-side naming rationale.)
+    private func storageURL() throws -> URL {
+        if let url = storageFileURL { return url }
+        let keyHex = (originalHash ?? hash ?? Data()).map { String(format: "%02x", $0) }.joined()
+        let name = "rns_resource_in_\(keyHex)"
+        let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(name)
+        storageFileURL = url
+        return url
     }
 }
