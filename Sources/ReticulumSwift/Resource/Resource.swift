@@ -763,6 +763,15 @@ public actor Resource {
         try transitionState(to: .rejected)
     }
 
+    /// Release any disk / file-handle resources held by this transfer.
+    ///
+    /// No-op today (transfers are buffered fully in memory). The resource
+    /// disk-streaming work fills this in to close open file handles and unlink
+    /// the inbound / outbound temp files. Safe to call multiple times.
+    public func cleanup() {
+        // Intentionally empty until resource disk-streaming lands.
+    }
+
     /// Request next batch of parts from sender.
     ///
     /// Uses window manager to determine which parts should be requested based

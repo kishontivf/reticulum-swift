@@ -64,6 +64,37 @@ exists specifically because this method wasn't idempotent; pinning the
 contract here is the correct fix and lets the workaround be deleted on
 the next Columba-iOS deps bump.
 
+### Resource corrupt-assembly handling — `.failed` mapping + deferred bz2-overflow teardown (fix/resource-completion-cleanup 2026-06-02)
+
+**Sites:** `Sources/ReticulumSwift/Link/Link.swift` — `handleResourceData`
+assembly catch + `close()` resource teardown; `Sources/ReticulumSwift/Resource/Resource.swift`
+— `cleanup()`.
+
+**Python reference:** `RNS/Resource.py` `assemble()` (`:672-749`) + `cancel()`
+(`:1071-1104`); `RNS/Link.py` `link_closed()` (`:724-726`).
+
+**Behavior (faithful):** an inbound assembly that hits a hash-mismatch (`:715`),
+decrypt error, or any exception (`:721`) leaves the resource non-COMPLETE and falls
+through to `link.resource_concluded(self)` (`:723`) — the swift port drops it from
+`inboundResources` and fires `resourceConcluded` (which the LXMF handler ignores for a
+non-`.complete` resource, matching `LXMRouter.py:1878`). No packet is sent and the link
+is NOT torn down. `Link.close()` cancels in-flight resources (mirrors `link_closed`
+`:724-726`) without emitting `RESOURCE_ICL`, because the link is no longer ACTIVE
+(`Resource.py:1088-1092` gates the cancel packet on `link.status == ACTIVE`). The prior
+swift `catch` only logged, leaking the resource in `.assembling` with the callback never
+fired — that leak is what this fixes.
+
+**Two structural notes (not behavioral divergences from the common corrupt path):**
+1. `ResourceState` has no `CORRUPT` case (pre-existing); the corrupt-assembly path maps
+   to the terminal `.failed`. Observably identical: non-COMPLETE ⇒ not delivered,
+   concluded, removed.
+2. **Deferred:** python's bz2 *max-decompressed-size overflow* sub-path
+   (`Resource.py:688-692`) sets CORRUPT and calls `cancel()` → `reject()` (RESOURCE_RCL)
+   + `link.teardown()`. The swift `ResourceCompression.decompress` does not enforce /
+   surface a max-decompressed-size, so that decompression-bomb guard is not yet ported;
+   such input currently takes the ordinary corrupt path (drop + conclude, no teardown).
+   Tracked with the transport memory-caps work (decompression-bomb / max-size guard).
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)

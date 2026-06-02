@@ -1072,6 +1072,25 @@ public actor Link {
         stopKeepalive()
         stopWatchdog()
 
+        // Mirror python Link.link_closed (Link.py:724-726): cancel in-flight resources
+        // on close. With the link already closing, cancel()'s non-corrupt FAILED branch
+        // fires the resource-conclusion callback (the LXMF handler ignores non-.complete)
+        // and drops the resource; no RESOURCE_ICL is sent because the link is no longer
+        // ACTIVE (Resource.py:1088-1092 gates the cancel packet on link status == ACTIVE).
+        let inflightResources = Array(inboundResources.values) + Array(outboundResources.values)
+        inboundResources.removeAll()
+        outboundResources.removeAll()
+        if !inflightResources.isEmpty {
+            let callbacks = resourceCallbacks
+            Task {
+                for resource in inflightResources {
+                    try? await resource.transitionState(to: .failed)
+                    await resource.cleanup()
+                    await callbacks?.resourceConcluded(resource)
+                }
+            }
+        }
+
         transitionState(to: .closed(reason: reason))
         stateContinuation?.finish()
 
@@ -1574,52 +1593,83 @@ public actor Link {
             let resourceState = await resource.state
             guard resourceState == .transferring else { continue }
 
+            let complete: Bool
             do {
-                let complete = try await resource.handlePartPacket(data)
-                let total = await resource.numParts
-                let received = await resource.receivedCount
-                resourceDebugLog("PART: \(received)/\(total), complete=\(complete), data=\(data.count)B")
-                linkLogger.debug("Part received (\(received, privacy: .public)/\(total, privacy: .public)), complete=\(complete, privacy: .public)")
-
-                if complete {
-                    // Resource transfer complete - assemble and send proof
-                    let assembledData = try await resource.assemble()
-                    resourceDebugLog("COMPLETE: assembled \(assembledData.count)B, sending proof")
-                    linkLogger.info("Resource assembled \(assembledData.count, privacy: .public) bytes, sending proof")
-                    try await resource.sendProof()
-
-                    // If this resource is a response to a pending request,
-                    // deliver the assembled data as the request response.
-                    // Python: packed_response = umsgpack.packb([request_id, response])
-                    // The assembled data IS this msgpack blob.
-                    if let reqId = resource.requestId {
-                        let reqHex = reqId.prefix(8).map { String(format: "%02x", $0) }.joined()
-                        resourceDebugLog("DELIVER: response resource for request \(reqHex), data=\(assembledData.count)B")
-                        linkLogger.info("Response resource complete for request \(reqHex, privacy: .public), data=\(assembledData.count, privacy: .public) bytes")
-                        // Unpack msgpack([requestId, responseData]) and deliver
-                        if let value = try? unpackMsgPack(assembledData),
-                           case .array(let elements) = value,
-                           elements.count >= 2,
-                           case .binary(let responseRequestId) = elements[0] {
-                            let responseData = packMsgPack(elements[1])
-                            resourceDebugLog("DELIVER: unpacked OK, responseData=\(responseData.count)B")
-                            await handleRequestResponse(requestId: responseRequestId, data: responseData)
-                        } else {
-                            resourceDebugLog("DELIVER: FAILED to unpack assembled data")
-                            linkLogger.error("Failed to unpack assembled data as msgpack([requestId, response])")
-                        }
-                    }
-
-                    // Notify callback
-                    await resourceCallbacks?.resourceConcluded(resource)
-
-                    // Remove from tracking
-                    inboundResources.removeValue(forKey: hash)
-                }
-                return
+                complete = try await resource.handlePartPacket(data)
             } catch {
+                // A bad / duplicate part is not fatal — the window + request machinery
+                // re-requests missing parts, so log and let a later packet retry.
                 linkLogger.error("Part handling error: \(error, privacy: .public)")
+                continue
             }
+
+            let total = await resource.numParts
+            let received = await resource.receivedCount
+            resourceDebugLog("PART: \(received)/\(total), complete=\(complete), data=\(data.count)B")
+            linkLogger.debug("Part received (\(received, privacy: .public)/\(total, privacy: .public)), complete=\(complete, privacy: .public)")
+
+            if complete {
+                // All parts received. Assemble; on failure, fail the inbound resource
+                // (rather than leak it in .assembling) and tell the sender to stop.
+                let assembledData: Data
+                do {
+                    assembledData = try await resource.assemble()
+                } catch {
+                    // Mirror python Resource.assemble() corrupt path (Resource.py:715/721 → :723):
+                    // a hash-mismatch / decrypt / size error leaves the resource non-COMPLETE and
+                    // falls through to `link.resource_concluded(self)` — drop it from the link's
+                    // tracking and fire the conclusion callback (which the LXMF handler ignores for
+                    // a non-.complete resource). Python sends NO packet and does NOT tear the link
+                    // down for ordinary corruption (only the bz2 max-decompressed-size overflow at
+                    // Resource.py:688-692 calls cancel() → reject + teardown; the swift decompressor
+                    // doesn't surface that case distinctly — see port-deviations.md).
+                    linkLogger.error("Resource assembly failed (corrupt): \(error, privacy: .public) — concluding without delivery")
+                    try? await resource.transitionState(to: .failed)
+                    await resource.cleanup()
+                    await resourceCallbacks?.resourceConcluded(resource)
+                    inboundResources.removeValue(forKey: hash)
+                    return
+                }
+
+                resourceDebugLog("COMPLETE: assembled \(assembledData.count)B, sending proof")
+                linkLogger.info("Resource assembled \(assembledData.count, privacy: .public) bytes, sending proof")
+                // Proof is best-effort: the data is fully received, so deliver it even
+                // if the proof send fails (the sender re-requests / times out its proof).
+                do {
+                    try await resource.sendProof()
+                } catch {
+                    linkLogger.error("Resource proof send failed (delivering anyway): \(error, privacy: .public)")
+                }
+
+                // If this resource is a response to a pending request,
+                // deliver the assembled data as the request response.
+                // Python: packed_response = umsgpack.packb([request_id, response])
+                // The assembled data IS this msgpack blob.
+                if let reqId = resource.requestId {
+                    let reqHex = reqId.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    resourceDebugLog("DELIVER: response resource for request \(reqHex), data=\(assembledData.count)B")
+                    linkLogger.info("Response resource complete for request \(reqHex, privacy: .public), data=\(assembledData.count, privacy: .public) bytes")
+                    // Unpack msgpack([requestId, responseData]) and deliver
+                    if let value = try? unpackMsgPack(assembledData),
+                       case .array(let elements) = value,
+                       elements.count >= 2,
+                       case .binary(let responseRequestId) = elements[0] {
+                        let responseData = packMsgPack(elements[1])
+                        resourceDebugLog("DELIVER: unpacked OK, responseData=\(responseData.count)B")
+                        await handleRequestResponse(requestId: responseRequestId, data: responseData)
+                    } else {
+                        resourceDebugLog("DELIVER: FAILED to unpack assembled data")
+                        linkLogger.error("Failed to unpack assembled data as msgpack([requestId, response])")
+                    }
+                }
+
+                // Notify callback
+                await resourceCallbacks?.resourceConcluded(resource)
+
+                // Remove from tracking
+                inboundResources.removeValue(forKey: hash)
+            }
+            return
         }
     }
 
