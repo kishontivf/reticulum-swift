@@ -1220,7 +1220,10 @@ public actor Resource {
         // Step 4: Decompress if needed
         let finalData: Data
         if compressed {
-            finalData = try ResourceCompression.decompress(Data(dataWithoutRandomHash))
+            // Bound decompression to the advertised size as the buffer hint and to
+            // AUTO_COMPRESS_MAX_SIZE as the hard cap (python max_decompressed_size,
+            // Resource.py:687), so an over-compressible payload can't exhaust memory.
+            finalData = try ResourceCompression.decompress(Data(dataWithoutRandomHash), expectedSize: originalSize)
         } else {
             finalData = Data(dataWithoutRandomHash)
         }

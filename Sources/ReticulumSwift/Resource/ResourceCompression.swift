@@ -49,6 +49,7 @@ public enum BZ2Error: Error, CustomStringConvertible {
     case compressFailed(code: Int32)
     case decompressFailed(code: Int32)
     case outputBufferTooSmall
+    case exceedsMaxDecompressedSize(max: Int)
 
     public var description: String {
         switch self {
@@ -58,6 +59,8 @@ public enum BZ2Error: Error, CustomStringConvertible {
             return "BZ2 decompression failed with code \(code) (\(BZ2Error.errorName(code)))"
         case .outputBufferTooSmall:
             return "BZ2 output buffer too small after maximum retries"
+        case .exceedsMaxDecompressedSize(let max):
+            return "BZ2 decompressed output exceeds maximum allowed size (\(max) bytes)"
         }
     }
 
@@ -165,7 +168,11 @@ public enum ResourceCompression {
     ///   - expectedSize: Optional hint for output buffer size
     /// - Returns: Decompressed data
     /// - Throws: BZ2Error on decompression failure
-    public static func bz2Decompress(_ data: Data, expectedSize: Int? = nil) throws -> Data {
+    public static func bz2Decompress(
+        _ data: Data,
+        expectedSize: Int? = nil,
+        maxDecompressedSize: Int = ResourceConstants.AUTO_COMPRESS_MAX_SIZE
+    ) throws -> Data {
         guard !data.isEmpty else {
             return Data()
         }
@@ -176,10 +183,17 @@ public enum ResourceCompression {
         if bufferSize < 1024 {
             bufferSize = 1024
         }
+        // Bound the output buffer so a maliciously over-compressible ("bz2 bomb")
+        // input cannot allocate unbounded memory. Mirrors python's decompress
+        // max_length = max_decompressed_size (Resource.py:687, AUTO_COMPRESS_MAX_SIZE):
+        // output beyond the cap is treated as corrupt rather than expanded further.
+        if bufferSize > maxDecompressedSize {
+            bufferSize = maxDecompressedSize
+        }
 
         let maxAttempts = 6
 
-        for attempt in 0..<maxAttempts {
+        for _ in 0..<maxAttempts {
             var destLen = UInt32(bufferSize)
             let destBuffer = UnsafeMutablePointer<CChar>.allocate(capacity: bufferSize)
 
@@ -202,10 +216,14 @@ public enum ResourceCompression {
                 let resultData = Data(bytes: destBuffer, count: Int(destLen))
                 destBuffer.deallocate()
                 return resultData
-            } else if result == BZ_OUTBUFF_FULL && attempt < maxAttempts - 1 {
-                // Double buffer and retry
+            } else if result == BZ_OUTBUFF_FULL {
                 destBuffer.deallocate()
-                bufferSize *= 2
+                // Already at the absolute cap and still too small => the decompressed
+                // output exceeds the maximum allowed size; surface the bomb/corrupt case.
+                if bufferSize >= maxDecompressedSize {
+                    throw BZ2Error.exceedsMaxDecompressedSize(max: maxDecompressedSize)
+                }
+                bufferSize = min(bufferSize * 2, maxDecompressedSize)
                 continue
             } else {
                 destBuffer.deallocate()
@@ -289,13 +307,17 @@ public enum ResourceCompression {
     ///   - expectedSize: Expected decompressed size (for buffer allocation)
     /// - Returns: Decompressed data
     /// - Throws: ResourceError.decompressionFailed on error
-    public static func decompress(_ data: Data, expectedSize: Int? = nil) throws -> Data {
+    public static func decompress(
+        _ data: Data,
+        expectedSize: Int? = nil,
+        maxDecompressedSize: Int = ResourceConstants.AUTO_COMPRESS_MAX_SIZE
+    ) throws -> Data {
         guard !data.isEmpty else {
             return Data()
         }
 
         do {
-            return try bz2Decompress(data, expectedSize: expectedSize)
+            return try bz2Decompress(data, expectedSize: expectedSize, maxDecompressedSize: maxDecompressedSize)
         } catch {
             throw ResourceError.decompressionFailed(
                 reason: "BZ2 decompression failed: \(error)"

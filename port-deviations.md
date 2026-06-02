@@ -88,12 +88,16 @@ fired — that leak is what this fixes.
 1. `ResourceState` has no `CORRUPT` case (pre-existing); the corrupt-assembly path maps
    to the terminal `.failed`. Observably identical: non-COMPLETE ⇒ not delivered,
    concluded, removed.
-2. **Deferred:** python's bz2 *max-decompressed-size overflow* sub-path
-   (`Resource.py:688-692`) sets CORRUPT and calls `cancel()` → `reject()` (RESOURCE_RCL)
-   + `link.teardown()`. The swift `ResourceCompression.decompress` does not enforce /
-   surface a max-decompressed-size, so that decompression-bomb guard is not yet ported;
-   such input currently takes the ordinary corrupt path (drop + conclude, no teardown).
-   Tracked with the transport memory-caps work (decompression-bomb / max-size guard).
+2. python's bz2 *max-decompressed-size* bound (`Resource.py:687`,
+   `max_length = max_decompressed_size = AUTO_COMPRESS_MAX_SIZE`) is now enforced:
+   `ResourceCompression.decompress` / `bz2Decompress` cap the output buffer at
+   `AUTO_COMPRESS_MAX_SIZE` (64 MB) and throw `BZ2Error.exceedsMaxDecompressedSize`
+   on overflow, so an over-compressible ("bz2 bomb") payload can't exhaust memory
+   (`assemble()` passes the advertised size as the buffer hint). **Deferred:** python's
+   overflow *response* additionally `reject()`s (RESOURCE_RCL) and tears the link down
+   (the CORRUPT branch of `cancel()`, `Resource.py:1081-1084`); the swift overflow throw
+   currently takes the ordinary corrupt path (drop + conclude, no reject/teardown — the
+   same deferral as the rest of the corrupt-assembly handling above).
 
 ## Resolved deviations
 
