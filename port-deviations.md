@@ -285,3 +285,41 @@ Phase 1b (under-load NE memory measurement). If the NE actually OOMs on this
 path, an `HW_MTU`-style bound is added THEN as a measured, explicitly documented
 category-(a) divergence (a runtime constraint the python pattern cannot express
 in the NE sandbox), and this entry is updated to record it.
+
+### `TCPTransport.bypassTunnelEgress` — iOS Network Extension egress pin (defensive; new feature)
+
+**Site:** `Sources/ReticulumSwift/Transport/TCPTransport.swift` — static
+`bypassTunnelEgress` (default `false`) and its use in `connect()`, where it sets
+`NWParameters.prohibitedInterfaceTypes = [.other]` on the outbound
+`NWConnection`.
+
+**Python reference:** `../Reticulum/RNS/Interfaces/TCPInterface.py:142-202` —
+upstream creates a raw BSD socket (`socket.socket` / `socket.create_connection`,
+`setsockopt` for `TCP_NODELAY`/`SO_KEEPALIVE`/timeouts). There is no
+Network.framework, no `NWParameters`, and no concept of binding a connection to
+an interface *type*. The python desktop reference never runs inside an iOS
+packet-tunnel provider, so this concern does not arise upstream.
+
+**Reason:** Category (a) — a platform construct (Network.framework interface
+scoping) the python pattern cannot express. When `TCPTransport` runs *inside* a
+`NEPacketTunnelProvider`, an outbound connection can in principle bind to the
+provider's own tunnel (utun, interface type `.other`) and loop instead of
+egressing the LAN. `prohibitedInterfaceTypes = [.other]` pins it to a physical
+interface (wifi/cellular). Only the NE host sets it `true`; the normal in-app
+path is unaffected.
+
+**Honesty note (2026-06-02 on-device bring-up):** this was originally added
+believing it was *the* fix for "announces not propagating," but that diagnosis
+was wrong — the real root cause was a **wedged Mac relay daemon** (`lxmd` had
+crashed days earlier on `[Errno 28] No space left on device` while persisting a
+ratchet, so it accepted TCP connections but ingested no announces). The
+"phantom `.ready` / zero SYN" observation that motivated this was a **tcpdump
+filter artifact** — I was filtering the device's stale DHCP IP, not its current
+one; the NE's stock-`NWParameters` connection had been egressing fine the whole
+time. So `bypassTunnelEgress` is **retained as a defensive belt-and-suspenders
+pin** (cheap insurance against a future tunnel-routing regression binding the
+NE's relay to its own utun), NOT as a verified-necessary fix. **Revert
+candidate:** returning `connect()` to stock `NWConnection(using: .tcp)` and
+deleting this flag would also be correct — on-device delivery + announce-in/out
+were later confirmed working with it in place, but were never shown to *require*
+it.
