@@ -71,6 +71,11 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     /// (allowDuplicates) scan — it saturates the radio and `didConnect` never
     /// fires otherwise — and resumes it afterwards iff this is still set.
     private var scanRequested = false
+    /// In-flight central connects. The scan is paused on the first and resumed
+    /// only when this drops back to zero — a per-call snapshot would let the
+    /// first connect to resolve restart the scan while another is still waiting
+    /// for `didConnect`, re-saturating the radio.
+    private var activeConnectCount = 0
     private var pendingConnect: [String: CheckedContinuation<any BLEPeerConnection, Error>] = [:]
     private var pendingRssi: [String: CheckedContinuation<Int, Error>] = [:]
 
@@ -211,13 +216,26 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
         // central connect never establishes — `didConnect` never fires and the
         // attempt dies on `connectionTimeout`. Pause the scan for the duration of the
         // connect and resume it (iff still wanted) once the connect resolves.
-        let resumeScan = lock.withLock { scanRequested }
-        if resumeScan {
+        //
+        // Reference-count concurrent connects: pause on the first, resume only once
+        // the last finishes. A per-call snapshot would let the first connect to
+        // resolve restart the scan while another is still waiting for `didConnect`,
+        // re-saturating the radio. The increment is paired with the `defer` below
+        // (both after the not-found guard above), so the counter stays balanced.
+        let pauseScan = lock.withLock { () -> Bool in
+            activeConnectCount += 1
+            return activeConnectCount == 1 && scanRequested
+        }
+        if pauseScan {
             centralManager.stopScan()
             bleDiag("connect: paused scan for \(address.prefix(8))")
         }
         defer {
-            if resumeScan, lock.withLock({ scanRequested }) {
+            let resumeScan = lock.withLock { () -> Bool in
+                activeConnectCount -= 1
+                return activeConnectCount == 0 && scanRequested
+            }
+            if resumeScan {
                 centralManager.scanForPeripherals(
                     withServices: [BLEMeshConstants.serviceUUID],
                     options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
