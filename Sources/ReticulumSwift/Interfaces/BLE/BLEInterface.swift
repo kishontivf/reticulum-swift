@@ -492,30 +492,23 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
             let existingState = await existingPeer.state
             let isStale = await existingPeer.isStale
 
+            // Python parity (BLEInterface._check_duplicate_identity): an existing HEALTHY
+            // connection for this identity already won the handshake race — reject the
+            // duplicate regardless of direction (central OR peripheral). The reference keeps
+            // the existing alive connection and aborts the newcomer; when both peers apply
+            // this same rule they converge on the first-completed handshake.
+            //
+            // (Previously this preferred the outgoing/central link, which diverged from the
+            // python/kotlin "keep existing" rule and could leave iOS↔Android each keeping the
+            // opposite link, closing both. Direction-based sorting can't converge cross-platform:
+            // iOS has no local BLE MAC and sees peers as opaque CoreBluetooth UUIDs.)
             if existingState == .connected && !isStale {
-                // Healthy existing connection — check for dual-connection dedup
-                let existingIsOutgoing = await existingPeer.isOutgoing
-                if existingIsOutgoing != isOutgoing {
-                    // Dual connection: same identity connected as both central and peripheral.
-                    // Keep the outgoing (central-initiated) connection — it's further along
-                    // with service discovery. Both sides follow this rule for determinism.
-                    if existingIsOutgoing {
-                        logger.info("Dual-dedup: keeping existing outgoing for \(identityHex.prefix(8), privacy: .public)")
-                        connection.close()
-                        return
-                    } else {
-                        logger.info("Dual-dedup: replacing incoming with outgoing for \(identityHex.prefix(8), privacy: .public)")
-                        // Fall through to hot-swap
-                    }
-                } else {
-                    // Same direction, healthy — reject duplicate
-                    logger.debug("Rejecting duplicate \(isOutgoing ? "outgoing" : "incoming", privacy: .public) for \(identityHex.prefix(8), privacy: .public)")
-                    connection.close()
-                    return
-                }
+                logger.info("Duplicate identity \(identityHex.prefix(8), privacy: .public): keeping existing healthy connection, rejecting \(isOutgoing ? "outgoing" : "incoming", privacy: .public)")
+                connection.close()
+                return
             }
 
-            // Hot-swap: stale, dead, or dual-dedup replacement
+            // Hot-swap: the existing connection is stale (MAC rotation) or dead (reconnect).
             if existingState == .connected && isStale {
                 logger.info("MAC rotation: hot-swapping stale connection for \(identityHex.prefix(8), privacy: .public)")
             } else if existingState != .connected {
