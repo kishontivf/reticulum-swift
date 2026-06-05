@@ -67,6 +67,10 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     private var centralReady = false
     private var peripheralReady = false
     private var _isRunning = false
+    /// Whether the mesh scan should be running. A central connect pauses the
+    /// (allowDuplicates) scan — it saturates the radio and `didConnect` never
+    /// fires otherwise — and resumes it afterwards iff this is still set.
+    private var scanRequested = false
     private var pendingConnect: [String: CheckedContinuation<any BLEPeerConnection, Error>] = [:]
     private var pendingRssi: [String: CheckedContinuation<Int, Error>] = [:]
 
@@ -179,6 +183,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             throw InterfaceError.connectionFailed(underlying: "Bluetooth central not ready")
         }
 
+        lock.withLock { scanRequested = true }
         centralManager.scanForPeripherals(
             withServices: [BLEMeshConstants.serviceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
@@ -188,6 +193,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     }
 
     public func stopScanning() async {
+        lock.withLock { scanRequested = false }
         centralManager.stopScan()
         logger.info("BLE scanning stopped")
     }
@@ -199,6 +205,25 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
         let peripheral: CBPeripheral? = bleQueue.sync { discoveredPeripherals[address] }
         guard let peripheral else {
             throw InterfaceError.connectionFailed(underlying: "Peripheral not found: \(address)")
+        }
+
+        // CoreBluetooth: an active `allowDuplicates` scan saturates the radio so the
+        // central connect never establishes — `didConnect` never fires and the
+        // attempt dies on `connectionTimeout`. Pause the scan for the duration of the
+        // connect and resume it (iff still wanted) once the connect resolves.
+        let resumeScan = lock.withLock { scanRequested }
+        if resumeScan {
+            centralManager.stopScan()
+            bleDiag("connect: paused scan for \(address.prefix(8))")
+        }
+        defer {
+            if resumeScan, lock.withLock({ scanRequested }) {
+                centralManager.scanForPeripherals(
+                    withServices: [BLEMeshConstants.serviceUUID],
+                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                )
+                bleDiag("connect: resumed scan after \(address.prefix(8))")
+            }
         }
 
         return try await withCheckedThrowingContinuation { [weak self] continuation in

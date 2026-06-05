@@ -59,7 +59,11 @@ public enum BLEMeshConstants {
 
     public static let reassemblyTimeout: TimeInterval = 30.0
     public static let handshakeTimeout: TimeInterval = 30.0
-    public static let connectionTimeout: TimeInterval = 30.0
+    // A live peripheral connects in ~1-2s; a stale RPA (peer rotated its advertising
+    // address) never completes. A short timeout lets the central abandon a stale
+    // address fast and retry the live one — and (since the scan is paused during a
+    // connect) keeps a stale attempt from blocking discovery for long.
+    public static let connectionTimeout: TimeInterval = 8.0
     public static let zombieTimeout: TimeInterval = 45.0
     public static let zombieCheckInterval: TimeInterval = 15.0
     public static let zombieGracePeriod: TimeInterval = 5.0
