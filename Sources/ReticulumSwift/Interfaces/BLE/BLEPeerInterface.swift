@@ -84,7 +84,10 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     private var rssiTask: Task<Void, Never>?
 
     private var delegateRef: WeakBLEPeerDelegate?
-    private var onDetach: ((String) -> Void)?
+    /// Invoked when this peer detects its OWN connection dropped (receive stream
+    /// ended or keepalive failed). The owner (`BLEInterface`) schedules a
+    /// grace-period detach rather than removing the interface immediately.
+    private var onConnectionLost: ((String) -> Void)?
 
     private let logger = Logger(subsystem: "net.reticulum", category: "BLEPeerInterface")
 
@@ -149,9 +152,10 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
 
     // MARK: - Lifecycle
 
-    /// Set the detach callback (called when this peer should be removed).
-    public func setOnDetach(_ callback: @escaping @Sendable (String) -> Void) {
-        self.onDetach = callback
+    /// Set the connection-lost callback (called when this peer detects its own
+    /// connection dropped, so the owner can schedule a grace-period detach).
+    public func setOnConnectionLost(_ callback: @escaping @Sendable (String) -> Void) {
+        self.onConnectionLost = callback
     }
 
     /// Start background loops: receive, keepalive, RSSI polling.
@@ -166,7 +170,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
             }
             // Stream ended — connection lost
             if !Task.isCancelled {
-                await self?.detach()
+                await self?.handleConnectionLost()
             }
         }
 
@@ -187,8 +191,8 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
                         firstFailure = false
                         await self.logDebug("Keepalive failed (grace period)")
                     } else {
-                        await self.logDebug("Keepalive failed twice — detaching")
-                        await self.detach()
+                        await self.logDebug("Keepalive failed twice — connection lost")
+                        await self.handleConnectionLost()
                         break
                     }
                 }
@@ -242,7 +246,13 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         startReceiving()
     }
 
-    /// Tear down this peer interface.
+    /// Tear down this peer's BLE connection + background loops. Idempotent.
+    ///
+    /// This does NOT unregister the interface from the transport — that is owned by
+    /// `BLEInterface.removePeer`, called either after the detach grace period expires
+    /// or immediately for a deliberate removal (zombie / eviction / stop). Keeping
+    /// teardown and transport-unregistration separate is what lets a transient drop
+    /// hold the route alive during the grace window (ble-reticulum `_pending_detach`).
     public func detach() {
         guard state == .connected else { return }
         state = .disconnected
@@ -257,9 +267,23 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         connection.close()
 
         delegateRef?.delegate?.interface(id: id, didChangeState: .disconnected)
-        onDetach?(peerIdentityHex)
 
-        logger.info("BLEPeerInterface[\(self.peerIdentityHex.prefix(8), privacy: .public)] detached")
+        logger.info("BLEPeerInterface[\(self.peerIdentityHex.prefix(8), privacy: .public)] connection torn down")
+    }
+
+    /// The peer detected its OWN connection dropped (receive stream ended, or
+    /// keepalive failed twice). Tear the dead connection down, then ask the owning
+    /// `BLEInterface` to schedule a grace-period detach instead of removing the
+    /// interface immediately — a reconnect with the same identity during the grace
+    /// window reuses it, so a transient drop does not cull the learned route.
+    ///
+    /// Mirrors ble-reticulum: the driver's disconnect callback
+    /// (`_device_disconnected_callback`) schedules `_pending_detach` rather than
+    /// detaching the peer interface inline.
+    private func handleConnectionLost() {
+        guard state == .connected else { return }
+        detach()                            // teardown; sets state → .disconnected
+        onConnectionLost?(peerIdentityHex)  // → BLEInterface.scheduleDetach (grace)
     }
 
     // MARK: - Fragment Handling

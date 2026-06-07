@@ -89,4 +89,12 @@ public enum BLEMeshConstants {
     /// and allow replacement by a new connection with the same identity.
     /// Set to 2x keepalive interval.
     public static let staleConnectionThreshold: TimeInterval = 30.0
+
+    /// Grace window between a peer's BLE connection dropping and tearing down its
+    /// per-peer interface (unregistering it from the transport). A reconnect with
+    /// the same identity during this window reuses the interface, so a transient
+    /// drop (e.g. MAC rotation) does not cull the learned route.
+    /// Mirrors ble-reticulum python `_pending_detach_grace_period = 2.0`
+    /// (BLEInterface.py). iOS BLE reconnect latency may warrant tuning this up.
+    public static let detachGracePeriod: TimeInterval = 2.0
 }

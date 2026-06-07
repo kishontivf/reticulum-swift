@@ -400,3 +400,75 @@ default open (unchanged).
 **Not a logic divergence:** the path-table decision trees (`record`, `lookup`,
 `cleanup` incl. the interface-absent cull at `Transport.py:778-785`) are
 unchanged and faithful — only the storage backend's iOS open is platform-specific.
+
+### BLE per-peer interface — grace-period detach + identity reuse (fix/ble-peer-grace-period-detach 2026-06-07)
+
+**Sites:** `Interfaces/BLE/BLEInterface.swift` (`pendingDetach`, `scheduleDetach`,
+`finalizeDetach`, `handleDisconnection`, `addPeer` reuse), `BLEPeerInterface.swift`
+(`onConnectionLost` / `handleConnectionLost`, `detach` made teardown-only),
+`BLEMeshConstants.swift` (`detachGracePeriod`).
+
+**Python reference:** `../ble-reticulum/src/ble_reticulum/BLEInterface.py` —
+`_device_disconnected_callback` (1295) schedules `_pending_detach[identity_hash]`
+instead of detaching inline; `_process_pending_detaches` (771) detaches after the
+grace period if no address reconnected; `_spawn_peer_interface` (1892) reuses the
+existing per-peer interface on reconnect and clears `_pending_detach`;
+`_pending_detach_grace_period = 2.0` (393). Both stacks register identity-keyed
+per-peer interfaces with core RNS `Transport.interfaces`, whose `jobs()` culls
+paths of absent interfaces (`../Reticulum/RNS/Transport.py:778-785`).
+
+**What now matches python:** a dropped BLE connection no longer removes the peer
+interface immediately. It is held (registered with the transport) for
+`detachGracePeriod`; a reconnect with the same identity reuses it (existing
+hot-swap `updateConnection`) and cancels the pending detach, so a transient drop
+(MAC rotation) does not cull the learned route. Absent a reconnect, the peer is
+removed after grace. This is the actual fix for BLE transient-drop route loss;
+the core RNS interface-absent cull stays intact (it is correct and matches
+upstream — see the H4 revert in the NE-safe-PathTable PR).
+
+**Deviations from the python shape (and why):**
+
+1. **One-shot timer, not a maintenance-loop poll.** Python calls
+   `_process_pending_detaches` from its periodic maintenance loop; the swift port
+   arms a single `Task.sleep(detachGracePeriod)` per scheduled detach
+   (`scheduleDetach`). Same semantics, but event-driven (no steady ~1s poll),
+   matching Torlando's standing prefer-event-driven-over-polling rule. The
+   reconnect-cancels signal is `pendingDetach` being cleared by `addPeer`, which
+   `finalizeDetach` re-checks — the analogue of python re-checking
+   `has_connected_address`.
+
+2. **No `_identity_cache`.** Python caches peer identity for `_identity_cache_ttl`
+   (60s) so a reconnect that arrives *without* a fresh identity handshake (Android
+   holding the GATT link) can be re-identified. The swift port performs a full
+   identity handshake on *every* connection (`performCentralHandshake` /
+   `performPeripheralHandshake`), so identity is always re-derived on reconnect and
+   the cache is unnecessary. Category (b) — a faithful simplification the swift
+   handshake model permits.
+
+3. **Teardown is owned by the peer's cancellation-safe loops, not inline in the
+   disconnect handler.** Python serializes disconnect vs reconnect with
+   `peer_lock`. Swift actors can't hold a lock across `await`, so `scheduleDetach`
+   is deliberately synchronous (no `await` into the peer) and does **not** tear the
+   connection down: a reconnect's `updateConnection` cancels the peer's old
+   receive/keepalive tasks, and their existing `!Task.isCancelled` guards suppress
+   the self-detach — so a stale teardown can never kill a freshly-reconnected
+   connection. If no reconnect arrives, `removePeer` (at finalize) does the
+   teardown. Category (a) — Swift's actor/reentrancy model vs python's thread+lock.
+
+4. **Three disconnect signals funnel into one scheduler.** Python has a single
+   driver callback. Swift has three ("connection died" via the driver's
+   `connectionLost` stream, the peer's receive-stream end, and keepalive
+   double-fail); all route to `scheduleDetach`, which is idempotent per identity
+   (`pendingDetach[hex] == nil` guard). The `addPeer` reject-duplicate rule also
+   gains an `isDetaching` check so an in-grace peer (still reading `.connected`
+   until its loops wind down) does not reject the very reconnect it is waiting for.
+
+**Grace value:** `detachGracePeriod = 2.0s` mirrors python exactly. iOS BLE
+reconnect latency (RPA rotation + scan/connect) may warrant tuning it up after
+on-device observation; raising it only widens the transient-drop window the route
+survives, so it is safe to increase.
+
+**Not a logic divergence in the cull:** core RNS path-table `record`/`lookup`/
+`cleanup` (incl. the interface-absent cull) are unchanged. This PR fixes the
+*interface lifecycle* so a transient drop keeps its interface registered long
+enough to be reused — the layer ble-reticulum fixes it at.
