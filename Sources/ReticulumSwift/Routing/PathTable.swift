@@ -113,6 +113,13 @@ public actor PathTable {
                 throw PathTableError.databaseError("Failed to open database: \(error)")
             }
 
+            // NE-safe pragmas (on iOS this DB is the Network-Extension writer, shared
+            // read-only with the app). WAL keeps write locks short; busy_timeout rides
+            // out cross-process contention instead of failing fast.
+            sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+            sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
+            sqlite3_exec(db, "PRAGMA busy_timeout=5000;", nil, nil, nil)
+
             // Create table with random_blobs column (JSON-encoded [Data])
             let createSQL = """
                 CREATE TABLE IF NOT EXISTS paths (
@@ -133,6 +140,21 @@ public actor PathTable {
                 let error = String(cString: sqlite3_errmsg(db))
                 throw PathTableError.databaseError("Failed to create table: \(error)")
             }
+
+            #if os(iOS)
+            // Deliver-while-locked: the NE writes learned paths after first unlock even
+            // when the device is later locked. Pin the data-protection class on the DB +
+            // its WAL/SHM sidecars to CompleteUntilFirstUserAuthentication, matching the
+            // LXMF store — otherwise iOS 0xDEAD10CC-kills the NE when it touches a
+            // Complete-protected file while suspended. (CREATE above created -wal/-shm.)
+            let fm = FileManager.default
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: dbPath + suffix) {
+                try? fm.setAttributes(
+                    [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                    ofItemAtPath: dbPath + suffix
+                )
+            }
+            #endif
 
             // Migrate and load in a Task to satisfy actor isolation
             Task { [self] in

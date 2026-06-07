@@ -2781,12 +2781,19 @@ public actor ReticulumTransport {
     /// Throttle counter for periodic cleanup in retransmission loop (H4/H3).
     private var tableCullCounter: Int = 0
 
-    /// H3/H4: Periodic cleanup of links and paths, throttled to every ~5 seconds.
+    /// H3: Periodic cleanup of links and EXPIRED paths, throttled to every ~5 seconds.
     private func periodicTableCleanup() async {
         tableCullCounter += 1
         guard tableCullCounter % 5 == 0 else { return }
-        let activeIds = Set(interfaces.keys)
-        await pathTable.cleanup(activeInterfaceIds: activeIds)
+        // Expired-only cull. Do NOT periodically cull paths whose interface isn't
+        // currently registered: per-peer BLE sub-interfaces come and go as peers
+        // connect/disconnect, and on a cold boot persisted paths load before their
+        // interfaces reconnect — culling on "interface absent" deletes still-valid
+        // routes (and their on-disk persistence). Python keeps destination_table
+        // entries until they expire; a down interface just means a send fails or
+        // triggers a path request. Stale paths are still cleaned reactively on the
+        // next send attempt (the missing-interface invalidation in the outbound path).
+        await pathTable.cleanup()
         await cleanupLinks()
     }
 
