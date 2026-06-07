@@ -2785,6 +2785,11 @@ public actor ReticulumTransport {
     private func periodicTableCleanup() async {
         tableCullCounter += 1
         guard tableCullCounter % 5 == 0 else { return }
+        // Mirror python Transport.jobs() (Transport.py:778-785): cull paths that have
+        // expired OR whose attached interface is no longer present. Keeping the
+        // interface-absent cull is correct — the BLE boot/transient path-loss is fixed
+        // at the right layer (per-peer interface lifecycle: grace-period detach + reuse,
+        // matching ble-reticulum), not by weakening this sweep.
         let activeIds = Set(interfaces.keys)
         await pathTable.cleanup(activeInterfaceIds: activeIds)
         await cleanupLinks()

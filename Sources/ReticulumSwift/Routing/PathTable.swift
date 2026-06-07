@@ -113,6 +113,32 @@ public actor PathTable {
                 throw PathTableError.databaseError("Failed to open database: \(error)")
             }
 
+            #if os(iOS)
+            // NE-safe SQLite (iOS only — this DB is the Network-Extension writer, shared
+            // read-only with the app). WAL keeps write locks short; busy_timeout rides
+            // out cross-process contention instead of failing fast. Other platforms keep
+            // the default journal/synchronous so single-process embedders are unaffected.
+            sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
+            sqlite3_exec(db, "PRAGMA busy_timeout=5000;", nil, nil, nil)
+            // `PRAGMA journal_mode=WAL` is *accepted* even when WAL doesn't actually engage
+            // (it reports the resulting mode as a result row, not via the return code). Run
+            // it via prepare/step so we can read the result back and warn on a silent
+            // fallback to DELETE mode — which would reintroduce the cross-process lock/busy
+            // failures the NE-safe open exists to prevent.
+            var walStmt: OpaquePointer?
+            if sqlite3_prepare_v2(db, "PRAGMA journal_mode=WAL;", -1, &walStmt, nil) == SQLITE_OK {
+                if sqlite3_step(walStmt) == SQLITE_ROW, let modePtr = sqlite3_column_text(walStmt, 0) {
+                    let mode = String(cString: modePtr)
+                    if mode.lowercased() != "wal" {
+                        logger.error("PathTable: WAL did not engage (journal_mode=\(mode)) — NE cross-process safety degraded")
+                    }
+                }
+                sqlite3_finalize(walStmt)
+            } else {
+                logger.error("PathTable: could not set WAL journal mode — NE cross-process safety degraded")
+            }
+            #endif
+
             // Create table with random_blobs column (JSON-encoded [Data])
             let createSQL = """
                 CREATE TABLE IF NOT EXISTS paths (
@@ -133,6 +159,27 @@ public actor PathTable {
                 let error = String(cString: sqlite3_errmsg(db))
                 throw PathTableError.databaseError("Failed to create table: \(error)")
             }
+
+            #if os(iOS)
+            // Deliver-while-locked: the NE writes learned paths after first unlock even
+            // when the device is later locked. Pin the data-protection class on the DB +
+            // its WAL/SHM sidecars to CompleteUntilFirstUserAuthentication, matching the
+            // LXMF store — otherwise iOS 0xDEAD10CC-kills the NE when it touches a
+            // Complete-protected file while suspended. (CREATE above created -wal/-shm.)
+            let fm = FileManager.default
+            for suffix in ["", "-wal", "-shm"] where fm.fileExists(atPath: dbPath + suffix) {
+                do {
+                    try fm.setAttributes(
+                        [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication],
+                        ofItemAtPath: dbPath + suffix
+                    )
+                } catch {
+                    // A silent failure here can let the NE 0xDEAD10CC when the device
+                    // locks — surface it so the resulting crash is diagnosable.
+                    logger.error("PathTable: data-protection setAttributes failed for \(suffix.isEmpty ? "db" : suffix): \(error.localizedDescription)")
+                }
+            }
+            #endif
 
             // Migrate and load in a Task to satisfy actor isolation
             Task { [self] in

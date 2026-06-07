@@ -323,3 +323,32 @@ candidate:** returning `connect()` to stock `NWConnection(using: .tcp)` and
 deleting this flag would also be correct — on-device delivery + announce-in/out
 were later confirmed working with it in place, but were never shown to *require*
 it.
+
+### PathTable persistence — iOS NE-safe SQLite open (fix/pathtable-ne-safe 2026-06-07)
+
+**Sites:** `Routing/PathTable.swift` `init(databasePath:)` — `#if os(iOS)` blocks:
+`PRAGMA synchronous=NORMAL` + `PRAGMA busy_timeout=5000` + `journal_mode=WAL`
+(set via prepare/step so the resulting mode is verified), and
+`FileManager.setAttributes(.protectionKey: .completeUntilFirstUserAuthentication)`
+on the db + its `-wal`/`-shm` sidecars.
+
+**Python reference:** `../Reticulum/RNS/Transport.py` persists the path table by
+pickling to `<storagepath>/destination_table` (`save_path_table()` /
+`persist_data()`) — an in-memory dict flushed to a plain file on a desktop
+process that is never suspended-while-locked. No SQLite, no data-protection.
+
+**Reason:** Category (a) — a platform/runtime need python's pickle-on-desktop
+model cannot express. The swift port already backs the path table with SQLite (a
+pre-existing storage-layer choice; the record/lookup/cleanup *logic* still
+mirrors Transport.py). When that store is the **iOS Network-Extension writer**
+(Columba Model B — the NE owns it, the app opens it read-only), it must be opened
+NE-safe: WAL + `busy_timeout` ride out cross-process contention with the app's
+handle, and `completeUntilFirstUserAuthentication` lets the NE read/write after
+first unlock even while the device is later locked — otherwise the NE faults
+(`0xDEAD10CC` / protected-file) touching the store while suspended. Mirrors how
+`LXMFDatabase` opens its store. Guarded `#if os(iOS)`; other platforms keep the
+default open (unchanged).
+
+**Not a logic divergence:** the path-table decision trees (`record`, `lookup`,
+`cleanup` incl. the interface-absent cull at `Transport.py:778-785`) are
+unchanged and faithful — only the storage backend's iOS open is platform-specific.
