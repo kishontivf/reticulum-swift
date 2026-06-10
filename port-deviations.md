@@ -248,6 +248,51 @@ began its firmware-init wait, orphaning the live link mid-detect. No semantic
 change vs python; it makes the async port honour the same "don't reconnect a live
 link" guarantee.
 
+### BLE data-path liveness probe — per-peer loop + grace-detach reconnect (fix/ble-peer-grace-period-detach 2026-06-10)
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/BLE/BLEPeerInterface.swift` —
+`lastRealData`, `probeCapable`, `probeTask`, `handleProbeFrame`, `sendProbe`,
+`runDataPathProbe`, and the `lastRealData` refresh in `handleFragment`.
+`Sources/ReticulumSwift/Interfaces/BLE/BLEMeshConstants.swift` — `probePingByte`
+(0x04) / `probePongByte` (0x05) and the three interval constants.
+
+**Python reference:** ble-reticulum `BLEInterface.py` — `_run_data_path_probes`,
+`_handle_probe_frame`, `_send_probe`, `_last_real_data`, `_probe_capable`
+(protocol v0.4.0, `BLE_PROTOCOL_v0.4.0.md`). The wire format (2-byte
+PING `0x04` / PONG `0x05`, capability auto-negotiated on first frame, the
+thresholds) matches the python reference exactly.
+
+**Reason:** Category (b) — structural adaptation to the swift per-peer actor
+model, semantics identical. Three deviations from the python structure:
+
+1. **Per-peer loop, not centralized.** Python runs ONE timer in the parent
+   `BLEInterface` iterating `spawned_interfaces`; the swift port runs the probe
+   loop per-peer in `BLEPeerInterface` (`probeTask`, alongside the existing
+   per-peer `keepaliveTask`/`rssiTask`), because the swift port already models
+   each peer as its own actor with its own background loops.
+2. **No address normalization.** Python `_handle_probe_frame` strips a
+   `dev:`-prefixed peripheral address to resolve the peer's identity under the
+   dual-role collision; here the frame already arrives on this peer's own
+   connection, so identity is implicit and no lookup is needed.
+3. **Reconnect via the owner's `onDataPathDead` → `driver.disconnect(address)`,**
+   matching python. A peer interface's `connection.close()` only ends the receive
+   stream; it does NOT cancel the BLE link, so on a dead data path the probe delegates
+   to `BLEInterface`, which forces a real driver-level disconnect (central role:
+   `cancelPeripheralConnection` → the peer re-advertises → reconnect via re-discovery,
+   then grace-detach holds the route during the gap).
+   **Known limitation (TODO, needs on-device validation):** for a *peripheral-role*
+   peer CoreBluetooth cannot force-disconnect a subscribed central, so
+   `driver.disconnect` is a no-op there; full recovery additionally requires the driver
+   to drop `subscribedCentrals`/`centralConnections` for that address + emit
+   `connectionLost` so the central's next write re-handshakes (the
+   `didReceiveWrite` else-branch). Central-role recovery (the common case) works today.
+
+Additionally, swift adds a `lastRealData` clock (updated only on real data +
+probe frames, not keepalives/handshake). Python already has `_last_real_data`;
+swift previously had only `lastActivity` (which counts keepalives). `lastActivity`
+/ `checkZombies` are retained unchanged as the link-liveness backstop; the new
+clock drives data-path liveness.
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)

@@ -613,6 +613,13 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
             }
         }
 
+        await peer.setOnDataPathDead { [weak self] identityHex in
+            guard let self = self else { return }
+            Task {
+                await self.disconnectDeadDataPath(identityHex: identityHex)
+            }
+        }
+
         peers[identityHex] = peer
         addressToIdentity[connection.address] = identityHex
 
@@ -622,6 +629,20 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         logger.info("Added BLE peer \(identityHex.prefix(8), privacy: .public) (\(direction, privacy: .public)) — \(self.peers.count)/\(BLEMeshConstants.maxConnections) connections")
 
         onPeerAdded?(peer)
+    }
+
+    /// A peer's data-path probe found the link dead (connected but no real data crossing).
+    /// Force a real driver-level disconnect so it re-establishes — mirrors ble-reticulum's
+    /// `driver.disconnect(address)`. A peer interface's `connection.close()` only ends the
+    /// receive stream; it does not cancel the BLE link, so the probe must go through the
+    /// driver. (Central role: `cancelPeripheralConnection` → reconnect via re-discovery.
+    /// Peripheral role: CoreBluetooth cannot force-disconnect a subscribed central, so full
+    /// recovery there additionally needs the driver to drop the central + allow re-handshake
+    /// — see port-deviations.md.)
+    private func disconnectDeadDataPath(identityHex: String) async {
+        guard let address = addressToIdentity.first(where: { $0.value == identityHex })?.key else { return }
+        logger.info("Data-path dead for \(identityHex.prefix(8), privacy: .public) — forcing reconnect via driver.disconnect")
+        await driver.disconnect(address: address)
     }
 
     private func removePeer(identityHex: String) async {

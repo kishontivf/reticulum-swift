@@ -55,6 +55,26 @@ public enum BLEMeshConstants {
     public static let keepaliveByte: UInt8 = 0x00
     public static let keepaliveInterval: TimeInterval = 15.0
 
+    // MARK: - Data-Path Liveness Probe (protocol v0.4.0)
+
+    /// A keepalive proves the *link* is up; it does not prove *data* still flows
+    /// (under RF degradation 1-byte writes succeed while larger fragments fail, and
+    /// the link layer keeps an idle connection alive). The data-path probe is an
+    /// active 2-byte PING/PONG round-trip over the real data path: a healthy link
+    /// round-trips it (which keeps the link fresh, so idle links are never reaped),
+    /// a data-dead link does not (so it is detected and reconnected). The 2-byte
+    /// frames are shorter than the 5-byte fragment header, so peers that predate the
+    /// probe reject them as "too short" and are unaffected.
+    /// Wire-compatible with ble-reticulum python (BLE_PROTOCOL_v0.4.0.md).
+    public static let probePingByte: UInt8 = 0x04
+    public static let probePongByte: UInt8 = 0x05
+    /// PING a link that has had no real data for this many seconds.
+    public static let dataPathProbeInterval: TimeInterval = 15.0
+    /// Reconnect a probe-capable peer whose data path has been silent this long.
+    public static let dataPathTimeout: TimeInterval = 45.0
+    /// How often the per-peer probe/detect loop runs.
+    public static let dataPathProbePollInterval: TimeInterval = 10.0
+
     // MARK: - Timeouts
 
     public static let reassemblyTimeout: TimeInterval = 30.0

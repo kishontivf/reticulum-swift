@@ -50,6 +50,13 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     /// Last time we received any data (fragment or keepalive)
     public private(set) var lastActivity: Date = Date()
 
+    /// Last time *real data* crossed the link — a data fragment or a data-path probe
+    /// frame, but NOT a keepalive or handshake. Drives the data-path liveness probe.
+    /// (`lastActivity` includes keepalives and so cannot distinguish an idle-but-healthy
+    /// link from a keepalive-alive-but-data-dead one; this clock can.)
+    /// Mirrors ble-reticulum python `_last_real_data` (BLEInterface.py).
+    public private(set) var lastRealData: Date = Date()
+
     /// When this peer connection was established
     public private(set) var connectedAt: Date = Date()
 
@@ -82,12 +89,25 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     private var receiveTask: Task<Void, Never>?
     private var keepaliveTask: Task<Void, Never>?
     private var rssiTask: Task<Void, Never>?
+    private var probeTask: Task<Void, Never>?
+
+    /// Set once a PING/PONG has been seen from this peer (the peer speaks the
+    /// data-path probe). Only probe-capable peers are reconnected on a dead path,
+    /// so peers that predate the probe are never falsely reaped.
+    /// Mirrors ble-reticulum python `_probe_capable` (BLEInterface.py).
+    private var probeCapable: Bool = false
 
     private var delegateRef: WeakBLEPeerDelegate?
     /// Invoked when this peer detects its OWN connection dropped (receive stream
     /// ended or keepalive failed). The owner (`BLEInterface`) schedules a
     /// grace-period detach rather than removing the interface immediately.
     private var onConnectionLost: ((String) -> Void)?
+    /// Invoked when this peer's data-path probe finds the link dead (connected but no
+    /// real data flowing). The owner forces a real driver-level disconnect so the
+    /// connection re-establishes — `connection.close()` alone only ends the receive
+    /// stream, it does not cancel the BLE link. Mirrors ble-reticulum's probe calling
+    /// `driver.disconnect(address)`.
+    private var onDataPathDead: ((String) -> Void)?
 
     private let logger = Logger(subsystem: "net.reticulum", category: "BLEPeerInterface")
 
@@ -158,6 +178,12 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         self.onConnectionLost = callback
     }
 
+    /// Set the data-path-dead callback (called when the data-path probe finds the link
+    /// dead, so the owner can force a real driver-level disconnect → reconnect).
+    public func setOnDataPathDead(_ callback: @escaping @Sendable (String) -> Void) {
+        self.onDataPathDead = callback
+    }
+
     /// Start background loops: receive, keepalive, RSSI polling.
     public func startReceiving() {
         // Capture the stream while still on the actor
@@ -199,6 +225,18 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
             }
         }
 
+        // Data-path liveness probe: PING an idle link, reconnect a data-dead peer.
+        probeTask = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(BLEMeshConstants.dataPathProbePollInterval))
+                } catch { break }
+
+                guard let self = self else { break }
+                await self.runDataPathProbe()
+            }
+        }
+
         // Only poll RSSI on outgoing connections
         if isOutgoing {
             rssiTask = Task { [weak self] in
@@ -228,6 +266,7 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         receiveTask?.cancel()
         keepaliveTask?.cancel()
         rssiTask?.cancel()
+        probeTask?.cancel()
 
         connection.close()
         connection = newConnection
@@ -235,6 +274,8 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         fragmenter = BLEFragmenter(mtu: newConnection.mtu)
         reassembler.reset()
         lastActivity = Date()
+        lastRealData = Date()
+        probeCapable = false
         connectedAt = Date()
         bytesSent = 0
         bytesReceived = 0
@@ -260,9 +301,11 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         receiveTask?.cancel()
         keepaliveTask?.cancel()
         rssiTask?.cancel()
+        probeTask?.cancel()
         receiveTask = nil
         keepaliveTask = nil
         rssiTask = nil
+        probeTask = nil
 
         connection.close()
 
@@ -288,19 +331,27 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
 
     // MARK: - Fragment Handling
 
-    private func handleFragment(_ fragment: Data) {
+    private func handleFragment(_ fragment: Data) async {
         lastActivity = Date()
         bytesReceived += fragment.count
 
-        // Filter keepalives (single 0x00 byte)
+        // Keepalives (single 0x00 byte) prove the LINK, not the data path — ignore.
         if fragment.count == 1 && fragment[fragment.startIndex] == BLEMeshConstants.keepaliveByte {
             return
         }
 
-        // Filter handshake data (exactly 16 bytes = identity)
+        // Data-path liveness probe frames (2-byte PING/PONG).
+        if await handleProbeFrame(fragment) {
+            return
+        }
+
+        // Handshake data (exactly 16 bytes = identity) — not real data.
         if fragment.count == 16 {
             return
         }
+
+        // Real data crossed the link — refresh the data-path liveness clock.
+        lastRealData = Date()
 
         do {
             if let packet = try reassembler.receiveFragment(fragment, senderId: peerIdentityHex) {
@@ -315,6 +366,67 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
     private func sendKeepalive() async throws {
         let data = Data([BLEMeshConstants.keepaliveByte])
         try await connection.sendFragment(data)
+    }
+
+    // MARK: - Data-Path Liveness Probe
+
+    /// Handle an inbound data-path liveness frame (2-byte PING/PONG). Returns true if
+    /// `fragment` was a probe frame (and is now consumed). Receiving any probe frame
+    /// proves the inbound data path is alive and that the peer speaks the probe, so the
+    /// peer is marked probe-capable; a PING is echoed as a PONG.
+    ///
+    /// Port note: ble-reticulum `_handle_probe_frame` (BLEInterface.py) also normalizes a
+    /// "dev:"-prefixed peripheral address to resolve the peer's identity; here the frame
+    /// already arrives on this peer's own connection, so no address lookup is needed.
+    private func handleProbeFrame(_ fragment: Data) async -> Bool {
+        guard fragment.count == 2 else { return false }
+        let type = fragment[fragment.startIndex]
+        guard type == BLEMeshConstants.probePingByte || type == BLEMeshConstants.probePongByte else {
+            return false
+        }
+
+        // Any probe frame proves the data path is alive and the peer speaks the probe.
+        lastRealData = Date()
+        probeCapable = true
+
+        if type == BLEMeshConstants.probePingByte {
+            let nonce = fragment[fragment.index(after: fragment.startIndex)]
+            try? await sendProbe(BLEMeshConstants.probePongByte, nonce: nonce)
+        }
+        return true
+    }
+
+    /// Send a 2-byte data-path probe frame (PING/PONG) over the real data path.
+    private func sendProbe(_ type: UInt8, nonce: UInt8) async throws {
+        try await connection.sendFragment(Data([type, nonce]))
+    }
+
+    /// Periodic data-path liveness sweep for this peer.
+    ///
+    /// - If the link has had no real data for `dataPathProbeInterval`, send a PING; a
+    ///   healthy peer echoes a PONG, which refreshes `lastRealData` — so the probe is
+    ///   itself the traffic that keeps a genuinely idle-but-healthy link from ever
+    ///   looking dead, and idle links are never reaped.
+    /// - If a probe-capable peer's data path has been silent past `dataPathTimeout`, the
+    ///   link is "connected but data-dead": tear it down so it re-establishes.
+    ///
+    /// Port note: ble-reticulum `_run_data_path_probes` (BLEInterface.py) runs one timer
+    /// in the parent interface iterating all peers; this swift port runs the loop per-peer
+    /// (alongside the existing keepalive/RSSI tasks) to fit the per-peer actor model. The
+    /// reconnect is delegated to the owner via `onDataPathDead`, which forces a real
+    /// `driver.disconnect(address)` (python parity) — `connection.close()` alone only ends
+    /// the receive stream and would leave the (data-dead) BLE link up.
+    private func runDataPathProbe() async {
+        let idle = Date().timeIntervalSince(lastRealData)
+        if idle > BLEMeshConstants.dataPathProbeInterval {
+            try? await sendProbe(BLEMeshConstants.probePingByte,
+                                 nonce: UInt8(truncatingIfNeeded: Int(Date().timeIntervalSince1970)))
+        }
+        if probeCapable && idle > BLEMeshConstants.dataPathTimeout {
+            logger.warning("data-path dead for \(self.peerIdentityHex.prefix(8), privacy: .public) — no real data for \(Int(idle), privacy: .public)s, reconnecting")
+            probeCapable = false
+            onDataPathDead?(peerIdentityHex)
+        }
     }
 
     private func pollRssi() {
