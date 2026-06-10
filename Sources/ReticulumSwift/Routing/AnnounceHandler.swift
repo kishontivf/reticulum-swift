@@ -89,8 +89,11 @@ public actor AnnounceHandler {
     /// Path table for recording learned routes.
     private let pathTable: PathTable
 
-    /// Set of seen announce hashes for deduplication.
-    private var seenAnnounces: Set<Data> = []
+    /// Seen announce hashes mapped to the interfaces that delivered them.
+    /// Per-interface tracking lets the same announce heard on a second
+    /// interface record an additional path (multi-path) while still
+    /// rebroadcasting at most once per unique announce packet.
+    private var seenAnnounces: [Data: Set<String>] = [:]
 
     /// Maximum hop count allowed (Reticulum standard is 128).
     public let maxHops: UInt8 = TransportConstants.PATHFINDER_M
@@ -136,11 +139,13 @@ public actor AnnounceHandler {
         // 1. Compute announce hash for deduplication
         let announceHash = computeAnnounceHash(packet)
 
-        // 2. Check deduplication
-        if seenAnnounces.contains(announceHash) {
-            logger.debug("Ignored: already seen")
+        // 2. Check deduplication (per interface: the same announce arriving
+        // on a different interface still records an additional path)
+        if seenAnnounces[announceHash]?.contains(interfaceId) == true {
+            logger.debug("Ignored: already seen on \(interfaceId, privacy: .public)")
             return .ignored(reason: .alreadySeen)
         }
+        let isGlobalFirstSight = seenAnnounces[announceHash] == nil
 
         // 3. Check hop limit
         if packet.header.hopCount >= maxHops {
@@ -217,15 +222,18 @@ public actor AnnounceHandler {
         // Only proceed if path was actually recorded (not a replay or worse path)
         guard pathRecorded else {
             // Path was rejected (replay or worse hop count), but still mark as seen
-            addToSeenAnnounces(announceHash)
+            addToSeenAnnounces(announceHash, interfaceId: interfaceId)
             return .ignored(reason: .alreadySeen)
         }
 
         // 6. Add announce hash to seen set
-        addToSeenAnnounces(announceHash)
+        addToSeenAnnounces(announceHash, interfaceId: interfaceId)
 
-        // 7. Determine rebroadcast based on interface mode
-        if interfaceMode.shouldPropagateAnnounces {
+        // 7. Determine rebroadcast based on interface mode. Rebroadcast at
+        // most once per unique announce packet: a second-interface arrival
+        // records the additional path but must not re-propagate (the wire
+        // already saw this announce when it was first received).
+        if interfaceMode.shouldPropagateAnnounces && isGlobalFirstSight {
             // Create rebroadcast packet with incremented hop count
             let rebroadcastPacket = createRebroadcastPacket(from: packet)
             return .recordedAndRebroadcast(
@@ -254,19 +262,21 @@ public actor AnnounceHandler {
 
     /// Add an announce hash to the seen set, pruning if needed.
     ///
-    /// - Parameter hash: Hash to add
-    private func addToSeenAnnounces(_ hash: Data) {
+    /// - Parameters:
+    ///   - hash: Hash to add
+    ///   - interfaceId: Interface that delivered this copy of the announce
+    private func addToSeenAnnounces(_ hash: Data, interfaceId: String) {
         // Prune if over max size (remove oldest by removing arbitrary element)
         if seenAnnounces.count >= seenAnnouncesMaxSize {
             // Remove approximately 10% of entries to avoid frequent pruning
             let removeCount = seenAnnouncesMaxSize / 10
             for _ in 0..<removeCount {
-                if let first = seenAnnounces.first {
-                    seenAnnounces.remove(first)
+                if let first = seenAnnounces.keys.first {
+                    seenAnnounces.removeValue(forKey: first)
                 }
             }
         }
-        seenAnnounces.insert(hash)
+        seenAnnounces[hash, default: []].insert(interfaceId)
     }
 
     /// Create a rebroadcast packet with incremented hop count.
@@ -301,13 +311,13 @@ public actor AnnounceHandler {
         seenAnnounces.count
     }
 
-    /// Check if an announce hash has been seen (for testing).
+    /// Check if an announce hash has been seen on any interface (for testing).
     ///
     /// - Parameter packet: Packet to check
     /// - Returns: true if the announce hash has been seen
     public func hasSeen(packet: Packet) -> Bool {
         let hash = computeAnnounceHash(packet)
-        return seenAnnounces.contains(hash)
+        return seenAnnounces[hash] != nil
     }
 
     /// Clear all seen announces (for testing).

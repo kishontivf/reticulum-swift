@@ -64,6 +64,41 @@ exists specifically because this method wasn't idempotent; pinning the
 contract here is the correct fix and lets the workaround be deleted on
 the next Columba-iOS deps bump.
 
+### Multi-path `PathTable` + interface-aware outbound selection (new feature)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` (per-interface
+buckets, schema v2 composite PK), `Sources/ReticulumSwift/Routing/AnnounceHandler.swift`
+(per-interface dedup), `Sources/ReticulumSwift/Transport/ReticulumTransport.swift`
+(`selectOutboundPath`, `setNearbyDestinations`, `TransportEvent`,
+`handleInterfaceLost`), `Sources/ReticulumSwift/Interfaces/InterfaceConfig.swift`
+(`InterfaceLinkClass`).
+
+**Python reference:** `RNS/Transport.py` keeps exactly one
+`path_table[destination_hash]` entry; the most recently accepted announce
+wins regardless of which interface carried it. Python has no concept of
+keeping a BLE path and a TCP path to the same destination concurrently,
+no "nearby" preference hint, and no path-invalidation events.
+
+**Reason:** Category (b) — new feature for the iOS port. A phone routinely
+reaches the same peer over a direct medium (BLE mesh / MultipeerConnectivity,
+0–1 hops) and over TCP relays (n hops) simultaneously, and must fail over
+between them instantly when the peer walks in/out of radio range. Local
+route-selection state only — **wire behavior is unchanged**:
+
+- The Python 5-rule announce acceptance tree applies verbatim per
+  (destination, interface) bucket; a new cross-interface rule 1b accepts a
+  first path on an additional interface only when the announce emission
+  timestamp is >= the destination's timebase (replay protection stays at
+  least as strong as upstream).
+- An announce is rebroadcast at most once per unique packet (global first
+  sight), exactly as upstream; second-interface arrivals only record paths.
+- Link traffic stays pinned to the attached interface; the previous
+  broadcast *fallback* when the attached interface vanished (itself an
+  undocumented deviation) now throws instead, restoring upstream's
+  "link traffic never escapes the attached interface" invariant.
+  `Link.invalidate(reason: .attachedInterfaceClosed)` tears down such
+  links without emitting LINKCLOSE.
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)

@@ -33,6 +33,33 @@ public enum InterfaceType: String, Codable, Sendable, Equatable {
     case multipeerConnectivity
 }
 
+// MARK: - Interface Link Class
+
+/// Classification of an interface for outbound route selection.
+///
+/// - `direct`: Carries traffic straight to physically nearby peers (BLE mesh,
+///   MultipeerConnectivity). Preferred for destinations marked nearby.
+/// - `indirect`: Reaches peers through infrastructure (TCP relays, I2P).
+///   Used by default and as the failover when a direct path is unavailable.
+public enum InterfaceLinkClass: String, Codable, Sendable, Equatable {
+    case direct
+    case indirect
+}
+
+extension InterfaceType {
+    /// Default link class for this interface type. BLE and Multipeer
+    /// Connectivity reach only physically nearby peers; everything else is
+    /// treated as infrastructure.
+    public var defaultLinkClass: InterfaceLinkClass {
+        switch self {
+        case .ble, .multipeerConnectivity:
+            return .direct
+        default:
+            return .indirect
+        }
+    }
+}
+
 // MARK: - Interface Configuration
 
 /// Configuration for a Reticulum network interface.
@@ -111,6 +138,11 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     /// Reference: Python Interface.ifac_key
     public var ifacKey: Data?
 
+    /// Link class used for outbound route selection (direct vs indirect).
+    /// Defaults from the interface type; override e.g. to treat a hotspot
+    /// TCP interface as direct.
+    public var linkClass: InterfaceLinkClass
+
     // MARK: - Initialization
 
     /// Create a new interface configuration.
@@ -141,7 +173,8 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         announceRatePenalty: TimeInterval = 0,
         bitrate: Int = 0,
         ifacSize: Int = 0,
-        ifacKey: Data? = nil
+        ifacKey: Data? = nil,
+        linkClass: InterfaceLinkClass? = nil
     ) {
         self.id = id
         self.name = name
@@ -157,6 +190,7 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         self.bitrate = bitrate
         self.ifacSize = ifacSize
         self.ifacKey = ifacKey
+        self.linkClass = linkClass ?? type.defaultLinkClass
     }
 
     // MARK: - Codable backward compatibility
@@ -178,12 +212,14 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         bitrate = try container.decodeIfPresent(Int.self, forKey: .bitrate) ?? 0
         ifacSize = try container.decodeIfPresent(Int.self, forKey: .ifacSize) ?? 0
         ifacKey = try container.decodeIfPresent(Data.self, forKey: .ifacKey)
+        linkClass = try container.decodeIfPresent(InterfaceLinkClass.self, forKey: .linkClass)
+            ?? type.defaultLinkClass
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, type, enabled, mode, host, port, ifac
         case announceRateTarget, announceRateGrace, announceRatePenalty
-        case bitrate, ifacSize, ifacKey
+        case bitrate, ifacSize, ifacKey, linkClass
     }
 
     // MARK: - Persistence

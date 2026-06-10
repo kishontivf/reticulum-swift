@@ -55,6 +55,13 @@ public enum TeardownReason: Sendable, Equatable, CustomStringConvertible {
     /// an unrecoverable error.
     case transportError
 
+    /// The interface this link was attached to was removed.
+    ///
+    /// The link's only wire (e.g. a BLE/MPC peer interface) is gone, so the
+    /// link is invalidated locally without sending LINKCLOSE — the peer is
+    /// unreachable on that medium by definition.
+    case attachedInterfaceClosed
+
     // MARK: - CustomStringConvertible
 
     public var description: String {
@@ -71,6 +78,8 @@ public enum TeardownReason: Sendable, Equatable, CustomStringConvertible {
             return "crypto_error"
         case .transportError:
             return "transport_error"
+        case .attachedInterfaceClosed:
+            return "attached_interface_closed"
         }
     }
 }

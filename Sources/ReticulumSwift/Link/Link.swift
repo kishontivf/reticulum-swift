@@ -1082,6 +1082,30 @@ public actor Link {
         }
     }
 
+    /// Invalidate the link locally without notifying the remote peer.
+    ///
+    /// Used when the link's attached interface is removed: the peer is
+    /// unreachable on that medium, so sending LINKCLOSE is pointless (and a
+    /// broadcast fallback would leak link traffic onto other interfaces).
+    /// Stops keep-alive/watchdog, transitions to closed, fires the close
+    /// callback — identical to `close(reason:)` minus the LINKCLOSE packet.
+    ///
+    /// - Parameter reason: Reason for invalidation (defaults to attachedInterfaceClosed)
+    public func invalidate(reason: TeardownReason = .attachedInterfaceClosed) {
+        guard !state.isTerminal else { return }
+
+        stopKeepalive()
+        stopWatchdog()
+
+        transitionState(to: .closed(reason: reason))
+        stateContinuation?.finish()
+
+        if let cb = closeCallback {
+            closeCallback = nil  // clear to prevent double-fire
+            Task { await cb(reason) }
+        }
+    }
+
     // MARK: - Resource Management
 
     /// Set the resource acceptance strategy.

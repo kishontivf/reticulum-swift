@@ -12,6 +12,12 @@
 //  When an announce is received and validated, the path is recorded here.
 //  When sending a packet, the path table is consulted to find the route.
 //
+//  Multi-path deviation from Python RNS: paths are stored per
+//  (destination, interface) pair instead of one entry per destination, so a
+//  destination reachable over both a direct interface (BLE/MPC) and an
+//  infrastructure interface (TCP) keeps both routes. Wire behavior is
+//  unchanged; only local route selection differs. See port-deviations.md.
+//
 
 import Foundation
 import SQLite3
@@ -47,10 +53,14 @@ public enum PathTableError: Error, Sendable, Equatable {
 ///
 /// The path table stores routing information learned from validated announces.
 /// It enables routing packets to known destinations by looking up the best path.
+/// Entries are kept per (destination, interface) pair so multiple concurrent
+/// routes to the same destination (e.g. BLE mesh and TCP relay) coexist.
 ///
 /// Key operations:
 /// - **record()**: Store a path from a validated announce
-/// - **lookup()**: Find a path for a destination hash
+/// - **lookup()**: Find the best path for a destination hash
+/// - **lookupAll()**: All valid paths for a destination (one per interface)
+/// - **removeAll(forInterface:)**: Drop every path learned on an interface
 /// - **cleanup()**: Remove expired entries
 /// - **pathUpdates**: AsyncStream for real-time path notifications
 ///
@@ -60,8 +70,13 @@ public actor PathTable {
 
     // MARK: - Storage
 
-    /// Paths indexed by destination hash (in-memory cache)
-    private var paths: [Data: PathEntry] = [:]
+    /// Schema version for the persisted paths table (PRAGMA user_version).
+    /// Version 2 introduced the composite (destination_hash, interface_id)
+    /// primary key for multi-path storage.
+    private static let schemaVersion: Int32 = 2
+
+    /// Paths indexed by destination hash, then by interface id (in-memory cache)
+    private var paths: [Data: [String: PathEntry]] = [:]
 
     /// SQLite database handle for persistence
     private var db: OpaquePointer?
@@ -76,6 +91,8 @@ public actor PathTable {
 
     /// Stream of path updates for real-time UI notifications.
     /// Emits whenever a new path is recorded (not duplicates or worse paths).
+    /// With multi-path storage, entries are per (destination, interface) —
+    /// consumers may see one event per interface for the same destination.
     public nonisolated var pathUpdates: AsyncStream<PathEntry> {
         AsyncStream { continuation in
             Task {
@@ -113,23 +130,9 @@ public actor PathTable {
                 throw PathTableError.databaseError("Failed to open database: \(error)")
             }
 
-            // Create table with random_blobs column (JSON-encoded [Data])
-            let createSQL = """
-                CREATE TABLE IF NOT EXISTS paths (
-                    destination_hash BLOB PRIMARY KEY,
-                    public_keys BLOB NOT NULL,
-                    interface_id TEXT NOT NULL,
-                    hop_count INTEGER NOT NULL,
-                    timestamp REAL NOT NULL,
-                    expires REAL NOT NULL,
-                    random_blobs TEXT NOT NULL,
-                    ratchet BLOB,
-                    app_data BLOB,
-                    next_hop BLOB,
-                    announce_data BLOB
-                )
-                """
-            if sqlite3_exec(db, createSQL, nil, nil, nil) != SQLITE_OK {
+            // Create table (v2 schema with composite primary key).
+            // Pre-v2 databases are rebuilt by migrateToMultiPathSchema below.
+            if sqlite3_exec(db, Self.createTableSQL, nil, nil, nil) != SQLITE_OK {
                 let error = String(cString: sqlite3_errmsg(db))
                 throw PathTableError.databaseError("Failed to create table: \(error)")
             }
@@ -138,8 +141,9 @@ public actor PathTable {
             Task { [self] in
                 await migrateRandomBlobColumn()
                 await migrateAnnounceDataColumn()
+                await migrateToMultiPathSchema()
                 await loadFromDatabase()
-                let pathCount = await self.paths.count
+                let pathCount = await self.entryCount
                 logger.info("Loaded \(pathCount) paths from database: \(dbPath)")
             }
         }
@@ -157,21 +161,40 @@ public actor PathTable {
         self.db = nil
     }
 
+    /// v2 schema: one row per (destination, interface) pair.
+    private static let createTableSQL = """
+        CREATE TABLE IF NOT EXISTS paths (
+            destination_hash BLOB NOT NULL,
+            public_keys BLOB NOT NULL,
+            interface_id TEXT NOT NULL,
+            hop_count INTEGER NOT NULL,
+            timestamp REAL NOT NULL,
+            expires REAL NOT NULL,
+            random_blobs TEXT NOT NULL,
+            ratchet BLOB,
+            app_data BLOB,
+            next_hop BLOB,
+            announce_data BLOB,
+            PRIMARY KEY (destination_hash, interface_id)
+        )
+        """
+
     // MARK: - Path State Management
 
     /// Path states indexed by destination hash.
     /// Separate from PathEntry to match Python's Transport.path_states dict.
+    /// Kept per destination (not per interface) to match Python semantics.
     private var pathStates: [Data: Int] = [:]
 
     /// Mark a path as unresponsive (failed communication attempt).
     public func markPathUnresponsive(_ destinationHash: Data) {
-        guard paths[destinationHash] != nil else { return }
+        guard paths[destinationHash]?.isEmpty == false else { return }
         pathStates[destinationHash] = TransportConstants.PATH_STATE_UNRESPONSIVE
     }
 
     /// Reset a path to unknown state (e.g., when a new announce is accepted).
     public func markPathUnknownState(_ destinationHash: Data) {
-        guard paths[destinationHash] != nil else { return }
+        guard paths[destinationHash]?.isEmpty == false else { return }
         pathStates[destinationHash] = TransportConstants.PATH_STATE_UNKNOWN
     }
 
@@ -183,17 +206,23 @@ public actor PathTable {
     /// Mark a path as responsive after successful communication (M10).
     /// Called after link establishment confirms the path is alive.
     public func markPathResponsive(_ destinationHash: Data) {
-        guard paths[destinationHash] != nil else { return }
+        guard paths[destinationHash]?.isEmpty == false else { return }
         pathStates[destinationHash] = TransportConstants.PATH_STATE_RESPONSIVE
     }
 
-    // MARK: - Record (Python 5-path decision tree)
+    // MARK: - Record (Python 5-path decision tree, per interface)
 
     /// Record a path entry using Python-compatible acceptance logic.
     ///
-    /// Implements the 5-path decision tree from Python Transport.py:1614-1686:
+    /// Implements the 5-path decision tree from Python Transport.py:1614-1686,
+    /// applied per (destination, interface) bucket, plus one multi-path rule:
     ///
     /// 1. **Unknown destination** → accept
+    /// 1b. **Known destination, first path on this interface** → accept iff the
+    ///     announce emission timestamp is >= the destination's timebase (the
+    ///     latest emission seen on any interface). ">=" so the *same* announce
+    ///     heard moments later on a second interface is accepted, while a
+    ///     replayed old capture on a new medium is rejected.
     /// 2. **Equal/better hops + new blob + fresher timestamp** → accept
     /// 3. **Worse hops + expired path + new blob** → accept
     /// 4. **Worse hops + not expired + fresher emission + new blob** → accept
@@ -209,16 +238,37 @@ public actor PathTable {
         let keyHex = key.prefix(8).map { String(format: "%02x", $0) }.joined()
         let newBlob = entry.randomBlob
         let announceEmitted = PathEntry.emissionTimestamp(from: newBlob)
+        let bucket = paths[key] ?? [:]
 
-        guard let existing = paths[key] else {
-            // Path 1: Unknown destination → accept
-            paths[key] = entry
-            pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
-            saveToDatabase(entry)
-            let nextHopStr = entry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
-            logger.info("Recorded NEW path to \(keyHex), hops=\(entry.hopCount), nextHop=\(nextHopStr)")
-            pathUpdateContinuation?.yield(entry)
-            return true
+        guard let existing = bucket[entry.interfaceId] else {
+            if bucket.isEmpty {
+                // Path 1: Unknown destination → accept
+                paths[key] = [entry.interfaceId: entry]
+                pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
+                saveToDatabase(entry)
+                let nextHopStr = entry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+                logger.info("Recorded NEW path to \(keyHex) via \(entry.interfaceId, privacy: .public), hops=\(entry.hopCount), nextHop=\(nextHopStr)")
+                pathUpdateContinuation?.yield(entry)
+                return true
+            }
+
+            // Path 1b: Known destination, first path on this interface.
+            // Accept only if the announce is at least as fresh as anything we
+            // have seen on other interfaces — blocks replayed old announces
+            // from hijacking the route via a new medium.
+            let destinationTimebase = bucket.values.map { $0.latestEmissionTimestamp }.max() ?? 0
+            if announceEmitted >= destinationTimebase {
+                var stored = bucket
+                stored[entry.interfaceId] = entry
+                paths[key] = stored
+                markPathUnknownState(key)
+                saveToDatabase(entry)
+                logger.info("Recorded ADDITIONAL path to \(keyHex) via \(entry.interfaceId, privacy: .public), hops=\(entry.hopCount)")
+                pathUpdateContinuation?.yield(entry)
+                return true
+            }
+            logger.debug("Ignored \(keyHex) on \(entry.interfaceId, privacy: .public): emission older than destination timebase")
+            return false
         }
 
         let existingBlobs = existing.randomBlobs
@@ -228,18 +278,11 @@ public actor PathTable {
         if entry.hopCount <= existing.hopCount {
             // Path 2: Equal or better hops + new blob + fresher timestamp
             if isNewBlob && announceEmitted > pathTimebase {
-                markPathUnknownState(key)
-                let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
-                var updated = entry
-                updated.randomBlobs = merged
-                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
-                paths[key] = updated
-                saveToDatabase(updated)
-                logger.info("Updated \(keyHex): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
-                pathUpdateContinuation?.yield(updated)
+                accept(entry, mergingBlobsFrom: existingBlobs)
+                logger.info("Updated \(keyHex) via \(entry.interfaceId, privacy: .public): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
                 return true
             }
-            logger.debug("Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
+            logger.debug("Ignored \(keyHex) on \(entry.interfaceId, privacy: .public): equal/better hops but duplicate blob or stale emit")
             return false
         }
 
@@ -249,54 +292,48 @@ public actor PathTable {
         // Path 3: Expired path + new blob
         if now >= existing.expires {
             if isNewBlob {
-                markPathUnknownState(key)
-                let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
-                var updated = entry
-                updated.randomBlobs = merged
-                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
-                paths[key] = updated
-                saveToDatabase(updated)
-                logger.info("Updated \(keyHex): expired path replaced, hops=\(entry.hopCount)")
-                pathUpdateContinuation?.yield(updated)
+                accept(entry, mergingBlobsFrom: existingBlobs)
+                logger.info("Updated \(keyHex) via \(entry.interfaceId, privacy: .public): expired path replaced, hops=\(entry.hopCount)")
                 return true
             }
-            logger.debug("Ignored \(keyHex): expired path but duplicate blob")
+            logger.debug("Ignored \(keyHex) on \(entry.interfaceId, privacy: .public): expired path but duplicate blob")
             return false
         }
 
         // Path 4: Not expired + fresher emission + new blob
         if announceEmitted > pathTimebase {
             if isNewBlob {
-                markPathUnknownState(key)
-                let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
-                var updated = entry
-                updated.randomBlobs = merged
-                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
-                paths[key] = updated
-                saveToDatabase(updated)
-                logger.info("Updated \(keyHex): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
-                pathUpdateContinuation?.yield(updated)
+                accept(entry, mergingBlobsFrom: existingBlobs)
+                logger.info("Updated \(keyHex) via \(entry.interfaceId, privacy: .public): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
                 return true
             }
-            logger.debug("Ignored \(keyHex): fresher emission but duplicate blob")
+            logger.debug("Ignored \(keyHex) on \(entry.interfaceId, privacy: .public): fresher emission but duplicate blob")
             return false
         }
 
         // Path 5: Same emission + unresponsive path
         if announceEmitted == pathTimebase && isPathUnresponsive(key) {
-            var updated = entry
-            updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
-            updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
-            paths[key] = updated
-            pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
-            saveToDatabase(updated)
-            logger.info("Updated \(keyHex): same emission but path was unresponsive")
-            pathUpdateContinuation?.yield(updated)
+            accept(entry, mergingBlobsFrom: existingBlobs)
+            logger.info("Updated \(keyHex) via \(entry.interfaceId, privacy: .public): same emission but path was unresponsive")
             return true
         }
 
-        logger.debug("Ignored \(keyHex): worse hops, not expired, not fresher, not unresponsive")
+        logger.debug("Ignored \(keyHex) on \(entry.interfaceId, privacy: .public): worse hops, not expired, not fresher, not unresponsive")
         return false
+    }
+
+    /// Store an accepted entry into its bucket with merged blobs and reset state.
+    private func accept(_ entry: PathEntry, mergingBlobsFrom existingBlobs: [Data]) {
+        let key = entry.destinationHash
+        var updated = entry
+        updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: entry.randomBlob)
+        updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+        var bucket = paths[key] ?? [:]
+        bucket[entry.interfaceId] = updated
+        paths[key] = bucket
+        pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
+        saveToDatabase(updated)
+        pathUpdateContinuation?.yield(updated)
     }
 
     /// Merge a new blob into existing blobs list, capped at MAX_RANDOM_BLOBS.
@@ -376,7 +413,8 @@ public actor PathTable {
             sqlite3_finalize(selectStmt)
         }
 
-        // Drop and recreate with new schema
+        // Drop and recreate with new schema (announce_data and composite PK
+        // are added by the follow-up migrations)
         sqlite3_exec(db, "DROP TABLE paths", nil, nil, nil)
         let createSQL = """
             CREATE TABLE paths (
@@ -432,6 +470,52 @@ public actor PathTable {
         guard !hasColumn else { return }
         logger.info("Migrating: adding announce_data column")
         sqlite3_exec(db, "ALTER TABLE paths ADD COLUMN announce_data BLOB", nil, nil, nil)
+    }
+
+    /// Migrate to the v2 multi-path schema: composite primary key on
+    /// (destination_hash, interface_id). Existing rows carry over verbatim —
+    /// each becomes the sole entry for its stored interface id.
+    private func migrateToMultiPathSchema() {
+        guard let db = db else { return }
+
+        var version: Int32 = 0
+        var stmt: OpaquePointer?
+        if sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &stmt, nil) == SQLITE_OK {
+            if sqlite3_step(stmt) == SQLITE_ROW {
+                version = sqlite3_column_int(stmt, 0)
+            }
+            sqlite3_finalize(stmt)
+        }
+        guard version < Self.schemaVersion else { return }
+
+        logger.info("Migrating paths table to multi-path schema (v\(Self.schemaVersion))")
+        let rebuildSQL = """
+            CREATE TABLE paths_v2 (
+                destination_hash BLOB NOT NULL,
+                public_keys BLOB NOT NULL,
+                interface_id TEXT NOT NULL,
+                hop_count INTEGER NOT NULL,
+                timestamp REAL NOT NULL,
+                expires REAL NOT NULL,
+                random_blobs TEXT NOT NULL,
+                ratchet BLOB,
+                app_data BLOB,
+                next_hop BLOB,
+                announce_data BLOB,
+                PRIMARY KEY (destination_hash, interface_id)
+            );
+            INSERT OR IGNORE INTO paths_v2
+                SELECT destination_hash, public_keys, interface_id, hop_count,
+                       timestamp, expires, random_blobs, ratchet, app_data,
+                       next_hop, announce_data
+                FROM paths;
+            DROP TABLE paths;
+            ALTER TABLE paths_v2 RENAME TO paths;
+            PRAGMA user_version = \(Self.schemaVersion);
+            """
+        if sqlite3_exec(db, rebuildSQL, nil, nil, nil) != SQLITE_OK {
+            logger.error("Multi-path schema migration failed: \(String(cString: sqlite3_errmsg(db)))")
+        }
     }
 
     // MARK: - Database Persistence
@@ -542,7 +626,7 @@ public actor PathTable {
 
             // Only load non-expired entries
             if !entry.isExpired {
-                paths[destinationHash] = entry
+                paths[destinationHash, default: [:]][interfaceId] = entry
             }
         }
     }
@@ -615,7 +699,7 @@ public actor PathTable {
         }
     }
 
-    /// Remove a path from the database.
+    /// Remove all rows for a destination from the database.
     private func removeFromDatabase(_ destinationHash: Data) {
         guard let db = db else { return }
 
@@ -628,6 +712,39 @@ public actor PathTable {
         _ = destinationHash.withUnsafeBytes { ptr in
             sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(destinationHash.count), nil)
         }
+
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Remove a single (destination, interface) row from the database.
+    private func removeFromDatabase(_ destinationHash: Data, interfaceId: String) {
+        guard let db = db else { return }
+
+        let deleteSQL = "DELETE FROM paths WHERE destination_hash = ? AND interface_id = ?"
+        var stmt: OpaquePointer?
+
+        guard sqlite3_prepare_v2(db, deleteSQL, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        _ = destinationHash.withUnsafeBytes { ptr in
+            sqlite3_bind_blob(stmt, 1, ptr.baseAddress, Int32(destinationHash.count), nil)
+        }
+        sqlite3_bind_text(stmt, 2, interfaceId, -1, SQLITE_TRANSIENT)
+
+        _ = sqlite3_step(stmt)
+    }
+
+    /// Remove all rows referencing an interface from the database.
+    private func removeFromDatabase(interfaceId: String) {
+        guard let db = db else { return }
+
+        let deleteSQL = "DELETE FROM paths WHERE interface_id = ?"
+        var stmt: OpaquePointer?
+
+        guard sqlite3_prepare_v2(db, deleteSQL, -1, &stmt, nil) == SQLITE_OK else { return }
+        defer { sqlite3_finalize(stmt) }
+
+        sqlite3_bind_text(stmt, 1, interfaceId, -1, SQLITE_TRANSIENT)
 
         _ = sqlite3_step(stmt)
     }
@@ -678,132 +795,197 @@ public actor PathTable {
 
     // MARK: - Lookup
 
-    /// Look up a path for a destination.
+    /// Order entries best-first: fewest hops, then most recently learned.
+    private static func isBetter(_ a: PathEntry, than b: PathEntry) -> Bool {
+        if a.hopCount != b.hopCount { return a.hopCount < b.hopCount }
+        return a.timestamp > b.timestamp
+    }
+
+    /// Best non-expired entry in a bucket (min hops, newest tiebreak).
+    private static func bestEntry(in bucket: [String: PathEntry]) -> PathEntry? {
+        bucket.values
+            .filter { !$0.isExpired }
+            .min { isBetter($0, than: $1) }
+    }
+
+    /// Look up the best path for a destination.
     ///
-    /// Returns the path entry if found and not expired.
-    /// Returns nil if not found or expired.
+    /// Returns the best (fewest hops, newest tiebreak) non-expired entry
+    /// across all interfaces. Returns nil if not found or all expired.
     ///
     /// - Parameter destinationHash: 16-byte destination hash
     /// - Returns: Path entry if found and valid, nil otherwise
     public func lookup(destinationHash: Data) -> PathEntry? {
-        guard let entry = paths[destinationHash] else {
+        guard let bucket = paths[destinationHash] else {
             return nil
         }
+        return Self.bestEntry(in: bucket)
+    }
 
-        // Don't return expired entries
-        if entry.isExpired {
+    /// All non-expired paths for a destination, one per interface, best first.
+    ///
+    /// - Parameter destinationHash: 16-byte destination hash
+    /// - Returns: Valid path entries (empty if none)
+    public func lookupAll(destinationHash: Data) -> [PathEntry] {
+        guard let bucket = paths[destinationHash] else { return [] }
+        return bucket.values
+            .filter { !$0.isExpired }
+            .sorted { Self.isBetter($0, than: $1) }
+    }
+
+    /// Look up the path for a destination on a specific interface.
+    ///
+    /// - Parameters:
+    ///   - destinationHash: 16-byte destination hash
+    ///   - interfaceId: Interface the path must have been learned on
+    /// - Returns: Path entry if present and not expired, nil otherwise
+    public func lookup(destinationHash: Data, interfaceId: String) -> PathEntry? {
+        guard let entry = paths[destinationHash]?[interfaceId], !entry.isExpired else {
             return nil
         }
-
         return entry
     }
 
-    /// Look up a path, throwing on not found or expired.
+    /// Look up the best path, throwing on not found or expired.
     ///
     /// - Parameter destinationHash: 16-byte destination hash
     /// - Returns: Path entry
     /// - Throws: `PathTableError.pathNotFound` or `PathTableError.pathExpired`
     public func lookupOrThrow(destinationHash: Data) throws -> PathEntry {
-        guard let entry = paths[destinationHash] else {
+        guard let bucket = paths[destinationHash], !bucket.isEmpty else {
             throw PathTableError.pathNotFound
         }
 
-        if entry.isExpired {
+        guard let best = Self.bestEntry(in: bucket) else {
             throw PathTableError.pathExpired
         }
 
-        return entry
+        return best
     }
 
     // MARK: - Touch
 
-    /// Update the timestamp of an existing path entry (e.g., after transport forwarding).
+    /// Update the timestamp of existing path entries (e.g., after transport forwarding).
     /// Also extends the expiration time (M7).
     /// Python reference: Transport.py line 1504
     ///
+    /// Touches every entry for the destination — successful traffic confirms
+    /// the destination is alive, regardless of which interface carried it.
+    ///
     /// - Parameter destinationHash: 16-byte destination hash
     public func touch(destinationHash: Data) {
-        guard let entry = paths[destinationHash] else { return }
+        guard let bucket = paths[destinationHash] else { return }
         // M7: Refresh both timestamp and expiration
         let newExpires = Date().addingTimeInterval(PathEntry.standardExpiration)
-        let touched = PathEntry(
-            destinationHash: entry.destinationHash,
-            publicKeys: entry.publicKeys,
-            interfaceId: entry.interfaceId,
-            hopCount: entry.hopCount,
-            timestamp: Date(),
-            expires: newExpires,
-            randomBlob: entry.randomBlob,
-            randomBlobs: entry.randomBlobs,
-            pathState: entry.pathState,
-            ratchet: entry.ratchet,
-            appData: entry.appData,
-            nextHop: entry.nextHop,
-            announceData: entry.announceData
-        )
-        paths[destinationHash] = touched
-        saveToDatabase(touched)
+        for (interfaceId, entry) in bucket {
+            let touched = PathEntry(
+                destinationHash: entry.destinationHash,
+                publicKeys: entry.publicKeys,
+                interfaceId: entry.interfaceId,
+                hopCount: entry.hopCount,
+                timestamp: Date(),
+                expires: newExpires,
+                randomBlob: entry.randomBlob,
+                randomBlobs: entry.randomBlobs,
+                pathState: entry.pathState,
+                ratchet: entry.ratchet,
+                appData: entry.appData,
+                nextHop: entry.nextHop,
+                announceData: entry.announceData
+            )
+            paths[destinationHash]?[interfaceId] = touched
+            saveToDatabase(touched)
+        }
     }
 
-    /// M6: Force-expire a path to trigger rediscovery.
+    /// M6: Force-expire all paths to a destination to trigger rediscovery.
     /// Called when a link to a non-transport destination is closed.
     /// Python reference: Transport.py:699
     ///
     /// - Parameter destinationHash: 16-byte destination hash
     public func expirePath(destinationHash: Data) {
-        guard let entry = paths[destinationHash] else { return }
-        let expired = PathEntry(
-            destinationHash: entry.destinationHash,
-            publicKeys: entry.publicKeys,
-            interfaceId: entry.interfaceId,
-            hopCount: entry.hopCount,
-            timestamp: entry.timestamp,
-            expires: Date(timeIntervalSince1970: 0),
-            randomBlob: entry.randomBlob,
-            randomBlobs: entry.randomBlobs,
-            pathState: entry.pathState,
-            ratchet: entry.ratchet,
-            appData: entry.appData,
-            nextHop: entry.nextHop,
-            announceData: entry.announceData
-        )
-        paths[destinationHash] = expired
-        saveToDatabase(expired)
+        guard let bucket = paths[destinationHash] else { return }
+        for (interfaceId, entry) in bucket {
+            let expired = PathEntry(
+                destinationHash: entry.destinationHash,
+                publicKeys: entry.publicKeys,
+                interfaceId: entry.interfaceId,
+                hopCount: entry.hopCount,
+                timestamp: entry.timestamp,
+                expires: Date(timeIntervalSince1970: 0),
+                randomBlob: entry.randomBlob,
+                randomBlobs: entry.randomBlobs,
+                pathState: entry.pathState,
+                ratchet: entry.ratchet,
+                appData: entry.appData,
+                nextHop: entry.nextHop,
+                announceData: entry.announceData
+            )
+            paths[destinationHash]?[interfaceId] = expired
+            saveToDatabase(expired)
+        }
     }
 
     // MARK: - Removal
 
-    /// Remove a path from the table.
+    /// Remove all paths to a destination from the table.
     ///
     /// - Parameter destinationHash: 16-byte destination hash
     public func remove(destinationHash: Data) {
         paths.removeValue(forKey: destinationHash)
+        pathStates.removeValue(forKey: destinationHash)
         removeFromDatabase(destinationHash)
     }
 
-    /// Atomically remove a path only if it currently references the given
-    /// interface id. Use when invalidating a stale entry whose interface is
-    /// missing: if a fresh announce for the same destination has replaced the
-    /// entry with a different interface id, this call becomes a no-op so the
-    /// freshly-learned path is preserved.
+    /// Remove only the path entry learned on the given interface, preserving
+    /// paths to the same destination on other interfaces. Use when
+    /// invalidating a stale entry whose interface is missing.
     ///
     /// - Parameters:
     ///   - destinationHash: 16-byte destination hash
-    ///   - interfaceId: the interface id the stale entry was expected to reference
-    /// - Returns: true if the entry was removed, false if it was preserved or absent
+    ///   - interfaceId: the interface whose entry should be removed
+    /// - Returns: true if an entry was removed, false if absent
     @discardableResult
     public func remove(destinationHash: Data, ifInterface interfaceId: String) -> Bool {
-        guard let current = paths[destinationHash], current.interfaceId == interfaceId else {
+        guard paths[destinationHash]?[interfaceId] != nil else {
             return false
         }
-        paths.removeValue(forKey: destinationHash)
-        removeFromDatabase(destinationHash)
+        paths[destinationHash]?.removeValue(forKey: interfaceId)
+        if paths[destinationHash]?.isEmpty == true {
+            paths.removeValue(forKey: destinationHash)
+            pathStates.removeValue(forKey: destinationHash)
+        }
+        removeFromDatabase(destinationHash, interfaceId: interfaceId)
         return true
+    }
+
+    /// Remove every path learned on the given interface (e.g. when a BLE/MPC
+    /// peer interface detaches). Paths to the same destinations on other
+    /// interfaces are preserved.
+    ///
+    /// - Parameter interfaceId: the interface being removed
+    /// - Returns: destination hashes whose entry on this interface was removed
+    @discardableResult
+    public func removeAll(forInterface interfaceId: String) -> [Data] {
+        var affected: [Data] = []
+        for (destination, bucket) in paths where bucket[interfaceId] != nil {
+            affected.append(destination)
+            paths[destination]?.removeValue(forKey: interfaceId)
+            if paths[destination]?.isEmpty == true {
+                paths.removeValue(forKey: destination)
+                pathStates.removeValue(forKey: destination)
+            }
+        }
+        if !affected.isEmpty {
+            removeFromDatabase(interfaceId: interfaceId)
+        }
+        return affected
     }
 
     /// Remove all paths from the table and database.
     public func removeAll() {
         paths.removeAll()
+        pathStates.removeAll()
         clearDatabase()
     }
 
@@ -822,59 +1004,61 @@ public actor PathTable {
     /// - Returns: Number of entries removed
     @discardableResult
     public func cleanup(activeInterfaceIds: Set<String>? = nil) -> Int {
-        let beforeCount = paths.count
+        var removed = 0
 
-        // Remove expired entries
-        let expiredKeys = paths.filter { $0.value.isExpired }.map { $0.key }
-        for key in expiredKeys {
-            paths.removeValue(forKey: key)
-            pathStates.removeValue(forKey: key)
-            removeFromDatabase(key)
-        }
-
-        // H4: Remove paths for dead interfaces
-        if let activeIds = activeInterfaceIds {
-            let deadKeys = paths.filter {
-                !$0.value.interfaceId.isEmpty && !activeIds.contains($0.value.interfaceId)
-            }.map { $0.key }
-            for key in deadKeys {
-                paths.removeValue(forKey: key)
-                pathStates.removeValue(forKey: key)
-                removeFromDatabase(key)
+        for (destination, bucket) in paths {
+            for (interfaceId, entry) in bucket {
+                let isDead = activeInterfaceIds.map {
+                    !interfaceId.isEmpty && !$0.contains(interfaceId)
+                } ?? false
+                if entry.isExpired || isDead {
+                    paths[destination]?.removeValue(forKey: interfaceId)
+                    removeFromDatabase(destination, interfaceId: interfaceId)
+                    removed += 1
+                }
+            }
+            if paths[destination]?.isEmpty == true {
+                paths.removeValue(forKey: destination)
+                pathStates.removeValue(forKey: destination)
             }
         }
 
-        return beforeCount - paths.count
+        return removed
     }
 
     // MARK: - Properties
 
-    /// Number of valid (non-expired) paths in the table.
+    /// Number of destinations with at least one valid (non-expired) path.
     public var count: Int {
-        paths.values.filter { !$0.isExpired }.count
+        paths.values.filter { Self.bestEntry(in: $0) != nil }.count
     }
 
-    /// Total number of entries including expired ones.
+    /// Total number of entries including expired ones, across all interfaces.
     ///
     /// Expired entries are lazily removed by cleanup() or filtered by lookup().
     public var totalCount: Int {
-        paths.count
+        paths.values.reduce(0) { $0 + $1.count }
+    }
+
+    /// Total number of (destination, interface) entries including expired ones.
+    public var entryCount: Int {
+        totalCount
     }
 
     /// All destination hashes with valid paths.
     public var destinations: [Data] {
-        paths.filter { !$0.value.isExpired }.map { $0.key }
+        paths.filter { Self.bestEntry(in: $0.value) != nil }.map { $0.key }
     }
 
-    /// Check if a path exists for a destination (and is not expired).
+    /// Check if a path exists for a destination (and is not expired) on any interface.
     ///
     /// - Parameter destinationHash: 16-byte destination hash
     /// - Returns: true if valid path exists
     public func hasPath(for destinationHash: Data) -> Bool {
-        guard let entry = paths[destinationHash] else {
+        guard let bucket = paths[destinationHash] else {
             return false
         }
-        return !entry.isExpired
+        return Self.bestEntry(in: bucket) != nil
     }
 }
 
@@ -885,6 +1069,6 @@ extension PathTable {
     ///
     /// Not for production use.
     public func allEntries() -> [PathEntry] {
-        Array(paths.values)
+        paths.values.flatMap { $0.values }
     }
 }

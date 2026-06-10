@@ -241,10 +241,12 @@ final class TransportStalePathQueueTests: XCTestCase {
 
     // MARK: - Conditional remove
 
-    /// PathTable.remove(destinationHash:, ifInterface:) must be a no-op when
-    /// the current entry references a different interface. This is the key
-    /// guarantee that prevents the stale-path invalidation flow from erasing
-    /// a freshly-recorded path that arrived during the actor suspension.
+    /// PathTable.remove(destinationHash:, ifInterface:) must remove ONLY the
+    /// entry for the named interface. This is the key guarantee that prevents
+    /// the stale-path invalidation flow from erasing a freshly-recorded path
+    /// that arrived during the actor suspension: with multi-path storage the
+    /// fresh entry lives in its own (destination, interface) slot and
+    /// survives the stale entry's removal.
     func testConditionalRemoveSkipsWhenInterfaceChanged() async throws {
         let pathTable = PathTable()
         let stale = PathEntry(
@@ -257,7 +259,7 @@ final class TransportStalePathQueueTests: XCTestCase {
         )
         await pathTable.record(entry: stale)
 
-        // Simulate an announce replacing the entry with a fresh interface id
+        // Simulate an announce recording a fresh path on a different interface
         // between our decision to remove and the remove call itself.
         let fresh = PathEntry(
             destinationHash: Self.destHash,
@@ -269,13 +271,15 @@ final class TransportStalePathQueueTests: XCTestCase {
         )
         await pathTable.record(entry: fresh)
 
-        // Attempt to remove with the STALE interface id — should be a no-op.
+        // Remove the STALE interface's entry — the fresh entry must survive.
         let removed = await pathTable.remove(destinationHash: Self.destHash, ifInterface: "iface-old")
-        XCTAssertFalse(removed, "Remove must be a no-op when current entry references a different interface")
+        XCTAssertTrue(removed, "Stale interface's own entry should be removed")
 
         let after = await pathTable.lookup(destinationHash: Self.destHash)
         XCTAssertNotNil(after, "Fresh entry must be preserved")
         XCTAssertEqual(after?.interfaceId, "iface-new")
+        let remaining = await pathTable.lookupAll(destinationHash: Self.destHash)
+        XCTAssertEqual(remaining.count, 1, "Only the fresh entry should remain")
     }
 
     /// Conditional remove must still work when the entry does reference the

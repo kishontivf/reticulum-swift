@@ -326,6 +326,86 @@ public actor ReticulumTransport {
         self.onDiagnostic = callback
     }
 
+    // MARK: - Transport Events & Nearby Destinations
+
+    /// Destinations the application currently senses as physically nearby.
+    /// A *preference* hint for outbound route selection: nearby destinations
+    /// prefer direct-class interfaces (BLE/MPC) when a live path exists there.
+    /// Never a hard filter — liveness gates eligibility, so a stale nearby
+    /// flag can never black-hole traffic. In-memory only.
+    private var nearbyDestinations: Set<Data> = []
+
+    /// Routing events emitted to upper layers (LXMF) so in-flight deliveries
+    /// can react to path and link loss without polling.
+    public enum TransportEvent: Sendable {
+        /// All paths learned on an interface were invalidated (interface
+        /// unregistered). Destinations listed may still have paths on other
+        /// interfaces — re-query the path table.
+        case pathsInvalidated(destinationHashes: [Data], interfaceId: String)
+
+        /// A link was torn down. Emitted after the link reached a terminal
+        /// state, so re-establishing immediately is safe.
+        case linkClosed(linkId: Data, destinationHash: Data, reason: TeardownReason)
+
+        /// The preferred outbound path for a destination may have changed
+        /// (nearby hint toggled, or an interface carrying it appeared/vanished).
+        case preferredPathChanged(destinationHash: Data)
+    }
+
+    /// Callback for transport events. Events fire AFTER the path table has
+    /// been updated: re-querying paths from inside the callback reflects the
+    /// surviving routes.
+    private var onTransportEvent: (@Sendable (TransportEvent) async -> Void)?
+
+    /// Set the transport-event callback. See `TransportEvent`.
+    public func setOnTransportEvent(_ callback: (@Sendable (TransportEvent) async -> Void)?) {
+        self.onTransportEvent = callback
+    }
+
+    /// Emit a transport event without blocking the actor.
+    private func emitEvent(_ event: TransportEvent) {
+        guard let callback = onTransportEvent else { return }
+        Task { await callback(event) }
+    }
+
+    /// Replace the set of destinations currently sensed as nearby.
+    ///
+    /// Full-set replace (idempotent under app-side races). The hint is
+    /// authoritative for *preference* only; a nearby destination with no live
+    /// direct path still routes over indirect interfaces.
+    ///
+    /// - Parameter destinations: 16-byte destination hashes (e.g. lxmf.delivery)
+    public func setNearbyDestinations(_ destinations: Set<Data>) {
+        let changed = destinations.symmetricDifference(nearbyDestinations)
+        guard !changed.isEmpty else { return }
+        nearbyDestinations = destinations
+        logger.info("Nearby destinations updated: \(destinations.count) nearby, \(changed.count) changed")
+        for destination in changed {
+            emitEvent(.preferredPathChanged(destinationHash: destination))
+        }
+    }
+
+    /// Current nearby destination set (for tests/diagnostics).
+    public func getNearbyDestinations() -> Set<Data> {
+        nearbyDestinations
+    }
+
+    /// The interface id outbound traffic to a destination would currently
+    /// use, or nil when no live path exists. Lets upper layers (LXMF)
+    /// compare an established link's attached interface against the
+    /// currently preferred wire for passive link migration.
+    public func preferredOutboundInterfaceId(for destinationHash: Data) async -> String? {
+        guard case .path(let entry) = await selectOutboundPath(for: destinationHash) else {
+            return nil
+        }
+        return entry.interfaceId.isEmpty ? nil : entry.interfaceId
+    }
+
+    /// Whether an interface carries traffic to physically nearby peers.
+    private func isDirectInterface(_ id: String) -> Bool {
+        interfaces[id]?.config.linkClass == .direct
+    }
+
     // MARK: - Initialization
 
     /// Create a new transport with optional dependency injection.
@@ -381,7 +461,9 @@ public actor ReticulumTransport {
 
     /// Remove a network interface.
     ///
-    /// The interface will be disconnected before removal.
+    /// The interface will be disconnected before removal. Paths learned on
+    /// the interface are invalidated and links attached to it are torn down,
+    /// with `TransportEvent`s emitted so upper layers can fail over.
     ///
     /// - Parameter id: Interface ID to remove
     public func removeInterface(id: String) async {
@@ -394,6 +476,53 @@ public actor ReticulumTransport {
         await interface.disconnect()
         interfaces.removeValue(forKey: id)
         delegateWrappers.removeValue(forKey: id)
+
+        await handleInterfaceLost(id: id)
+    }
+
+    /// Invalidate routing state for an unregistered interface.
+    ///
+    /// Hard invalidation happens only on unregistration (this method) —
+    /// a registered interface that is merely `.disconnected`/`.reconnecting`
+    /// (TCP blip) keeps its paths; outbound selection routes around it and a
+    /// reconnect restores it with zero churn. BLE/MPC peer children always
+    /// arrive here because their parents *remove* them on peer loss.
+    ///
+    /// Order matters for the upper-layer contract: the path table is updated
+    /// BEFORE events fire, so event handlers re-querying paths see only the
+    /// surviving routes.
+    private func handleInterfaceLost(id: String) async {
+        // 1. Drop every path learned on this interface (other interfaces'
+        //    paths to the same destinations survive).
+        let affected = await pathTable.removeAll(forInterface: id)
+        if !affected.isEmpty {
+            logger.info("Interface \(id, privacy: .public) lost: invalidated paths to \(affected.count) destination(s)")
+            emitEvent(.pathsInvalidated(destinationHashes: affected, interfaceId: id))
+            for destination in affected {
+                emitEvent(.preferredPathChanged(destinationHash: destination))
+            }
+        }
+
+        // 2. Tear down links attached to this interface. invalidate() skips
+        //    LINKCLOSE — the peer is unreachable on that medium, and the
+        //    broadcast fallback that would have carried it is disabled for
+        //    link traffic.
+        for (linkId, link) in activeLinks {
+            guard await link.attachedInterfaceId == id else { continue }
+            let destinationHash = await link.destinationHash
+            await link.invalidate(reason: .attachedInterfaceClosed)
+            activeLinks.removeValue(forKey: linkId)
+            let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+            logger.info("Invalidated active link \(linkHex) attached to lost interface \(id, privacy: .public)")
+            emitEvent(.linkClosed(linkId: linkId, destinationHash: destinationHash, reason: .attachedInterfaceClosed))
+        }
+        for (linkId, link) in pendingLinks {
+            guard await link.attachedInterfaceId == id else { continue }
+            let destinationHash = await link.destinationHash
+            await link.invalidate(reason: .attachedInterfaceClosed)
+            pendingLinks.removeValue(forKey: linkId)
+            emitEvent(.linkClosed(linkId: linkId, destinationHash: destinationHash, reason: .attachedInterfaceClosed))
+        }
     }
 
     /// Add an AutoInterface with peer lifecycle management.
@@ -725,11 +854,20 @@ public actor ReticulumTransport {
 
     /// Look up the HW_MTU of the next-hop interface for a destination.
     /// Matches Python Transport.next_hop_interface_hw_mtu().
+    /// Uses outbound path selection so the negotiated link MTU matches the
+    /// interface the LINKREQUEST will actually be sent on.
     public func nextHopInterfaceHwMtu(for destinationHash: Data) async -> Int? {
-        guard let pathEntry = await pathTable.lookup(destinationHash: destinationHash) else {
-            return nil
+        let pathEntry: PathEntry?
+        if case .path(let selected) = await selectOutboundPath(for: destinationHash) {
+            pathEntry = selected
+        } else {
+            // No live path right now — fall back to the best known entry so
+            // MTU negotiation still has a hint (Python doesn't gate this
+            // lookup on connectivity; a queued LINKREQUEST may well go out
+            // on this interface after it reconnects).
+            pathEntry = await pathTable.lookup(destinationHash: destinationHash)
         }
-        guard let iface = interfaces[pathEntry.interfaceId] else {
+        guard let pathEntry, let iface = interfaces[pathEntry.interfaceId] else {
             return nil
         }
         return iface.hwMtu
@@ -743,12 +881,37 @@ public actor ReticulumTransport {
     /// - Parameters:
     ///   - destination: Target destination
     ///   - identity: Local identity for authentication
+    ///   - routeHint: Optional route preference for this link's establishment.
+    ///     `.preferIndirect` pins the LINKREQUEST (and so the whole link) to
+    ///     infrastructure when a live indirect path exists — used by LXMF for
+    ///     large resource transfers that would crawl over BLE. The hint is
+    ///     transient: applied for the MTU lookup + LINKREQUEST dispatch, then
+    ///     cleared.
     /// - Returns: The created Link actor
     /// - Throws: TransportError if destination has no known path
-    public func initiateLink(to destination: Destination, identity: Identity) async throws -> Link {
+    public func initiateLink(
+        to destination: Destination,
+        identity: Identity,
+        routeHint: RouteHint? = nil
+    ) async throws -> Link {
         // Check we have a path to the destination
         guard await pathTable.hasPath(for: destination.hash) else {
             throw TransportError.noPathAvailable(destinationHash: destination.hash)
+        }
+
+        // Scope the route hint to this establishment: it must steer both the
+        // MTU lookup below and the LINKREQUEST dispatch in send(packet:).
+        // Cleared in the defer so a hint never outlives its establishment
+        // (concurrent sends to the same destination during the await windows
+        // see the hint — acceptable: they'd ride the same wire the link is
+        // about to use).
+        if let routeHint {
+            routeHints[destination.hash] = routeHint
+        }
+        defer {
+            if routeHint != nil {
+                routeHints.removeValue(forKey: destination.hash)
+            }
         }
 
         // Query next-hop interface HW_MTU for link MTU discovery
@@ -769,12 +932,14 @@ public actor ReticulumTransport {
         // Create link with interface HW_MTU for MTU negotiation
         let link = Link(destination: destination, identity: identity, hwMtu: hwMtu)
 
-        // Set send callback - routes via attached interface when known
+        // Set send callback - routes via attached interface when known.
         // The Link builds complete packets (with header, context, etc.)
+        // No broadcast fallback: once attached, link traffic must never
+        // escape onto other interfaces (Python parity).
         await link.setSendCallback { [weak self, weak link] packetBytes in
             guard let self = self else { throw TransportError.notConnected }
             let ifaceId = await link?.attachedInterfaceId
-            try await self.sendRawBytes(packetBytes, interfaceId: ifaceId)
+            try await self.sendRawBytes(packetBytes, interfaceId: ifaceId, fallbackToBroadcast: ifaceId == nil)
         }
 
         // Get packet FIRST so we can use it to compute link_id
@@ -1003,14 +1168,27 @@ public actor ReticulumTransport {
     /// - Parameters:
     ///   - bytes: Encoded packet bytes to send
     ///   - interfaceId: Optional specific interface to send on (nil = all)
-    /// - Throws: TransportError if send fails
-    private func sendRawBytes(_ bytes: Data, interfaceId: String? = nil) async throws {
+    ///   - fallbackToBroadcast: When the target interface is unavailable,
+    ///     whether to broadcast instead (true) or throw (false). Link traffic
+    ///     MUST pass false — Python never lets link packets escape the
+    ///     attached interface, and a broadcast fallback would spray
+    ///     keepalives/LINKCLOSE from a dead BLE link onto TCP.
+    /// - Throws: TransportError if send fails or target interface unavailable
+    private func sendRawBytes(
+        _ bytes: Data,
+        interfaceId: String? = nil,
+        fallbackToBroadcast: Bool = true
+    ) async throws {
         let bytesHex = bytes.prefix(20).map { String(format: "%02x", $0) }.joined()
         logger.debug("sendRawBytes called with \(bytes.count) bytes: \(bytesHex)... interfaceId=\(interfaceId ?? "all")")
 
         // If a specific interface is requested, send only on that one
         if let targetId = interfaceId {
             guard let interface = interfaces[targetId], interface.state == .connected else {
+                guard fallbackToBroadcast else {
+                    logger.warning("Specified interface \(targetId, privacy: .public) unavailable; dropping (no broadcast fallback for link traffic)")
+                    throw TransportError.notConnected
+                }
                 // Fall back to broadcast if the specified interface is unavailable
                 logger.warning("Specified interface \(targetId, privacy: .public) unavailable, falling back to broadcast")
                 try await sendRawBytes(bytes, interfaceId: nil)
@@ -1083,6 +1261,149 @@ public actor ReticulumTransport {
         try await send(packet: packet)
     }
 
+    // MARK: - Outbound Path Selection
+
+    /// Result of outbound path selection for a destination.
+    enum OutboundPathSelection {
+        /// A usable path was found — send via this entry.
+        case path(PathEntry)
+        /// Paths are known but none is currently usable (interfaces missing
+        /// or disconnected). `stale` lists the unusable entries.
+        case noLivePath(stale: [PathEntry])
+        /// No path is known for the destination at all.
+        case noPath
+    }
+
+    /// Temporary route preference for a destination's next link
+    /// establishment. Set by `initiateLink(to:identity:routeHint:)` so a
+    /// large (resource) transfer can pin its link to infrastructure even
+    /// when the peer is nearby — BLE throughput is a few KB/s; TCP/WLAN
+    /// moves the same payload in seconds.
+    public enum RouteHint: Sendable {
+        /// Prefer direct-class interfaces (BLE/MPC) when live.
+        case preferDirect
+        /// Prefer indirect-class interfaces (TCP et al.) when live.
+        case preferIndirect
+    }
+
+    /// Active per-destination route hints. Transient — set around link
+    /// establishment, cleared once the LINKREQUEST is dispatched.
+    private var routeHints: [Data: RouteHint] = [:]
+
+    /// Throughput rank used to order live direct candidates with equal hop
+    /// counts: explicit bitrate when configured, otherwise hwMtu as a proxy
+    /// (MPC's 1196 over WiFi vastly outpaces BLE's 508 over GATT).
+    private func throughputRank(of interfaceId: String) -> Int {
+        guard let iface = interfaces[interfaceId] else { return 0 }
+        let bitrate = iface.config.bitrate
+        return bitrate > 0 ? bitrate : iface.hwMtu
+    }
+
+    /// Whether any live path of the given link class exists for a destination.
+    /// Used by LXMF to decide if a large transfer can prefer infrastructure.
+    public func hasLivePath(for destinationHash: Data, linkClass: InterfaceLinkClass) async -> Bool {
+        let candidates = await pathTable.lookupAll(destinationHash: destinationHash)
+        return candidates.contains { entry in
+            guard !entry.interfaceId.isEmpty,
+                  let iface = interfaces[entry.interfaceId],
+                  iface.state == .connected else { return false }
+            return iface.config.linkClass == linkClass
+        }
+    }
+
+    /// Link class of a registered interface (nil when unknown/unregistered).
+    public func linkClass(ofInterface id: String) -> InterfaceLinkClass? {
+        interfaces[id]?.config.linkClass
+    }
+
+    /// Select the outbound path for a destination across all interfaces.
+    ///
+    /// Policy:
+    /// 1. Consider only live entries: interface registered and `.connected`
+    ///    (entries with an empty interface id count as live → broadcast).
+    /// 2. An active `RouteHint` overrides the nearby preference (but never
+    ///    liveness): `.preferIndirect` picks the best indirect path when one
+    ///    is live, `.preferDirect` the best direct path.
+    /// 3. If the destination is marked nearby and a live direct-class path
+    ///    (BLE/MPC) exists, use the best direct path.
+    /// 4. Otherwise use the best indirect path (TCP et al.).
+    /// 5. If only one class is live, use it regardless of preference.
+    ///
+    /// "Best" = fewest hops; direct candidates tie-break on throughput
+    /// (MPC over BLE), then newest timestamp.
+    private func selectOutboundPath(for destinationHash: Data) async -> OutboundPathSelection {
+        let candidates = await pathTable.lookupAll(destinationHash: destinationHash)
+        guard !candidates.isEmpty else { return .noPath }
+
+        // lookupAll returns entries best-first (fewest hops, newest tiebreak).
+        let live = candidates.filter { entry in
+            entry.interfaceId.isEmpty || interfaces[entry.interfaceId]?.state == .connected
+        }
+        guard !live.isEmpty else { return .noLivePath(stale: candidates) }
+
+        // Direct candidates: re-rank equal-hop entries by throughput so a
+        // live MPC (WiFi) peer beats a live BLE peer instead of an arbitrary
+        // announce-recency tiebreak.
+        let direct = live
+            .filter { !$0.interfaceId.isEmpty && isDirectInterface($0.interfaceId) }
+            .sorted { a, b in
+                if a.hopCount != b.hopCount { return a.hopCount < b.hopCount }
+                let rankA = throughputRank(of: a.interfaceId)
+                let rankB = throughputRank(of: b.interfaceId)
+                if rankA != rankB { return rankA > rankB }
+                return a.timestamp > b.timestamp
+            }
+        let indirect = live.filter { $0.interfaceId.isEmpty || !isDirectInterface($0.interfaceId) }
+
+        let prefersDirect: Bool
+        switch routeHints[destinationHash] {
+        case .preferIndirect:
+            prefersDirect = false
+        case .preferDirect:
+            prefersDirect = true
+        case nil:
+            prefersDirect = nearbyDestinations.contains(destinationHash)
+        }
+
+        if prefersDirect, let best = direct.first {
+            return .path(best)
+        }
+        if let best = indirect.first {
+            return .path(best)
+        }
+        // Only direct paths are live — use them regardless of preference.
+        if let best = direct.first {
+            return .path(best)
+        }
+        return .noLivePath(stale: candidates)
+    }
+
+    /// Handle the no-live-path case for an outbound packet: queue the packet,
+    /// invalidate entries whose interfaces are gone entirely (unregistered),
+    /// and request a fresh path. Entries on registered-but-disconnected
+    /// interfaces are preserved — a reconnect restores them with zero churn.
+    ///
+    /// The packet is queued FIRST — before any await that releases the actor.
+    /// An announce arriving during pathTable/requestPath suspensions triggers
+    /// processPendingPackets; queueing late would strand this packet until
+    /// the next unsolicited announce.
+    private func queueAndInvalidateStalePaths(
+        _ packet: Packet,
+        stale: [PathEntry]
+    ) async {
+        let destHash = packet.destination
+        let destHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        queuePendingPacket(packet, for: destHash)
+        for entry in stale where !entry.interfaceId.isEmpty && interfaces[entry.interfaceId] == nil {
+            logger.warning("Invalidating stale path to \(destHex)... via missing interface '\(entry.interfaceId, privacy: .public)'")
+            // Conditional remove: if an announce re-learned this entry during a
+            // suspension, the fresh path is preserved.
+            await pathTable.remove(destinationHash: destHash, ifInterface: entry.interfaceId)
+        }
+        await requestPath(for: destHash)
+        logger.info("Queued packet to \(destHex)... — no live path, fresh path requested")
+    }
+
     // MARK: - Outbound Packet Dispatch
 
     /// Send a packet through the transport.
@@ -1117,67 +1438,38 @@ public actor ReticulumTransport {
                 try await sendAnnounceFiltered(packet)
             } else {
                 // HEADER_1: Check if we need to convert to HEADER_2 for multi-hop routing
-                // This applies to LINKREQUEST and other packets going to remote destinations
-                let pathEntry = await pathTable.lookup(destinationHash: packet.destination)
-                if let entry = pathEntry {
-                    let nextHopStatus = entry.nextHop != nil ? entry.nextHop!.prefix(8).map { String(format: "%02x", $0) }.joined() : "nil"
-                    logger.debug("PathEntry found: hopCount=\(entry.hopCount), nextHop=\(nextHopStatus), interfaceId='\(entry.interfaceId)'")
-                } else {
-                    logger.debug("PathEntry NOT found for dest=\(destHex)")
-                }
-
-                // If the path entry references an interface we no longer have
-                // (e.g. stale path from a previous app run), invalidate it and
-                // request a fresh path. We queue the packet in that case so
-                // processPendingPackets can re-send it once a new path arrives,
-                // instead of falling through to a broadcast.
-                let resolvedEntry: PathEntry? = {
-                    guard let entry = pathEntry else { return nil }
-                    let outboundId = entry.interfaceId
-                    if !outboundId.isEmpty, interfaces[outboundId] == nil {
-                        logger.warning("Path entry references missing interface '\(outboundId)' — invalidating stale path to \(destHex)...")
-                        return nil
-                    }
-                    return entry
-                }()
-                let hadStalePath = resolvedEntry == nil && pathEntry != nil
-                if hadStalePath, let staleInterfaceId = pathEntry?.interfaceId {
-                    // Queue FIRST — before any await that releases the actor. Both
-                    // pathTable.remove and requestPath have real suspension points;
-                    // an announce arriving during either would trigger
-                    // processPendingPackets on an empty queue, stranding this
-                    // packet until the next unsolicited announce.
-                    //
-                    // Use the conditional remove so that if an announce did arrive
-                    // during the suspension and replaced the entry with a fresh
-                    // interface id, we don't erase the just-learned path.
-                    queuePendingPacket(packet, for: packet.destination)
-                    await pathTable.remove(destinationHash: packet.destination, ifInterface: staleInterfaceId)
-                    await requestPath(for: packet.destination)
-                    logger.info("Queuing packet to \(destHex)... after invalidating stale path; broadcasting skipped")
+                // This applies to LINKREQUEST and other packets going to remote destinations.
+                // Multi-path: selection considers all interfaces with a path,
+                // interface liveness, link class, and the nearby hint.
+                switch await selectOutboundPath(for: packet.destination) {
+                case .noLivePath(let stale):
+                    // Paths known but none usable right now (interface missing
+                    // or disconnected). Queue, invalidate truly-gone entries,
+                    // request a fresh path. Broadcasting is skipped.
+                    await queueAndInvalidateStalePaths(packet, stale: stale)
                     return
-                }
 
-                // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
-                // hops == 1 means destination is one hop away, send HEADER_1 directly
-                // hops > 1 means destination needs multi-hop routing via transport node
-                if let entry = resolvedEntry,
-                   entry.hopCount > 1,
-                   let nextHop = entry.nextHop {
-                    // Convert to HEADER_2 for routed delivery (multi-hop)
-                    let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
-                    let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
-                    logger.debug("Converting to HEADER_2: dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
-                    // M1: Send on specific interface when path is known
-                    let outboundId = entry.interfaceId.isEmpty ? nil : entry.interfaceId
-                    if let outboundId {
-                        try await sendToInterface(routedPacket.encode(), interfaceId: outboundId)
+                case .path(let entry):
+                    let nextHopStatus = entry.nextHop != nil ? entry.nextHop!.prefix(8).map { String(format: "%02x", $0) }.joined() : "nil"
+                    logger.debug("Path selected: hopCount=\(entry.hopCount), nextHop=\(nextHopStatus), interfaceId='\(entry.interfaceId)'")
+
+                    // Python converts to HEADER_2 only if hops > 1 (Transport.py line ~500)
+                    // hops == 1 means destination is one hop away, send HEADER_1 directly
+                    // hops > 1 means destination needs multi-hop routing via transport node
+                    if entry.hopCount > 1, let nextHop = entry.nextHop {
+                        // Convert to HEADER_2 for routed delivery (multi-hop)
+                        let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
+                        let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        logger.debug("Converting to HEADER_2: dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
+                        // M1: Send on specific interface when path is known
+                        let outboundId = entry.interfaceId.isEmpty ? nil : entry.interfaceId
+                        if let outboundId {
+                            try await sendToInterface(routedPacket.encode(), interfaceId: outboundId)
+                        } else {
+                            try await sendToAllInterfaces(routedPacket)
+                        }
                     } else {
-                        try await sendToAllInterfaces(routedPacket)
-                    }
-                } else {
-                    // Direct delivery (single hop or no path) - send as HEADER_1
-                    if let entry = resolvedEntry {
+                        // Direct delivery (single hop) - send as HEADER_1
                         if entry.hopCount > 1 && entry.nextHop == nil {
                             logger.warning("hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (transport will route)")
                         } else if entry.hopCount == 1 {
@@ -1192,13 +1484,14 @@ public actor ReticulumTransport {
                             logger.debug("Sending as HEADER_1 (direct broadcast)")
                             try await sendToAllInterfaces(packet)
                         }
-                    } else {
-                        // M2: Record outbound hash for broadcast (prevents self-reception on shared medium)
-                        let packetHash = packet.getFullHash()
-                        await packetHashlist.record(packetHash)
-                        logger.debug("Sending as HEADER_1 (broadcast, no path)")
-                        try await sendToAllInterfaces(packet)
                     }
+
+                case .noPath:
+                    // M2: Record outbound hash for broadcast (prevents self-reception on shared medium)
+                    let packetHash = packet.getFullHash()
+                    await packetHashlist.record(packetHash)
+                    logger.debug("Sending as HEADER_1 (broadcast, no path)")
+                    try await sendToAllInterfaces(packet)
                 }
             }
 
@@ -1479,57 +1772,35 @@ public actor ReticulumTransport {
         let destHash = packet.destination
         let destHex = destHash.prefix(8).map { String(format: "%02x", $0) }.joined()
 
-        // Look up path in path table
-        guard let pathEntry = await pathTable.lookup(destinationHash: destHash) else {
+        // Multi-path selection: liveness, link class, and nearby hint.
+        switch await selectOutboundPath(for: destHash) {
+        case .noPath:
             // No path available - queue packet and request path
             logger.info("No path to \(destHex)..., queuing packet")
             queuePendingPacket(packet, for: destHash)
             await requestPath(for: destHash)
             return  // Don't throw - packet is queued for later delivery
-        }
 
-        let interfaceId = pathEntry.interfaceId
-        logger.debug("Found path to \(destHex)... via interface '\(interfaceId)'")
-
-        // Get the interface. If it's missing (e.g. stored path references an
-        // interface from a previous app run), invalidate the stale path and
-        // re-request so a fresh path can be learned.
-        guard let interface = interfaces[interfaceId] else {
-            logger.warning("Interface '\(interfaceId)' not found (have: \(Array(self.interfaces.keys))) — invalidating stale path to \(destHex)...")
-            // Queue before any await to avoid the actor-reentrancy race where
-            // an announce arriving during pathTable.remove or requestPath
-            // triggers processPendingPackets on an empty queue. Use the
-            // conditional remove so a fresh announce that landed during our
-            // suspension isn't overwritten by our invalidation.
-            queuePendingPacket(packet, for: destHash)
-            await pathTable.remove(destinationHash: destHash, ifInterface: interfaceId)
-            await requestPath(for: destHash)
+        case .noLivePath(let stale):
+            // Paths known but no interface can carry them right now. Queue,
+            // invalidate entries on unregistered interfaces, request fresh path.
+            await queueAndInvalidateStalePaths(packet, stale: stale)
             return
-        }
 
-        // Check interface is connected. If not, treat as transient — queue
-        // the packet but don't invalidate the path (interface may reconnect).
-        // Also kick off a path re-request: if topology changed and the
-        // destination is now reachable via a different interface, the new
-        // announce will arrive and flush the queue. Without this, a queued
-        // packet can sit indefinitely if the interface never reconnects and
-        // the remote node doesn't happen to re-announce on its own.
-        guard interface.state == .connected else {
-            logger.warning("Interface '\(interfaceId)' not connected (state=\(String(describing: interface.state))) — queuing packet and re-requesting path")
-            queuePendingPacket(packet, for: destHash)
-            await requestPath(for: destHash)
-            return
-        }
+        case .path(let entry):
+            let interfaceId = entry.interfaceId
+            logger.debug("Found path to \(destHex)... via interface '\(interfaceId)'")
+            guard !interfaceId.isEmpty else {
+                // Legacy entry without an interface id — broadcast.
+                try await sendToAllInterfaces(packet)
+                return
+            }
 
-        // Send the packet
-        let encoded = packet.encode()
-        logger.debug("Sending \(encoded.count) bytes via '\(interfaceId)' (type=\(String(describing: packet.header.packetType)))")
-        do {
-            try await interface.send(encoded)
+            // Send the packet (sendToInterface applies IFAC — E8)
+            let encoded = packet.encode()
+            logger.debug("Sending \(encoded.count) bytes via '\(interfaceId)' (type=\(String(describing: packet.header.packetType)))")
+            try await sendToInterface(encoded, interfaceId: interfaceId)
             logger.debug("Routed packet sent via interface '\(interfaceId)'")
-        } catch {
-            logger.error("Send failed via '\(interfaceId)': \(error.localizedDescription)")
-            throw TransportError.sendFailed(interfaceId: interfaceId, underlying: error.localizedDescription)
         }
     }
 
@@ -1808,11 +2079,12 @@ public actor ReticulumTransport {
             identity: identity
         )
 
-        // Set up send callback for the link - routes via attached interface when known
+        // Set up send callback for the link - routes via attached interface when
+        // known. No broadcast fallback once attached (Python parity).
         await link.setSendCallback { [weak self, weak link] (data: Data) async throws -> Void in
             guard let self = self else { return }
             let ifaceId = await link?.attachedInterfaceId
-            try await self.sendRawBytes(data, interfaceId: ifaceId)
+            try await self.sendRawBytes(data, interfaceId: ifaceId, fallbackToBroadcast: ifaceId == nil)
         }
 
         // Configure link with destination callbacks IMMEDIATELY (before LRRTT).
@@ -2399,6 +2671,15 @@ public actor ReticulumTransport {
     ///   - packet: Announce packet to process
     ///   - interfaceId: ID of interface that received the announce
     private func processAnnounce(packet: Packet, from interfaceId: String) async {
+        // Race guard: the interface may have been unregistered between the
+        // delegate's Task hop and entering this actor. Recording a path for
+        // a just-removed interface would resurrect routes that
+        // handleInterfaceLost already invalidated.
+        guard interfaces[interfaceId] != nil else {
+            logger.debug("Dropping announce from unregistered interface \(interfaceId, privacy: .public)")
+            return
+        }
+
         // L6: Apply ingress storm detection only for unknown destinations
         // Known destinations are legitimate updates and should not be rate-limited
         let hasPath = await pathTable.hasPath(for: packet.destination)
