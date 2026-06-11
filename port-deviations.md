@@ -200,6 +200,31 @@ Data <= MAX_EFFICIENT_SIZE keeps the single in-RAM segment path
    faithful. The encrypted-side `assembled.count == transferSize` check is
    retained (transferSize is per-segment `t`).
 
+### `RNodeInterface` host-injectable inner transport (new feature)
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/RNodeInterface.swift` — the
+`makeInnerTransport` stored factory + the `transportFactory:` init parameter
+(default `{ BLETransport(deviceName: $0) }`), consumed in `setupTransport()`.
+
+**Python reference:** `../Reticulum/RNS/Interfaces/RNodeInterface.py` —
+`__init__`/`open_port` select the byte-I/O backend by config and assign it to
+`self.serial`: `pyserial.Serial(...)` (`:367`), a BLE adapter `self.serial =
+self.ble` (`:392`), or `self.serial = self.tcp` (`:408`). Python picks the
+backend internally from configuration.
+
+**Reason:** Category (b) — new feature for the swift host surface. The swift
+port already abstracts python's pluggable `self.serial` as the `Transport`
+protocol (`BLETransport` ≈ the python `self.ble` path). This change makes that
+inner transport *injectable by the host process* instead of always constructing
+`BLETransport` internally, so Columba's iOS **Network Extension** can supply an
+**App-Group seam transport** — the CoreBluetooth radio runs in the app process
+(Model B) while `RNodeInterface` + KISS framing run in the NE. It is the RNode
+analogue of `BLEInterface`'s already-injectable `driver`. **No protocol-semantics
+change:** KISS framing, RNode command handling, reconnect/backoff, and flow
+control are untouched; only the source of the inner byte-transport is injectable.
+The default preserves the previous behaviour exactly (`BLETransport` from
+`config.host`).
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)
