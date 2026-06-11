@@ -416,6 +416,62 @@ final class TransportSelectionTests: XCTestCase {
         XCTAssertEqual(tcp.sentPackets.count, 1)
     }
 
+    /// A reported delivery failure demotes the implicated path: the next
+    /// send rotates onto the other wire even though the failed interface is
+    /// still locally connected (relay-up-but-peer-gone case).
+    func testDeliveryFailureRotatesToOtherPath() async throws {
+        let (transport, _, tcp, ble) = try await makeSetup()
+
+        // Default (not nearby) → TCP.
+        try await transport.send(packet: makeDataPacket(dest: destHash))
+        XCTAssertEqual(tcp.sentPackets.count, 1)
+
+        await transport.reportDeliveryFailure(for: destHash, interfaceId: "tcp0")
+        try await transport.send(packet: makeDataPacket(dest: destHash))
+
+        XCTAssertEqual(tcp.sentPackets.count, 1, "Demoted TCP path must not be re-picked")
+        XCTAssertEqual(ble.sentPackets.count, 1, "Retry must rotate onto the live BLE path")
+    }
+
+    /// A delivery success lifts the demotion immediately.
+    func testDeliverySuccessClearsDemotion() async throws {
+        let (transport, _, tcp, ble) = try await makeSetup()
+
+        await transport.reportDeliveryFailure(for: destHash, interfaceId: "tcp0")
+        await transport.reportDeliverySuccess(for: destHash, interfaceId: "tcp0")
+        try await transport.send(packet: makeDataPacket(dest: destHash))
+
+        XCTAssertEqual(tcp.sentPackets.count, 1, "Cleared demotion should restore the indirect default")
+        XCTAssertEqual(ble.sentPackets.count, 0)
+    }
+
+    /// When every live path is demoted, demotions are ignored — trying a
+    /// suspect path beats trying nothing.
+    func testAllPathsDemotedStillSelects() async throws {
+        let (transport, _, tcp, ble) = try await makeSetup()
+
+        await transport.reportDeliveryFailure(for: destHash, interfaceId: "tcp0")
+        await transport.reportDeliveryFailure(for: destHash, interfaceId: "ble-mesh0-aabbccdd")
+        try await transport.send(packet: makeDataPacket(dest: destHash))
+
+        XCTAssertEqual(tcp.sentPackets.count + ble.sentPackets.count, 1,
+            "All-demoted must still pick a path, not black-hole")
+    }
+
+    /// `hasLivePath(for:linkClass:)` respects demotion, so LXMF's
+    /// size-aware `.preferIndirect` hint stops steering large transfers at
+    /// a demoted TCP path.
+    func testHasLivePathRespectsDemotion() async throws {
+        let (transport, _, _, _) = try await makeSetup()
+
+        let before = await transport.hasLivePath(for: destHash, linkClass: .indirect)
+        XCTAssertTrue(before)
+
+        await transport.reportDeliveryFailure(for: destHash, interfaceId: "tcp0")
+        let after = await transport.hasLivePath(for: destHash, linkClass: .indirect)
+        XCTAssertFalse(after, "Demoted TCP path must not count as a live indirect path")
+    }
+
     /// Among live direct candidates with equal hops, the higher-throughput
     /// interface wins (MPC's WiFi over BLE's GATT) instead of an arbitrary
     /// announce-recency tiebreak.

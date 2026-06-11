@@ -352,6 +352,11 @@ public struct Identity {
 
         // 3. Derive 64-byte key via HKDF using identity hash as salt
         let sharedSecretData = sharedSecret.withUnsafeBytes { Data($0) }
+        // X25519 does not reject low-order/invalid peer public keys, which can
+        // force an all-zero (attacker-known) shared secret. Fail closed.
+        guard sharedSecretData.contains(where: { $0 != 0 }) else {
+            throw IdentityError.encryptionFailed(reason: "Invalid (all-zero) ECDH shared secret")
+        }
         let derivedKey = KeyDerivation.deriveKey(
             length: 64,
             inputKeyMaterial: sharedSecretData,
@@ -444,6 +449,10 @@ public struct Identity {
 
         // 3. Derive key via HKDF using identity hash as salt
         let sharedSecretData = sharedSecret.withUnsafeBytes { Data($0) }
+        // Reject an all-zero shared secret from a low-order/invalid peer key.
+        guard sharedSecretData.contains(where: { $0 != 0 }) else {
+            throw IdentityError.decryptionFailed(reason: "Invalid (all-zero) ECDH shared secret")
+        }
         let derivedKey = KeyDerivation.deriveKey(
             length: 64,
             inputKeyMaterial: sharedSecretData,
@@ -534,6 +543,10 @@ public struct Identity {
                 let ratchetKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ratchetPriv)
                 let sharedSecret = try ratchetKey.sharedSecretFromKeyAgreement(with: ephemeralPublicKey)
                 let sharedSecretData = sharedSecret.withUnsafeBytes { Data($0) }
+                // Reject an all-zero shared secret (low-order/invalid peer key).
+                guard sharedSecretData.contains(where: { $0 != 0 }) else {
+                    throw IdentityError.decryptionFailed(reason: "Invalid (all-zero) ECDH shared secret")
+                }
                 let derivedKey = KeyDerivation.deriveKey(
                     length: 64,
                     inputKeyMaterial: sharedSecretData,

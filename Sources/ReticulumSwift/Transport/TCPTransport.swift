@@ -68,7 +68,18 @@ public final class TCPTransport: Transport {
 
     /// Establish TCP connection to the configured server.
     public func connect() {
-        guard state == .disconnected || state != .connecting else {
+        // Only (re)connect from a terminal state. The previous condition
+        // (`== .disconnected || != .connecting`) was a tautology that let a
+        // second NWConnection be created while already connected, leaking the
+        // first.
+        let canConnect: Bool
+        switch state {
+        case .disconnected, .failed:
+            canConnect = true
+        case .connecting, .connected:
+            canConnect = false
+        }
+        guard canConnect else {
             logger.warning("Connect called but already connecting/connected")
             return
         }

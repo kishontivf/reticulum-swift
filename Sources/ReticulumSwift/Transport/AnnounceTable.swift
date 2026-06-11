@@ -114,6 +114,16 @@ public actor AnnounceTable {
     /// Rate limiting table indexed by destination hash
     private var rateTable: [Data: RateEntry] = [:]
 
+    /// Maximum number of rate-limit entries retained before stale ones are pruned.
+    ///
+    /// Each unique destination hash creates a `RateEntry` that was previously never
+    /// removed, so a slow drip of unique hashes grew `rateTable` without bound
+    /// (memory DoS). Beyond this size, idle/expired entries are pruned.
+    private let maxRateTableSize = 16384
+
+    /// Age after which an idle (non-blocked) rate-limit entry may be pruned.
+    private let rateTableIdleTTL: TimeInterval = 3600
+
     // MARK: - Insert
 
     /// Insert an announce into the table for scheduled retransmission.
@@ -288,7 +298,10 @@ public actor AnnounceTable {
         let now = Date()
 
         guard var rateEntry = rateTable[destinationHash] else {
-            // First announce from this destination - not blocked, create entry
+            // First announce from this destination - not blocked, create entry.
+            // Prune stale entries first so a flood of unique hashes cannot grow
+            // the table without bound.
+            pruneRateTable(now: now)
             rateTable[destinationHash] = RateEntry(
                 lastSeen: now,
                 rateViolations: 0,
@@ -324,6 +337,27 @@ public actor AnnounceTable {
         } else {
             rateTable[destinationHash] = rateEntry
             return true
+        }
+    }
+
+    /// Prune stale entries from the rate-limit table when it grows too large.
+    ///
+    /// Removes idle (not currently blocked, unseen for `rateTableIdleTTL`) entries;
+    /// if still over the cap during an active flood, drops the oldest-seen entries.
+    private func pruneRateTable(now: Date) {
+        guard rateTable.count >= maxRateTableSize else { return }
+
+        for (hash, entry) in rateTable
+        where now > entry.blockedUntil && now.timeIntervalSince(entry.lastSeen) > rateTableIdleTTL {
+            rateTable.removeValue(forKey: hash)
+        }
+
+        if rateTable.count >= maxRateTableSize {
+            let removeCount = (rateTable.count - maxRateTableSize) + maxRateTableSize / 10
+            let oldest = rateTable.sorted { $0.value.lastSeen < $1.value.lastSeen }.prefix(removeCount)
+            for (hash, _) in oldest {
+                rateTable.removeValue(forKey: hash)
+            }
         }
     }
 

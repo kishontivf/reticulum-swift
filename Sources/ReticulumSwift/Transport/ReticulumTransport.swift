@@ -174,6 +174,22 @@ public actor ReticulumTransport {
     /// Pending link requests awaiting PROOF (indexed by link ID)
     private var pendingLinks: [Data: Link] = [:]
 
+    /// Establishment deadlines for responder links still in `.handshake`.
+    ///
+    /// A responder link is created (and a PROOF signed) for every inbound
+    /// LINKREQUEST, but the watchdog that can close it only starts after the
+    /// handshake completes. Without a deadline, links that never complete stay
+    /// in `activeLinks` forever — a memory/CPU amplification vector. These are
+    /// reaped by `cleanupLinks` once the deadline passes.
+    private var responderLinkDeadlines: [Data: Date] = [:]
+
+    /// Maximum number of concurrent links (active + handshake) retained.
+    /// Bounds the damage from a LINKREQUEST flood.
+    private let maxActiveLinks = 1024
+
+    /// Time a responder link may remain unestablished before it is reaped.
+    private let responderLinkEstablishmentTimeout: TimeInterval = 30
+
     /// Destination link callbacks: destHash -> callback when link is established
     /// Used by LXMF to set up resource handling on inbound links
     private var destinationLinkCallbacks: [Data: @Sendable (Link) async -> Void] = [:]
@@ -1290,6 +1306,58 @@ public actor ReticulumTransport {
     /// establishment, cleared once the LINKREQUEST is dispatched.
     private var routeHints: [Data: RouteHint] = [:]
 
+    /// Paths recently implicated in a failed delivery: destination →
+    /// interfaceId → demoted-until. A locally-live interface can still be
+    /// end-to-end dead (the TCP relay stays connected while the peer drops
+    /// off it; a cached BLE link can outlive the radio). The upper layer
+    /// reports unproven/failed deliveries here and selection avoids the
+    /// implicated wire for a cooldown, so retries rotate onto another path
+    /// instead of re-picking the same dead one.
+    private var demotedPaths: [Data: [String: Date]] = [:]
+
+    /// How long a delivery failure keeps a (destination, interface) path
+    /// out of selection. Long enough to outlive the LXMF retry backoff
+    /// (2.5s), short enough that a transient hiccup recovers on its own.
+    private static let DELIVERY_FAILURE_COOLDOWN: TimeInterval = 30.0
+
+    /// Report that a delivery over the given interface went unproven or
+    /// failed end-to-end. Selection avoids that (destination, interface)
+    /// path until the cooldown lapses or a success clears it.
+    public func reportDeliveryFailure(for destinationHash: Data, interfaceId: String?) {
+        guard let interfaceId, !interfaceId.isEmpty else { return }
+        demotedPaths[destinationHash, default: [:]][interfaceId] =
+            Date().addingTimeInterval(Self.DELIVERY_FAILURE_COOLDOWN)
+        let destHex = destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        logger.info("Delivery failure reported for \(destHex, privacy: .public) via \(interfaceId, privacy: .public); demoting path for \(Self.DELIVERY_FAILURE_COOLDOWN, privacy: .public)s")
+    }
+
+    /// Report a confirmed delivery — clears any demotion for the path so a
+    /// recovered wire is immediately preferred again.
+    public func reportDeliverySuccess(for destinationHash: Data, interfaceId: String?) {
+        if let interfaceId {
+            demotedPaths[destinationHash]?.removeValue(forKey: interfaceId)
+            if demotedPaths[destinationHash]?.isEmpty == true {
+                demotedPaths.removeValue(forKey: destinationHash)
+            }
+        } else {
+            demotedPaths.removeValue(forKey: destinationHash)
+        }
+    }
+
+    /// Whether a (destination, interface) path is currently demoted.
+    /// Lazily expires stale entries.
+    private func isDemoted(_ destinationHash: Data, interfaceId: String) -> Bool {
+        guard let until = demotedPaths[destinationHash]?[interfaceId] else { return false }
+        guard until > Date() else {
+            demotedPaths[destinationHash]?.removeValue(forKey: interfaceId)
+            if demotedPaths[destinationHash]?.isEmpty == true {
+                demotedPaths.removeValue(forKey: destinationHash)
+            }
+            return false
+        }
+        return true
+    }
+
     /// Throughput rank used to order live direct candidates with equal hop
     /// counts: explicit bitrate when configured, otherwise hwMtu as a proxy
     /// (MPC's 1196 over WiFi vastly outpaces BLE's 508 over GATT).
@@ -1306,7 +1374,8 @@ public actor ReticulumTransport {
         return candidates.contains { entry in
             guard !entry.interfaceId.isEmpty,
                   let iface = interfaces[entry.interfaceId],
-                  iface.state == .connected else { return false }
+                  iface.state == .connected,
+                  !isDemoted(destinationHash, interfaceId: entry.interfaceId) else { return false }
             return iface.config.linkClass == linkClass
         }
     }
@@ -1341,10 +1410,18 @@ public actor ReticulumTransport {
         }
         guard !live.isEmpty else { return .noLivePath(stale: candidates) }
 
+        // Skip paths recently implicated in a delivery failure so the retry
+        // rotates onto a different wire. If everything live is demoted,
+        // ignore the demotions — trying a suspect path beats trying nothing.
+        let responsive = live.filter { entry in
+            entry.interfaceId.isEmpty || !isDemoted(destinationHash, interfaceId: entry.interfaceId)
+        }
+        let pool = responsive.isEmpty ? live : responsive
+
         // Direct candidates: re-rank equal-hop entries by throughput so a
         // live MPC (WiFi) peer beats a live BLE peer instead of an arbitrary
         // announce-recency tiebreak.
-        let direct = live
+        let direct = pool
             .filter { !$0.interfaceId.isEmpty && isDirectInterface($0.interfaceId) }
             .sorted { a, b in
                 if a.hopCount != b.hopCount { return a.hopCount < b.hopCount }
@@ -1353,7 +1430,7 @@ public actor ReticulumTransport {
                 if rankA != rankB { return rankA > rankB }
                 return a.timestamp > b.timestamp
             }
-        let indirect = live.filter { $0.interfaceId.isEmpty || !isDirectInterface($0.interfaceId) }
+        let indirect = pool.filter { $0.interfaceId.isEmpty || !isDirectInterface($0.interfaceId) }
 
         let prefersDirect: Bool
         switch routeHints[destinationHash] {
@@ -2061,6 +2138,20 @@ public actor ReticulumTransport {
         let linkIdHex = incomingRequest.linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
         logger.info("Received LINKREQUEST for dest=\(hexPrefix), linkId=\(linkIdHex)")
 
+        // Replay/duplicate guard: a re-sent LINKREQUEST derives the same linkId.
+        // Re-processing it would re-sign a PROOF and overwrite the existing link
+        // (crypto amplification). Drop it if we already have this link.
+        if activeLinks[incomingRequest.linkId] != nil || pendingLinks[incomingRequest.linkId] != nil {
+            logger.debug("Ignoring duplicate LINKREQUEST for linkId=\(linkIdHex)")
+            return
+        }
+
+        // Capacity guard: bound concurrent links to limit LINKREQUEST-flood damage.
+        guard activeLinks.count + pendingLinks.count < maxActiveLinks else {
+            logger.warning("Refusing LINKREQUEST: link table at capacity (\(self.maxActiveLinks))")
+            return
+        }
+
         // Get destination's identity for signing PROOF
         guard let identity = destination.identity else {
             logger.warning("Cannot respond to LINKREQUEST: destination \(hexPrefix, privacy: .public)... has no identity")
@@ -2146,6 +2237,9 @@ public actor ReticulumTransport {
 
             // Store link as pending (waiting for LRRTT to complete establishment)
             activeLinks[incomingRequest.linkId] = link
+            // Arm an establishment deadline so a link that never completes the
+            // handshake is reaped rather than retained forever.
+            responderLinkDeadlines[incomingRequest.linkId] = Date().addingTimeInterval(responderLinkEstablishmentTimeout)
             // H2: Track which interface the link was established on
             await link.setAttachedInterface(interfaceId)
             logger.debug("Link \(linkIdHex) stored in activeLinks, awaiting LRRTT")
@@ -2531,6 +2625,19 @@ public actor ReticulumTransport {
             } else {
                 logger.debug("Destination \(hexPrefix) NOT registered locally, dropping packet")
             }
+            return
+        }
+
+        // Enforce that the packet's claimed destination type matches the
+        // registered destination's type. Without this, a directly-connected
+        // peer can send a DATA packet typed `.plain` at a SINGLE destination's
+        // hash: the `.single` decryption branch below is skipped and raw
+        // attacker bytes are delivered straight to the destination callback,
+        // bypassing identity/ratchet decryption (type confusion). Python RNS
+        // requires `destination.type == packet.destination_type` before
+        // delivery (Transport.py).
+        guard packet.header.destinationType.rawValue == destination.destinationType.rawValue else {
+            logger.warning("Dropping packet for \(hexPrefix, privacy: .public): destination type mismatch (packet=\(String(describing: packet.header.destinationType), privacy: .public), registered=\(String(describing: destination.destinationType), privacy: .public))")
             return
         }
 
@@ -3051,10 +3158,23 @@ public actor ReticulumTransport {
                 }
             }
         }
+        let now = Date()
         for (linkId, link) in activeLinks {
             let linkState = await link.state
             if linkState.isTerminal {
                 activeLinks.removeValue(forKey: linkId)
+                responderLinkDeadlines.removeValue(forKey: linkId)
+                continue
+            }
+            // Reap responder links that never completed the handshake by their
+            // deadline. Once established (.active/.stale) the deadline is cleared
+            // so the normal keep-alive watchdog governs the link's lifetime.
+            if linkState.isEstablished {
+                responderLinkDeadlines.removeValue(forKey: linkId)
+            } else if let deadline = responderLinkDeadlines[linkId], now > deadline {
+                responderLinkDeadlines.removeValue(forKey: linkId)
+                activeLinks.removeValue(forKey: linkId)
+                await link.close(reason: TeardownReason.timeout)
             }
         }
     }

@@ -56,6 +56,12 @@ public actor RatchetManager {
     /// Array of 32-byte X25519 private keys, newest first
     private var ratchets: [Data] = []
 
+    /// Generation timestamp (epoch seconds) of each ratchet, parallel to
+    /// `ratchets` (newest first). Used to enforce `RATCHET_EXPIRY` so stale
+    /// private keys are dropped rather than retained indefinitely (forward
+    /// secrecy). Persisted alongside the keys.
+    private var ratchetTimes: [TimeInterval] = []
+
     /// Timestamp of most recent ratchet generation
     private var latestRatchetTime: TimeInterval = 0
 
@@ -86,18 +92,24 @@ public actor RatchetManager {
         if FileManager.default.fileExists(atPath: storagePath) {
             do {
                 let loaded = try load()
-                self.ratchets = loaded
-                self.latestRatchetTime = Date().timeIntervalSince1970
+                self.ratchets = loaded.ratchets
+                self.ratchetTimes = loaded.times
+                self.latestRatchetTime = ratchetTimes.first ?? Date().timeIntervalSince1970
+                // Drop any ratchets older than RATCHET_EXPIRY before use.
+                expireOldRatchets()
             } catch {
                 // Corrupted file — start fresh
                 self.ratchets = []
+                self.ratchetTimes = []
             }
         }
 
         if ratchets.isEmpty {
             let newKey = RatchetManager.generateRatchet()
+            let now = Date().timeIntervalSince1970
             ratchets.insert(newKey, at: 0)
-            latestRatchetTime = Date().timeIntervalSince1970
+            ratchetTimes.insert(now, at: 0)
+            latestRatchetTime = now
             try persist()
         }
     }
@@ -117,11 +129,16 @@ public actor RatchetManager {
 
         let newKey = RatchetManager.generateRatchet()
         ratchets.insert(newKey, at: 0)
+        ratchetTimes.insert(now, at: 0)
 
-        // Trim to max count
+        // Trim to max count (both arrays stay in lockstep)
         if ratchets.count > RatchetManager.RATCHET_COUNT {
             ratchets = Array(ratchets.prefix(RatchetManager.RATCHET_COUNT))
+            ratchetTimes = Array(ratchetTimes.prefix(RatchetManager.RATCHET_COUNT))
         }
+
+        // Drop ratchets past their expiry window.
+        expireOldRatchets()
 
         latestRatchetTime = now
 
@@ -132,6 +149,28 @@ public actor RatchetManager {
         }
 
         return true
+    }
+
+    /// Remove ratchets older than `RATCHET_EXPIRY`, always retaining the newest.
+    ///
+    /// Retaining expired private keys weakens forward secrecy: a compromise of
+    /// on-disk/in-memory state would expose keys far past their intended window.
+    private func expireOldRatchets() {
+        guard !ratchets.isEmpty else { return }
+        let cutoff = Date().timeIntervalSince1970 - RatchetManager.RATCHET_EXPIRY
+        var keptRatchets: [Data] = []
+        var keptTimes: [TimeInterval] = []
+        for (index, time) in ratchetTimes.enumerated() where index < ratchets.count {
+            // Always keep the newest ratchet even if the clock looks skewed.
+            if index == 0 || time >= cutoff {
+                keptRatchets.append(ratchets[index])
+                keptTimes.append(time)
+            }
+        }
+        if keptRatchets.count != ratchets.count {
+            ratchets = keptRatchets
+            ratchetTimes = keptTimes
+        }
     }
 
     /// Get the public key bytes of the current (newest) ratchet.
@@ -213,10 +252,14 @@ public actor RatchetManager {
             throw RatchetError.persistenceFailed("Signing failed: \(error)")
         }
 
-        // Pack outer container
+        // Pack outer container. "ratchet_times" is an additive, unsigned field
+        // (Python RNS ignores unknown keys, preserving interop); it only governs
+        // local expiry timing, so it is not part of the signed key material.
+        let timesValue = MessagePackValue.array(ratchetTimes.map { MessagePackValue.double($0) })
         let container: MessagePackValue = .map([
             .string("signature"): .binary(signature),
-            .string("ratchets"): .binary(ratchetsPacked)
+            .string("ratchets"): .binary(ratchetsPacked),
+            .string("ratchet_times"): timesValue
         ])
         let packed = packMsgPack(container)
 
@@ -230,8 +273,10 @@ public actor RatchetManager {
 
     /// Load ratchets from disk, verifying the signature.
     ///
-    /// - Returns: Array of 32-byte private keys
-    private func load() throws -> [Data] {
+    /// - Returns: The 32-byte private keys (newest first) and their parallel
+    ///   generation timestamps. Timestamps are synthesized conservatively when
+    ///   absent (e.g. a file written by Python RNS or an older build).
+    private func load() throws -> (ratchets: [Data], times: [TimeInterval]) {
         let fileData: Data
         do {
             fileData = try Data(contentsOf: URL(fileURLWithPath: storagePath))
@@ -259,9 +304,33 @@ public actor RatchetManager {
             throw RatchetError.loadFailed("Invalid ratchets format")
         }
 
-        return ratchetArray.compactMap { value -> Data? in
+        let ratchets = ratchetArray.compactMap { value -> Data? in
             guard case .binary(let keyData) = value, keyData.count == 32 else { return nil }
             return keyData
         }
+
+        // Parse parallel timestamps if present and consistent; otherwise
+        // synthesize newest-first, spaced by the rotation interval. Synthesized
+        // ages stay within RATCHET_EXPIRY for the retained count, so nothing is
+        // wrongly expired on first load of a legacy/Python file.
+        var times: [TimeInterval] = []
+        if case .array(let timeArray)? = dict[.string("ratchet_times")],
+           timeArray.count == ratchets.count {
+            for value in timeArray {
+                switch value {
+                case .double(let d): times.append(d)
+                case .float(let f): times.append(TimeInterval(f))
+                case .uint(let u): times.append(TimeInterval(u))
+                case .int(let i): times.append(TimeInterval(i))
+                default: times.append(0)
+                }
+            }
+        }
+        if times.count != ratchets.count {
+            let now = Date().timeIntervalSince1970
+            times = ratchets.indices.map { now - Double($0) * RatchetManager.RATCHET_INTERVAL }
+        }
+
+        return (ratchets, times)
     }
 }

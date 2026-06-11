@@ -111,6 +111,10 @@ public actor PipeInterface: @preconcurrency NetworkInterface {
     private func processChunk(_ chunk: Data) {
         buffer.append(chunk)
         let frames = HDLC.extractFrames(from: &buffer)
+        // Discard an un-terminated frame that grows the buffer without bound.
+        if buffer.count > 512 * 1024 {
+            buffer.removeAll(keepingCapacity: false)
+        }
         for frame in frames {
             bytesReceived += UInt64(frame.count)
             _delegate?.interface(id: id, didReceivePacket: frame)

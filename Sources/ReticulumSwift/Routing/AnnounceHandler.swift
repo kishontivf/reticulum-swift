@@ -95,6 +95,13 @@ public actor AnnounceHandler {
     /// rebroadcasting at most once per unique announce packet.
     private var seenAnnounces: [Data: Set<String>] = [:]
 
+    /// Insertion order of `seenAnnounces` keys, used for FIFO eviction.
+    ///
+    /// Evicting an arbitrary key (`keys.first`) lets an attacker flooding unique
+    /// announce hashes evict a specific legitimate entry, bypassing dedup. FIFO
+    /// eviction removes the genuinely oldest entries instead.
+    private var seenAnnouncesOrder: [Data] = []
+
     /// Maximum hop count allowed (Reticulum standard is 128).
     public let maxHops: UInt8 = TransportConstants.PATHFINDER_M
 
@@ -164,10 +171,13 @@ public actor AnnounceHandler {
         } catch {
             logger.warning("Parse/validate error: \(error)")
             // Determine if it's a format or signature error
-            if error is AnnounceValidationError {
-                let validationError = error as! AnnounceValidationError
-                if validationError == .signatureInvalid {
+            if let validationError = error as? AnnounceValidationError {
+                switch validationError {
+                case .signatureInvalid, .hashMismatch:
+                    // A failed key↔destination binding means a forged/spoofed announce.
                     return .ignored(reason: .invalidSignature)
+                default:
+                    break
                 }
             }
             return .ignored(reason: .invalidFormat)
@@ -266,17 +276,23 @@ public actor AnnounceHandler {
     ///   - hash: Hash to add
     ///   - interfaceId: Interface that delivered this copy of the announce
     private func addToSeenAnnounces(_ hash: Data, interfaceId: String) {
-        // Prune if over max size (remove oldest by removing arbitrary element)
-        if seenAnnounces.count >= seenAnnouncesMaxSize {
+        let isNewKey = seenAnnounces[hash] == nil
+
+        // Prune if over max size, evicting the oldest entries first (FIFO).
+        if isNewKey && seenAnnounces.count >= seenAnnouncesMaxSize {
             // Remove approximately 10% of entries to avoid frequent pruning
-            let removeCount = seenAnnouncesMaxSize / 10
+            let removeCount = max(1, seenAnnouncesMaxSize / 10)
             for _ in 0..<removeCount {
-                if let first = seenAnnounces.keys.first {
-                    seenAnnounces.removeValue(forKey: first)
-                }
+                guard !seenAnnouncesOrder.isEmpty else { break }
+                let oldest = seenAnnouncesOrder.removeFirst()
+                seenAnnounces.removeValue(forKey: oldest)
             }
         }
+
         seenAnnounces[hash, default: []].insert(interfaceId)
+        if isNewKey {
+            seenAnnouncesOrder.append(hash)
+        }
     }
 
     /// Create a rebroadcast packet with incremented hop count.
@@ -323,5 +339,6 @@ public actor AnnounceHandler {
     /// Clear all seen announces (for testing).
     public func clearSeen() {
         seenAnnounces.removeAll()
+        seenAnnouncesOrder.removeAll()
     }
 }

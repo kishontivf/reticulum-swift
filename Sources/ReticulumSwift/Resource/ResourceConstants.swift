@@ -121,6 +121,21 @@ public enum ResourceConstants {
     /// This is 64 MB.
     public static let AUTO_COMPRESS_MAX_SIZE: Int = 64 * 1024 * 1024
 
+    /// Absolute hard cap on the advertised transfer/data size of an INBOUND resource.
+    ///
+    /// A remote peer fully controls the advertisement's size and part-count
+    /// fields. Without a ceiling, an advertised size/`numParts` drives unbounded
+    /// buffer allocation (memory-exhaustion DoS). 64 MB is far above any
+    /// legitimate message/attachment while keeping allocations bounded.
+    public static let MAX_TRANSFER_SIZE: Int = 64 * 1024 * 1024
+
+    /// Absolute hard cap on the number of parts in an INBOUND resource.
+    ///
+    /// `numParts` is allocated as two arrays up front, so it must be bounded
+    /// independently of the size fields. Each part carries link-MDU-sized
+    /// payload, so 1M parts comfortably covers `MAX_TRANSFER_SIZE`.
+    public static let MAX_PARTS: Int = 1_000_000
+
     // MARK: - Timing Constants
 
     /// Timeout waiting for resource proof (seconds).

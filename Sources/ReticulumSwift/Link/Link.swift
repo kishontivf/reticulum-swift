@@ -20,8 +20,13 @@ import os.log
 
 private let linkLogger = Logger(subsystem: "com.columba.app", category: "Link")
 
-/// File-based debug logger for resource diagnostics
+/// File-based debug logger for resource diagnostics.
+///
+/// Gated behind DEBUG: in release builds this is a no-op. The previous
+/// always-on behavior wrote every resource packet to an unbounded temp file
+/// (disk-fill + transfer-metadata leak).
 private func resourceDebugLog(_ message: String) {
+    #if DEBUG
     let timestamp = ISO8601DateFormatter().string(from: Date())
     let line = "[\(timestamp)] \(message)\n"
     let url = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("columba_resource_debug.log")
@@ -32,6 +37,7 @@ private func resourceDebugLog(_ message: String) {
     } else {
         try? Data(line.utf8).write(to: url)
     }
+    #endif
 }
 
 // MARK: - Link
@@ -740,6 +746,12 @@ public actor Link {
 
             // Convert SharedSecret to Data for HKDF
             let sharedSecretData = sharedSecret.withUnsafeBytes { Data($0) }
+
+            // X25519 accepts low-order/invalid peer keys that can force an
+            // all-zero (attacker-known) shared secret on the link handshake.
+            guard sharedSecretData.contains(where: { $0 != 0 }) else {
+                throw LinkError.keyDerivationFailed
+            }
 
             // Derive 64-byte key using HKDF
             // Salt: linkId, Context: nil (RNS standard)

@@ -229,7 +229,12 @@ extension ResourceAdvertisement {
             return d
         }
 
-        return ResourceAdvertisement(
+        let flagsValue = try getInt("f")
+        guard flagsValue >= 0, flagsValue <= 0xff else {
+            throw MessagePackError.decodingFailed("Invalid flags value")
+        }
+
+        let advertisement = ResourceAdvertisement(
             transferSize: try getInt("t"),
             dataSize: try getInt("d"),
             numParts: try getInt("n"),
@@ -239,9 +244,45 @@ extension ResourceAdvertisement {
             segmentIndex: try getInt("i"),
             totalSegments: try getInt("l"),
             requestId: getOptionalBinary("q"),
-            flags: ResourceFlags(rawValue: UInt8(try getInt("f"))),
+            flags: ResourceFlags(rawValue: UInt8(flagsValue)),
             hashmapChunk: try getBinary("m")
         )
+        try advertisement.validateInbound()
+        return advertisement
+    }
+
+    /// Validate the size/count fields of an advertisement received from an
+    /// untrusted peer before it is used to allocate buffers.
+    ///
+    /// These fields are attacker-controlled; a negative or oversized value would
+    /// otherwise trap (`Array(repeating:count:)` with a negative count) or trigger
+    /// a multi-gigabyte allocation in `Resource(advertisement:)`.
+    ///
+    /// - Throws: `MessagePackError.decodingFailed` if any field is out of range.
+    public func validateInbound() throws {
+        guard transferSize >= 0, transferSize <= ResourceConstants.MAX_TRANSFER_SIZE else {
+            throw MessagePackError.decodingFailed("Advertised transferSize out of range: \(transferSize)")
+        }
+        guard dataSize >= 0, dataSize <= ResourceConstants.MAX_TRANSFER_SIZE else {
+            throw MessagePackError.decodingFailed("Advertised dataSize out of range: \(dataSize)")
+        }
+        guard numParts >= 0, numParts <= ResourceConstants.MAX_PARTS else {
+            throw MessagePackError.decodingFailed("Advertised numParts out of range: \(numParts)")
+        }
+        // Every part carries at least one byte of transfer payload, so the part
+        // count can never legitimately exceed the transfer size.
+        guard numParts <= transferSize else {
+            throw MessagePackError.decodingFailed("Advertised numParts (\(numParts)) exceeds transferSize (\(transferSize))")
+        }
+        guard segmentIndex >= 0, totalSegments >= 0,
+              totalSegments <= ResourceConstants.MAX_PARTS,
+              segmentIndex <= totalSegments else {
+            throw MessagePackError.decodingFailed("Advertised segment fields out of range: \(segmentIndex)/\(totalSegments)")
+        }
+        // The hashmap chunk must not claim more part hashes than there are parts.
+        guard hashmapChunk.count <= numParts * ResourceConstants.MAPHASH_LEN || numParts == 0 else {
+            throw MessagePackError.decodingFailed("Hashmap chunk larger than numParts allows")
+        }
     }
 }
 

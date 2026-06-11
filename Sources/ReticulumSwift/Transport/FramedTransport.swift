@@ -47,6 +47,14 @@ public class FramedTransport: Transport {
     /// Lock for thread-safe buffer access
     private let bufferLock = NSLock()
 
+    /// Maximum size the reassembly buffer may reach before it is discarded.
+    ///
+    /// `HDLC.extractFrames` only consumes bytes once a closing flag is seen, so
+    /// a peer that opens a frame and then streams bytes without ever closing it
+    /// would otherwise grow `receiveBuffer` without bound (remote OOM). A
+    /// legitimate frame never exceeds the link MTU; 512 KB is a generous ceiling.
+    private let maxReceiveBufferSize = 512 * 1024
+
     // MARK: - Transport Protocol
 
     public var state: TransportState {
@@ -129,6 +137,12 @@ public class FramedTransport: Transport {
 
         // Extract all complete frames from buffer
         let frames = HDLC.extractFrames(from: &receiveBuffer)
+
+        // Guard against an un-terminated frame growing the buffer without bound.
+        if receiveBuffer.count > maxReceiveBufferSize {
+            logger.warning("Receive buffer exceeded \(self.maxReceiveBufferSize, privacy: .public) bytes with no complete frame; discarding")
+            receiveBuffer.removeAll(keepingCapacity: false)
+        }
         bufferLock.unlock()
 
         logger.debug("Extracted \(frames.count, privacy: .public) frame(s), buffer remaining: \(self.receiveBuffer.count, privacy: .public) bytes")

@@ -308,6 +308,10 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
     private var _modeOverride: InterfaceMode?
     private var _delegate: InterfaceDelegate?
     private var _spawnedPeers: [String: TCPSpawnedPeerInterface] = [:]
+    /// Upper bound on concurrently spawned inbound peers. Without a cap, a peer
+    /// can open unbounded connections (each holding a receive buffer) to exhaust
+    /// file descriptors and memory. Connections past this limit are dropped.
+    private let maxSpawnedPeers = 512
     private var listener: NWListener?
     private let queue: DispatchQueue
 
@@ -452,6 +456,16 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
     }
 
     private func spawn(for connection: NWConnection) {
+        // Reject the connection if we are already at the peer cap (DoS guard).
+        lock.lock()
+        let atCapacity = _spawnedPeers.count >= maxSpawnedPeers
+        lock.unlock()
+        if atCapacity {
+            tcpServerLogger.warning("Refusing inbound connection: spawned-peer cap (\(self.maxSpawnedPeers, privacy: .public)) reached")
+            connection.cancel()
+            return
+        }
+
         // Generate a unique spawned-peer id so the Transport-level
         // interface map keyed by `id` stays unique.
         let suffix = Data((0..<4).map { _ in UInt8.random(in: 0...255) })

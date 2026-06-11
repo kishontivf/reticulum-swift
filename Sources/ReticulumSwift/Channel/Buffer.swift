@@ -83,6 +83,12 @@ public actor RawChannelReader {
     private var eof: Bool = false
     private var waiters: [CheckedContinuation<Data?, Never>] = []
 
+    /// Maximum bytes buffered from un-consumed stream data before new data is
+    /// dropped. A peer can push StreamDataMessages faster than the app reads;
+    /// without a ceiling the buffer grows without bound (memory DoS). 4 MB is
+    /// well above any reasonable in-flight window.
+    private let maxBufferSize = 4 * 1024 * 1024
+
     public init() {}
 
     /// Read up to `count` bytes. Returns nil at EOF with empty buffer.
@@ -101,7 +107,10 @@ public actor RawChannelReader {
 
     /// Called by Channel when StreamDataMessage arrives.
     func receive(data: Data, eof: Bool) {
-        buffer.append(data)
+        // Apply backpressure by dropping data once the un-consumed buffer is full.
+        if buffer.count + data.count <= maxBufferSize {
+            buffer.append(data)
+        }
         if eof { self.eof = true }
         if let waiter = waiters.first {
             waiters.removeFirst()

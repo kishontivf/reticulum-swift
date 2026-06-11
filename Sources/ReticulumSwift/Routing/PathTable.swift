@@ -78,6 +78,14 @@ public actor PathTable {
     /// Paths indexed by destination hash, then by interface id (in-memory cache)
     private var paths: [Data: [String: PathEntry]] = [:]
 
+    /// Maximum number of distinct destinations retained in the in-memory path table.
+    ///
+    /// Announces are cheap to generate, so without a cap an attacker could install
+    /// an unbounded number of long-lived (up to 7-day) routes, exhausting memory.
+    /// When exceeded, expired destinations are dropped first, then the
+    /// soonest-to-expire ones.
+    private let maxDestinations = 8192
+
     /// SQLite database handle for persistence
     private var db: OpaquePointer?
 
@@ -242,7 +250,8 @@ public actor PathTable {
 
         guard let existing = bucket[entry.interfaceId] else {
             if bucket.isEmpty {
-                // Path 1: Unknown destination → accept
+                // Path 1: Unknown destination → accept (bounding total destinations first)
+                evictDestinationsForCapacityIfNeeded()
                 paths[key] = [entry.interfaceId: entry]
                 pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
                 saveToDatabase(entry)
@@ -334,6 +343,34 @@ public actor PathTable {
         pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
         saveToDatabase(updated)
         pathUpdateContinuation?.yield(updated)
+    }
+
+    /// Evict destinations when the in-memory table reaches its capacity.
+    ///
+    /// Drops fully-expired destinations first; if still over capacity (active
+    /// flood), evicts the destinations whose newest path expires soonest. Only
+    /// affects the in-memory cache (not the local persistence DB).
+    private func evictDestinationsForCapacityIfNeeded() {
+        guard paths.count >= maxDestinations else { return }
+        let now = Date()
+
+        for (key, bucket) in paths where bucket.values.allSatisfy({ now >= $0.expires }) {
+            paths.removeValue(forKey: key)
+            pathStates.removeValue(forKey: key)
+        }
+
+        if paths.count >= maxDestinations {
+            let removeCount = (paths.count - maxDestinations) + maxDestinations / 10
+            let ranked = paths.sorted { lhs, rhs in
+                let l = lhs.value.values.map { $0.expires }.max() ?? .distantPast
+                let r = rhs.value.values.map { $0.expires }.max() ?? .distantPast
+                return l < r
+            }
+            for (key, _) in ranked.prefix(removeCount) {
+                paths.removeValue(forKey: key)
+                pathStates.removeValue(forKey: key)
+            }
+        }
     }
 
     /// Merge a new blob into existing blobs list, capped at MAX_RANDOM_BLOBS.

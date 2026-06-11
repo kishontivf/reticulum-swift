@@ -227,6 +227,32 @@ public enum AnnounceValidator {
         }
 
         logger.debug("Signature verification PASSED")
+
+        // Bind the announced public keys to the destination hash.
+        //
+        // The signature above only proves the announce is self-consistent for the
+        // signing key carried *inside* the announce. Without also proving those keys
+        // own the claimed destination hash, an attacker can sign an announce with
+        // their own keypair while placing a victim's destination hash in the header,
+        // poisoning the path table (route hijack / MITM).
+        //
+        // RNS Identity.validate_announce requires:
+        //   destination_hash == truncated_hash(name_hash || truncated_hash(public_keys))
+        let announcedIdentityHash = Hashing.truncatedHash(publicKeys)
+        var hashMaterial = Data()
+        hashMaterial.append(parsed.nameHash)
+        hashMaterial.append(announcedIdentityHash)
+        let expectedHash = Hashing.truncatedHash(hashMaterial)
+
+        guard expectedHash == parsed.destinationHash else {
+            logger.warning("Announce destination-hash binding FAILED: keys do not own claimed destination")
+            throw AnnounceValidationError.hashMismatch(
+                computed: expectedHash.hexString,
+                expected: parsed.destinationHash.hexString
+            )
+        }
+
+        logger.debug("Destination-hash binding PASSED")
         return true
     }
 

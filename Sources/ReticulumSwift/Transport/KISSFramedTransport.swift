@@ -173,6 +173,12 @@ public class KISSFramedTransport: Transport {
 
         // Extract all complete frames from buffer
         let frames = extractKISSFrames(from: &receiveBuffer)
+
+        // Guard against an un-terminated frame growing the buffer without bound
+        // (remote OOM). A legitimate KISS frame never exceeds the link MTU.
+        if receiveBuffer.count > 512 * 1024 {
+            receiveBuffer.removeAll(keepingCapacity: false)
+        }
         bufferLock.unlock()
 
         // Deliver each frame to appropriate callback

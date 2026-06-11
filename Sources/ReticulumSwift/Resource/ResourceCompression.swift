@@ -170,11 +170,21 @@ public enum ResourceCompression {
             return Data()
         }
 
+        // Absolute ceiling on the decompressed output buffer. bzip2 can expand
+        // by >1000:1, so without a cap a small crafted "decompression bomb" part
+        // would drive escalating multi-gigabyte allocations (memory-exhaustion
+        // DoS). Bound the output to the same hard limit applied to inbound
+        // resource sizes.
+        let maxBufferSize = ResourceConstants.MAX_TRANSFER_SIZE
+
         // Start with expected size or 4x input as estimate
         var bufferSize = expectedSize ?? (data.count * 4)
         // Minimum buffer to avoid trivially small allocations
         if bufferSize < 1024 {
             bufferSize = 1024
+        }
+        if bufferSize > maxBufferSize {
+            bufferSize = maxBufferSize
         }
 
         let maxAttempts = 6
@@ -202,10 +212,10 @@ public enum ResourceCompression {
                 let resultData = Data(bytes: destBuffer, count: Int(destLen))
                 destBuffer.deallocate()
                 return resultData
-            } else if result == BZ_OUTBUFF_FULL && attempt < maxAttempts - 1 {
-                // Double buffer and retry
+            } else if result == BZ_OUTBUFF_FULL && attempt < maxAttempts - 1 && bufferSize < maxBufferSize {
+                // Double buffer and retry, but never exceed the absolute ceiling.
                 destBuffer.deallocate()
-                bufferSize *= 2
+                bufferSize = min(bufferSize * 2, maxBufferSize)
                 continue
             } else {
                 destBuffer.deallocate()

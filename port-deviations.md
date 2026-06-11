@@ -98,6 +98,17 @@ route-selection state only — **wire behavior is unchanged**:
   "link traffic never escapes the attached interface" invariant.
   `Link.invalidate(reason: .attachedInterfaceClosed)` tears down such
   links without emitting LINKCLOSE.
+- **Per-path delivery-failure demotion** (`reportDeliveryFailure` /
+  `reportDeliverySuccess`, `demotedPaths`): a locally-connected interface
+  can be end-to-end dead — the TCP relay stays up while the peer drops off
+  it, and a link reports `.active` for minutes after its wire died. LXMF
+  reports unproven/failed deliveries with the interface that carried them;
+  selection (and `hasLivePath`, which gates the size-aware
+  `.preferIndirect` hint) skips the implicated (destination, interface)
+  path for a 30s cooldown so retries rotate onto the other wire. If every
+  live path is demoted the filter is ignored. Python's per-destination
+  `path_states` (`PATH_STATE_UNRESPONSIVE`) is kept untouched alongside;
+  this is finer-grained, in-memory-only, and changes nothing on the wire.
 
 ## Resolved deviations
 

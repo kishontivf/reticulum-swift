@@ -55,9 +55,17 @@ public enum ResourceHashmap {
     ///   - index: Part index (0-based)
     /// - Returns: 4-byte expected hash from hashmap
     public static func getPartHash(from hashmap: Data, at index: Int) -> Data {
+        guard index >= 0 else { return Data() }
         let startByte = index * ResourceConstants.MAPHASH_LEN
         let endByte = startByte + ResourceConstants.MAPHASH_LEN
-        return hashmap[startByte..<endByte]
+        // Bounds-check against the actual hashmap length: `index` derives from
+        // `numParts`, which is attacker-controlled and may exceed the hashmap
+        // bytes actually received. Re-base on startIndex so the slice is valid
+        // even when `hashmap` is itself a Data slice. An out-of-range request
+        // returns empty (→ hash mismatch at the caller) instead of trapping.
+        guard endByte <= hashmap.count else { return Data() }
+        let base = hashmap.startIndex
+        return Data(hashmap[(base + startByte)..<(base + endByte)])
     }
 
     // MARK: - Hashmap Generation
