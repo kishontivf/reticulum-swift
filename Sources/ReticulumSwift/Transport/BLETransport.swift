@@ -149,6 +149,29 @@ public final class BLETransport: Transport {
 
             self.updateState(.connecting)
 
+            // Reuse an already-connected peripheral instead of scanning. A peripheral
+            // that is already connected (CoreBluetooth restored it across an app/NE
+            // relaunch via state preservation, or it simply never dropped) does NOT
+            // advertise, so a scan for it never completes and hits the connection
+            // timeout — the Model-B failure mode where the restored subscription keeps
+            // delivering data while a fresh scan spins fruitlessly and the interface
+            // never reaches `.connected`. `connect()` on an already-connected peripheral
+            // re-fires didConnect, driving the normal discover → `.connected` flow.
+            if let target = self.targetDeviceName {
+                let nusUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+                let alreadyConnected = manager.retrieveConnectedPeripherals(withServices: [nusUUID])
+                    .first { $0.name == target }
+                    ?? (self.peripheral?.state == .connected ? self.peripheral : nil)
+                if let existing = alreadyConnected {
+                    self.logger.error("[BLETRANS] '\(target, privacy: .public)' already connected — reusing (no scan)")
+                    self.peripheral = existing
+                    existing.delegate = self.delegateWrapper
+                    manager.connect(existing, options: nil)
+                    self.startConnectionTimeout()
+                    return
+                }
+            }
+
             let isScanOnly = (self.targetDeviceName == nil)
 
             if isScanOnly {
