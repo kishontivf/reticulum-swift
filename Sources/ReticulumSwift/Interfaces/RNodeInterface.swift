@@ -1260,6 +1260,20 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
                 // Check if cancelled during sleep
                 if Task.isCancelled { return }
 
+                // If a connection already came up while this reconnect delay was pending,
+                // do NOT reconnect: attemptReconnect() builds a fresh transport and would
+                // orphan the live link mid-configureDevice. This is the race that kept the
+                // RNode looping between BLE-connected and reconnecting once BLETransport
+                // started reusing an already-connected peripheral — the link reaches
+                // .connected, configureDevice() begins its ~2s firmware-init wait, and this
+                // still-pending loop would tear it down before the detect handshake. Bail.
+                let alreadyConnected = (await self.state == .connected)
+                let nowConfiguring = await self.isConfiguring
+                if alreadyConnected || nowConfiguring {
+                    await self.clearReconnectTask()
+                    return
+                }
+
                 // Attempt reconnection (starts BLE scan, returns immediately)
                 await self.attemptReconnect()
 

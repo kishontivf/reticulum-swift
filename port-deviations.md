@@ -225,6 +225,29 @@ control are untouched; only the source of the inner byte-transport is injectable
 The default preserves the previous behaviour exactly (`BLETransport` from
 `config.host`).
 
+### `RNodeInterface` async reconnect loop — guard against reconnecting a live link
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/RNodeInterface.swift` —
+`startReconnectLoop()` (the `reconnectTask` loop, `attemptReconnect`, phase-1/2
+waits) and the guard added before `attemptReconnect()`.
+
+**Python reference:** `../Reticulum/RNS/Interfaces/RNodeInterface.py` —
+`reconnect_port()`/the reconnect path gated by `self.reconnecting` (`:208`, `:358`
+`if not self.detached and not self.reconnecting:`) and `self.online` (`:462`).
+
+**Reason:** Category (a) — language/runtime. Python reconnects from a dedicated
+thread (`reconnect_port`), serialized by the `reconnecting` flag; the swift port
+expresses this as a single `reconnectTask` (`Task` + `ExponentialBackoff`). The
+guard added before `attemptReconnect()` — bail if `state == .connected ||
+isConfiguring` — restores python's invariant that a reconnect cycle never tears
+down a link that is already up/configuring (python only reconnects from the
+read-loop's disconnect/error path, never while `online`). Without it the async
+loop could fire its pending `attemptReconnect()` (which builds a fresh transport)
+just as `BLETransport` reused an already-connected peripheral and `configureDevice()`
+began its firmware-init wait, orphaning the live link mid-detect. No semantic
+change vs python; it makes the async port honour the same "don't reconnect a live
+link" guarantee.
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)
