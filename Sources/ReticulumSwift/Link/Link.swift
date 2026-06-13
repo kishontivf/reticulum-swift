@@ -1811,7 +1811,17 @@ public actor Link {
                 await resourceCallbacks?.resourceConcluded(next)
             }
         } catch {
+            // A prepareNextSegment failure leaves `current` owning the shared staging
+            // tempfile (transferInputFileOwnership never ran), so without this the file
+            // leaks. Unlink it (python closes/unlinks input_file on resource failure,
+            // RNS/Resource.py). Unlike the sendAdvertisement path above we do NOT fire
+            // resourceConcluded here: `current` already concluded `.complete` at the
+            // proof-validation site, so re-firing would be a callback double-fire. The
+            // remaining-chain-failure signal is a separate per-segment-model gap (no
+            // per-resource watchdog yet) — to be addressed by a timeout, not by
+            // double-concluding a completed segment.
             linkLogger.error("Failed to prepare next segment: \(error, privacy: .public)")
+            await current.cleanup()
         }
     }
 
