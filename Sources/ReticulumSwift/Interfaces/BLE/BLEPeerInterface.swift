@@ -422,8 +422,14 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
             try? await sendProbe(BLEMeshConstants.probePingByte,
                                  nonce: UInt8(truncatingIfNeeded: Int(Date().timeIntervalSince1970)))
         }
-        if probeCapable && idle > BLEMeshConstants.dataPathTimeout {
-            logger.warning("data-path dead for \(self.peerIdentityHex.prefix(8), privacy: .public) — no real data for \(Int(idle), privacy: .public)s, reconnecting")
+        // Re-read `lastRealData` after the await: this is an actor reentrancy
+        // point, so the probe's PONG (or any real traffic) may have refreshed it
+        // via `handleProbeFrame` while `sendProbe` was suspended. Deciding on the
+        // stale pre-await `idle` here would force-disconnect a link that just
+        // answered the PING — the spurious-reconnect-on-healthy-link bug.
+        let currentIdle = Date().timeIntervalSince(lastRealData)
+        if probeCapable && currentIdle > BLEMeshConstants.dataPathTimeout {
+            logger.warning("data-path dead for \(self.peerIdentityHex.prefix(8), privacy: .public) — no real data for \(Int(currentIdle), privacy: .public)s, reconnecting")
             probeCapable = false
             onDataPathDead?(peerIdentityHex)
         }
