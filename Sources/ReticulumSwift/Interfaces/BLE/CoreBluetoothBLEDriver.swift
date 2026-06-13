@@ -227,7 +227,11 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             return activeConnectCount == 1 && scanRequested
         }
         if pauseScan {
-            centralManager.stopScan()
+            // Route CB scan control through bleQueue (like disconnect()/shutdown()):
+            // the manager's queue serializes it against the didDiscover/didConnect
+            // callbacks. connect() runs on the BLEInterface actor's executor, so a
+            // direct call here would touch CoreBluetooth from the wrong thread.
+            bleQueue.sync { centralManager.stopScan() }
             bleDiag("connect: paused scan for \(address.prefix(8))")
         }
         defer {
@@ -236,10 +240,13 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
                 return activeConnectCount == 0 && scanRequested
             }
             if resumeScan {
-                centralManager.scanForPeripherals(
-                    withServices: [BLEMeshConstants.serviceUUID],
-                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
-                )
+                // Same threading domain as the pause above — resume on bleQueue.
+                bleQueue.sync {
+                    centralManager.scanForPeripherals(
+                        withServices: [BLEMeshConstants.serviceUUID],
+                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                    )
+                }
                 bleDiag("connect: resumed scan after \(address.prefix(8))")
             }
         }

@@ -35,7 +35,12 @@ public final class TCPTransport: Transport {
     /// did bind an NE-created connection to our own utun. `false` preserves
     /// stock behavior. Process-global; iOS-NE-specific, no Python-reference
     /// equivalent (see port-deviations.md).
-    public static var bypassTunnelEgress = false
+    ///
+    /// `nonisolated(unsafe)`: deliberately a set-once-before-any-transport global (the
+    /// host flips it at startup); reads in `init` are safe by that contract. The
+    /// annotation makes the unguarded-shared intent explicit and satisfies strict
+    /// concurrency without a lock for a flag that is never mutated after init.
+    nonisolated(unsafe) public static var bypassTunnelEgress = false
 
     // MARK: - Properties
 
