@@ -1795,9 +1795,23 @@ public actor Link {
             let nextTotal = await next.totalSegments
             let nextHashHex = nextHash.prefix(8).map { String(format: "%02x", $0) }.joined()
             linkLogger.info("Advertising segment \(nextIdx, privacy: .public)/\(nextTotal, privacy: .public) hash=\(nextHashHex, privacy: .public)")
-            try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+            do {
+                try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+            } catch {
+                // Python __advertise_job calls self.cancel() on an advertise failure
+                // (RNS/Resource.py:536-538). `next` is already in outboundResources and
+                // owns the staging tempfile (transferInputFileOwnership ran), and the
+                // receiver never saw the advertisement — so just logging would stall the
+                // whole multi-segment transfer permanently (no retry/self-timeout) and
+                // leak the tempfile. Mirror cancel(): drop tracking, unlink the staging
+                // file, and conclude so the caller observes the failure.
+                linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
+                outboundResources.removeValue(forKey: nextHash)
+                await next.cleanup()
+                await resourceCallbacks?.resourceConcluded(next)
+            }
         } catch {
-            linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
+            linkLogger.error("Failed to prepare next segment: \(error, privacy: .public)")
         }
     }
 
