@@ -80,8 +80,17 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     /// Hardware MTU — matches Python RNodeInterface.HW_MTU
     public var hwMtu: Int { 508 }
 
-    /// Underlying KISS-framed transport (wraps BLETransport)
+    /// Underlying KISS-framed transport (wraps the inner transport)
     private var transport: KISSFramedTransport?
+
+    /// Factory for the inner (pre-KISS) transport. Defaults to `BLETransport`
+    /// (direct CoreBluetooth NUS). A host process can inject a different transport
+    /// here — e.g. Columba's iOS Network Extension injects an App-Group *seam*
+    /// transport so the CoreBluetooth radio can live in the app process (Model B)
+    /// while `RNodeInterface` + KISS framing run in the NE. Mirrors `BLEInterface`'s
+    /// injectable `driver`. Invoked on every (re)connect to make a fresh inner
+    /// transport; the `String` argument is `config.host` (the target device name).
+    private let makeInnerTransport: @Sendable (String) -> any Transport
 
     /// Exponential backoff calculator for reconnection (BLE-specific: 2s-30s)
     private let backoff: ExponentialBackoff
@@ -235,7 +244,10 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     ///
     /// - Parameter config: Interface configuration (must be type .rnode)
     /// - Throws: InterfaceError.invalidConfig if config.type is not .rnode
-    public init(config: InterfaceConfig) throws {
+    public init(
+        config: InterfaceConfig,
+        transportFactory: @escaping @Sendable (String) -> any Transport = { BLETransport(deviceName: $0) }
+    ) throws {
         guard config.type == .rnode else {
             throw InterfaceError.invalidConfig(reason: "RNodeInterface requires config type .rnode, got \(config.type)")
         }
@@ -244,6 +256,7 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
         self.config = config
         self.mode = config.mode
         self.backoff = ExponentialBackoff(baseDelay: 2.0, maxDelay: 30.0)
+        self.makeInnerTransport = transportFactory
     }
 
     // MARK: - Public API
@@ -382,10 +395,10 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
     private func setupTransport() async {
         // Create BLE transport targeting device name from config.host
         logger.error("[RNODE] setupTransport: targeting device '\(self.config.host, privacy: .public)'")
-        let bleTransport = BLETransport(deviceName: config.host)
+        let innerTransport = makeInnerTransport(config.host)
 
         // Wrap in KISS framing layer
-        let kissTransport = KISSFramedTransport(transport: bleTransport)
+        let kissTransport = KISSFramedTransport(transport: innerTransport)
 
         // Wire state change callback
         kissTransport.onStateChange = { [weak self] transportState in
@@ -1246,6 +1259,20 @@ public actor RNodeInterface: @preconcurrency NetworkInterface {
 
                 // Check if cancelled during sleep
                 if Task.isCancelled { return }
+
+                // If a connection already came up while this reconnect delay was pending,
+                // do NOT reconnect: attemptReconnect() builds a fresh transport and would
+                // orphan the live link mid-configureDevice. This is the race that kept the
+                // RNode looping between BLE-connected and reconnecting once BLETransport
+                // started reusing an already-connected peripheral — the link reaches
+                // .connected, configureDevice() begins its ~2s firmware-init wait, and this
+                // still-pending loop would tear it down before the detect handshake. Bail.
+                let alreadyConnected = (await self.state == .connected)
+                let nowConfiguring = await self.isConfiguring
+                if alreadyConnected || nowConfiguring {
+                    await self.clearReconnectTask()
+                    return
+                }
 
                 // Attempt reconnection (starts BLE scan, returns immediately)
                 await self.attemptReconnect()
