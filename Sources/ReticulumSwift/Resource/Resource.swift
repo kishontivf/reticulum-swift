@@ -1742,7 +1742,14 @@ public actor Resource {
             let assembledURL = storageFileURL
             let finalData: Data
             if let url = assembledURL {
-                finalData = (try? Data(contentsOf: url)) ?? plaintextToStore
+                // Read the whole assembled storagepath back. Must THROW on failure, not
+                // fall back to `plaintextToStore` — that holds only the LAST segment's
+                // chunk, so a silent fallback would deliver a truncated multi-segment
+                // payload with no error. A throw routes to the Link's corrupt-assembly
+                // handler (non-COMPLETE → resourceConcluded), matching python `assemble()`
+                // where a storagepath read failure is caught and sets status=CORRUPT
+                // (RNS/Resource.py:47-50, final read at :66).
+                finalData = try Data(contentsOf: url)
             } else {
                 finalData = plaintextToStore
             }
