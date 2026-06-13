@@ -411,6 +411,17 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     private func finalizeDetach(identityHex: String, scheduledAt: Date) async {
         // Cancelled (reconnect cleared it) or superseded by a newer drop+schedule.
         guard pendingDetach[identityHex] == scheduledAt else { return }
+        // Order-independent reconnect guard. A stale `scheduleDetach` from the OLD
+        // connection's loss can land on either side of a hot-swap's
+        // `updateConnection` await and re-create this entry. A hot-swap reuses the
+        // SAME peer and restores `state == .connected`, so if the peer is currently
+        // live it reconnected during the grace window — clear the entry but do NOT
+        // reap the freshly-reconnected peer.
+        if let peer = peers[identityHex], await peer.state == .connected {
+            pendingDetach.removeValue(forKey: identityHex)
+            logger.info("Detach finalize skipped for \(identityHex.prefix(8), privacy: .public) — reconnected (live)")
+            return
+        }
         pendingDetach.removeValue(forKey: identityHex)
         await removePeer(identityHex: identityHex)
     }
@@ -594,6 +605,16 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
 
             // Hot-swap preserves the peer's registration with Transport
             await existingPeer.updateConnection(connection, isOutgoing: isOutgoing)
+
+            // `updateConnection` suspends, and during that suspension the OLD
+            // connection's receive-loop loss (`handleConnectionLost` →
+            // `onConnectionLost` → `Task { scheduleDetach }`) can run on this actor
+            // and re-add a `pendingDetach` entry after the clear above. Clear it
+            // again to close that window. (A loss that lands strictly AFTER this
+            // method returns is caught by the liveness guard in `finalizeDetach`.)
+            if pendingDetach.removeValue(forKey: identityHex) != nil {
+                logger.info("Cleared stale detach that raced in during hot-swap for \(identityHex.prefix(8), privacy: .public)")
+            }
             logger.info("Hot-swapped connection for \(identityHex.prefix(8), privacy: .public) at \(connection.address.prefix(8), privacy: .public)")
             return
         }
