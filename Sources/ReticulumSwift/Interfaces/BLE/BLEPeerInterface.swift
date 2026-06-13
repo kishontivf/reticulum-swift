@@ -427,6 +427,14 @@ public actor BLEPeerInterface: @preconcurrency NetworkInterface {
         // via `handleProbeFrame` while `sendProbe` was suspended. Deciding on the
         // stale pre-await `idle` here would force-disconnect a link that just
         // answered the PING — the spurious-reconnect-on-healthy-link bug.
+        //
+        // Also bail if `detach()` ran during the suspension: `handleConnectionLost`
+        // flips `state` to `.disconnected` but leaves `probeCapable == true`, so
+        // without this guard `onDataPathDead` fires on an already-dead peer — and if
+        // a grace-window reconnect has meanwhile re-pointed `addressToIdentity`, the
+        // resulting `driver.disconnect` lands on the NEW address and kills the
+        // freshly-reconnected connection.
+        guard state == .connected else { return }
         let currentIdle = Date().timeIntervalSince(lastRealData)
         if probeCapable && currentIdle > BLEMeshConstants.dataPathTimeout {
             logger.warning("data-path dead for \(self.peerIdentityHex.prefix(8), privacy: .public) — no real data for \(Int(currentIdle), privacy: .public)s, reconnecting")
