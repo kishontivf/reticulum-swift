@@ -422,6 +422,14 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
             logger.info("Detach finalize skipped for \(identityHex.prefix(8), privacy: .public) — reconnected (live)")
             return
         }
+        // Re-check the token after the `await peer.state` suspension — that await is
+        // itself a reentrancy point. A concurrent `addPeer` (reconnect) clears
+        // `pendingDetach[id]` synchronously before it awaits `updateConnection`, and
+        // the peer actor can answer our `state` query (FIFO) BEFORE `updateConnection`
+        // flips it to `.connected` — so the liveness guard above reads `.disconnected`
+        // and misses the reconnect. Without this re-check, `removePeer` would then run
+        // after `updateConnection` and tear down the freshly reconnected peer.
+        guard pendingDetach[identityHex] == scheduledAt else { return }
         pendingDetach.removeValue(forKey: identityHex)
         await removePeer(identityHex: identityHex)
     }
