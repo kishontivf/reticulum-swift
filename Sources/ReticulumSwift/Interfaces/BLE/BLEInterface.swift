@@ -365,6 +365,16 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         guard let identityHex = addressToIdentity[address] else { return }
         logger.info("Connection lost to \(identityHex.prefix(8), privacy: .public) at \(address, privacy: .public)")
         applyBackoff(address: address)
+        // Clear the address mapping now so a SAME-address reconnect arriving during
+        // the grace window isn't rejected by the "already connected" guard in
+        // handleDiscoveredPeer / handleIncomingConnection (`addressToIdentity[addr]
+        // != nil`). Without this, only RPA-rotating reconnects benefit from the
+        // window; a fast same-address reconnect (e.g. an Android central re-linking
+        // to the iOS peripheral in < 2s) — the exact case the window exists for — is
+        // silently dropped. The peer interface itself is keyed by IDENTITY and stays
+        // in `peers` for reuse; both addPeer (hot-swap) and removePeer reverse-scan
+        // for the address and no-op when it's absent, so clearing it here is safe.
+        addressToIdentity.removeValue(forKey: address)
         // Don't remove the peer interface immediately — schedule a grace-period
         // detach so a reconnect with the same identity reuses it (and keeps the
         // learned route alive). Mirrors ble-reticulum `_device_disconnected_callback`,
