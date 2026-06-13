@@ -248,6 +248,51 @@ began its firmware-init wait, orphaning the live link mid-detect. No semantic
 change vs python; it makes the async port honour the same "don't reconnect a live
 link" guarantee.
 
+### BLE data-path liveness probe — per-peer loop + grace-detach reconnect (fix/ble-peer-grace-period-detach 2026-06-10)
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/BLE/BLEPeerInterface.swift` —
+`lastRealData`, `probeCapable`, `probeTask`, `handleProbeFrame`, `sendProbe`,
+`runDataPathProbe`, and the `lastRealData` refresh in `handleFragment`.
+`Sources/ReticulumSwift/Interfaces/BLE/BLEMeshConstants.swift` — `probePingByte`
+(0x04) / `probePongByte` (0x05) and the three interval constants.
+
+**Python reference:** ble-reticulum `BLEInterface.py` — `_run_data_path_probes`,
+`_handle_probe_frame`, `_send_probe`, `_last_real_data`, `_probe_capable`
+(protocol v0.4.0, `BLE_PROTOCOL_v0.4.0.md`). The wire format (2-byte
+PING `0x04` / PONG `0x05`, capability auto-negotiated on first frame, the
+thresholds) matches the python reference exactly.
+
+**Reason:** Category (b) — structural adaptation to the swift per-peer actor
+model, semantics identical. Three deviations from the python structure:
+
+1. **Per-peer loop, not centralized.** Python runs ONE timer in the parent
+   `BLEInterface` iterating `spawned_interfaces`; the swift port runs the probe
+   loop per-peer in `BLEPeerInterface` (`probeTask`, alongside the existing
+   per-peer `keepaliveTask`/`rssiTask`), because the swift port already models
+   each peer as its own actor with its own background loops.
+2. **No address normalization.** Python `_handle_probe_frame` strips a
+   `dev:`-prefixed peripheral address to resolve the peer's identity under the
+   dual-role collision; here the frame already arrives on this peer's own
+   connection, so identity is implicit and no lookup is needed.
+3. **Reconnect via the owner's `onDataPathDead` → `driver.disconnect(address)`,**
+   matching python. A peer interface's `connection.close()` only ends the receive
+   stream; it does NOT cancel the BLE link, so on a dead data path the probe delegates
+   to `BLEInterface`, which forces a real driver-level disconnect (central role:
+   `cancelPeripheralConnection` → the peer re-advertises → reconnect via re-discovery,
+   then grace-detach holds the route during the gap).
+   **Known limitation (TODO, needs on-device validation):** for a *peripheral-role*
+   peer CoreBluetooth cannot force-disconnect a subscribed central, so
+   `driver.disconnect` is a no-op there; full recovery additionally requires the driver
+   to drop `subscribedCentrals`/`centralConnections` for that address + emit
+   `connectionLost` so the central's next write re-handshakes (the
+   `didReceiveWrite` else-branch). Central-role recovery (the common case) works today.
+
+Additionally, swift adds a `lastRealData` clock (updated only on real data +
+probe frames, not keepalives/handshake). Python already has `_last_real_data`;
+swift previously had only `lastActivity` (which counts keepalives). `lastActivity`
+/ `checkZombies` are retained unchanged as the link-liveness backstop; the new
+clock drives data-path liveness.
+
 ## Resolved deviations
 
 ### `ReticulumTransport.sendLinkData` — incorrectly converted link DATA to HEADER_2 (resolved 2026-05-10)
@@ -400,3 +445,75 @@ default open (unchanged).
 **Not a logic divergence:** the path-table decision trees (`record`, `lookup`,
 `cleanup` incl. the interface-absent cull at `Transport.py:778-785`) are
 unchanged and faithful — only the storage backend's iOS open is platform-specific.
+
+### BLE per-peer interface — grace-period detach + identity reuse (fix/ble-peer-grace-period-detach 2026-06-07)
+
+**Sites:** `Interfaces/BLE/BLEInterface.swift` (`pendingDetach`, `scheduleDetach`,
+`finalizeDetach`, `handleDisconnection`, `addPeer` reuse), `BLEPeerInterface.swift`
+(`onConnectionLost` / `handleConnectionLost`, `detach` made teardown-only),
+`BLEMeshConstants.swift` (`detachGracePeriod`).
+
+**Python reference:** `../ble-reticulum/src/ble_reticulum/BLEInterface.py` —
+`_device_disconnected_callback` (1295) schedules `_pending_detach[identity_hash]`
+instead of detaching inline; `_process_pending_detaches` (771) detaches after the
+grace period if no address reconnected; `_spawn_peer_interface` (1892) reuses the
+existing per-peer interface on reconnect and clears `_pending_detach`;
+`_pending_detach_grace_period = 2.0` (393). Both stacks register identity-keyed
+per-peer interfaces with core RNS `Transport.interfaces`, whose `jobs()` culls
+paths of absent interfaces (`../Reticulum/RNS/Transport.py:778-785`).
+
+**What now matches python:** a dropped BLE connection no longer removes the peer
+interface immediately. It is held (registered with the transport) for
+`detachGracePeriod`; a reconnect with the same identity reuses it (existing
+hot-swap `updateConnection`) and cancels the pending detach, so a transient drop
+(MAC rotation) does not cull the learned route. Absent a reconnect, the peer is
+removed after grace. This is the actual fix for BLE transient-drop route loss;
+the core RNS interface-absent cull stays intact (it is correct and matches
+upstream — see the H4 revert in the NE-safe-PathTable PR).
+
+**Deviations from the python shape (and why):**
+
+1. **One-shot timer, not a maintenance-loop poll.** Python calls
+   `_process_pending_detaches` from its periodic maintenance loop; the swift port
+   arms a single `Task.sleep(detachGracePeriod)` per scheduled detach
+   (`scheduleDetach`). Same semantics, but event-driven (no steady ~1s poll),
+   matching Torlando's standing prefer-event-driven-over-polling rule. The
+   reconnect-cancels signal is `pendingDetach` being cleared by `addPeer`, which
+   `finalizeDetach` re-checks — the analogue of python re-checking
+   `has_connected_address`.
+
+2. **No `_identity_cache`.** Python caches peer identity for `_identity_cache_ttl`
+   (60s) so a reconnect that arrives *without* a fresh identity handshake (Android
+   holding the GATT link) can be re-identified. The swift port performs a full
+   identity handshake on *every* connection (`performCentralHandshake` /
+   `performPeripheralHandshake`), so identity is always re-derived on reconnect and
+   the cache is unnecessary. Category (b) — a faithful simplification the swift
+   handshake model permits.
+
+3. **Teardown is owned by the peer's cancellation-safe loops, not inline in the
+   disconnect handler.** Python serializes disconnect vs reconnect with
+   `peer_lock`. Swift actors can't hold a lock across `await`, so `scheduleDetach`
+   is deliberately synchronous (no `await` into the peer) and does **not** tear the
+   connection down: a reconnect's `updateConnection` cancels the peer's old
+   receive/keepalive tasks, and their existing `!Task.isCancelled` guards suppress
+   the self-detach — so a stale teardown can never kill a freshly-reconnected
+   connection. If no reconnect arrives, `removePeer` (at finalize) does the
+   teardown. Category (a) — Swift's actor/reentrancy model vs python's thread+lock.
+
+4. **Three disconnect signals funnel into one scheduler.** Python has a single
+   driver callback. Swift has three ("connection died" via the driver's
+   `connectionLost` stream, the peer's receive-stream end, and keepalive
+   double-fail); all route to `scheduleDetach`, which is idempotent per identity
+   (`pendingDetach[hex] == nil` guard). The `addPeer` reject-duplicate rule also
+   gains an `isDetaching` check so an in-grace peer (still reading `.connected`
+   until its loops wind down) does not reject the very reconnect it is waiting for.
+
+**Grace value:** `detachGracePeriod = 2.0s` mirrors python exactly. iOS BLE
+reconnect latency (RPA rotation + scan/connect) may warrant tuning it up after
+on-device observation; raising it only widens the transient-drop window the route
+survives, so it is safe to increase.
+
+**Not a logic divergence in the cull:** core RNS path-table `record`/`lookup`/
+`cleanup` (incl. the interface-absent cull) are unchanged. This PR fixes the
+*interface lifecycle* so a transient drop keeps its interface registered long
+enough to be reused — the layer ble-reticulum fixes it at.

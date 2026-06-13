@@ -65,6 +65,13 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     /// Address → identity hex mapping for reverse lookups
     private var addressToIdentity: [String: String] = [:]
 
+    /// Identities whose connection dropped and are awaiting a grace-period detach,
+    /// keyed by identity hex → time scheduled. While an identity is here its peer
+    /// interface stays registered with the transport; a reconnect (`addPeer` reuse)
+    /// cancels the entry, a grace timeout (`finalizeDetach`) removes the peer.
+    /// Mirrors ble-reticulum `_pending_detach`.
+    private var pendingDetach: [String: Date] = [:]
+
     /// Blacklisted addresses with expiry time
     private var blacklist: [String: Date] = [:]
 
@@ -200,6 +207,7 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         }
         peers.removeAll()
         addressToIdentity.removeAll()
+        pendingDetach.removeAll()
 
         // Shut down driver
         driver.shutdown()
@@ -356,8 +364,84 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
     private func handleDisconnection(address: String) async {
         guard let identityHex = addressToIdentity[address] else { return }
         logger.info("Connection lost to \(identityHex.prefix(8), privacy: .public) at \(address, privacy: .public)")
-        await removePeer(identityHex: identityHex)
         applyBackoff(address: address)
+        // Clear the address mapping now so a SAME-address reconnect arriving during
+        // the grace window isn't rejected by the "already connected" guard in
+        // handleDiscoveredPeer / handleIncomingConnection (`addressToIdentity[addr]
+        // != nil`). Without this, only RPA-rotating reconnects benefit from the
+        // window; a fast same-address reconnect (e.g. an Android central re-linking
+        // to the iOS peripheral in < 2s) — the exact case the window exists for — is
+        // silently dropped. The peer interface itself is keyed by IDENTITY and stays
+        // in `peers` for reuse; both addPeer (hot-swap) and removePeer reverse-scan
+        // for the address and no-op when it's absent, so clearing it here is safe.
+        addressToIdentity.removeValue(forKey: address)
+        // Don't remove the peer interface immediately — schedule a grace-period
+        // detach so a reconnect with the same identity reuses it (and keeps the
+        // learned route alive). Mirrors ble-reticulum `_device_disconnected_callback`,
+        // which schedules `_pending_detach` rather than detaching inline.
+        scheduleDetach(identityHex: identityHex)
+    }
+
+    /// Schedule a peer interface for detach after `detachGracePeriod`, instead of
+    /// removing it immediately on a dropped connection. The interface stays in `peers`
+    /// and registered with the transport during the grace window, so a reconnect with
+    /// the same identity (`addPeer` reuse) keeps the learned route; if no reconnect
+    /// arrives, `finalizeDetach` removes it. Mirrors ble-reticulum `_pending_detach`
+    /// scheduling in `_device_disconnected_callback`.
+    ///
+    /// Deliberately synchronous and free of any `await` into the peer: connection
+    /// teardown is owned by the peer's own cancellation-safe loops (a reconnect's
+    /// `updateConnection` cancels them, which suppresses their self-detach) or, absent
+    /// a reconnect, by `removePeer` at finalize. Keeping this atomic on the actor means
+    /// a concurrent reconnect can't interleave a stale teardown that kills the new
+    /// connection, and can't race the address maps — the python `peer_lock` analogue.
+    private func scheduleDetach(identityHex: String) {
+        guard peers[identityHex] != nil else { return }
+        // Already scheduled (e.g. both the driver's connectionLost and the peer's own
+        // stream-end fired for the same drop) — keep the original timer.
+        guard pendingDetach[identityHex] == nil else { return }
+
+        let scheduledAt = Date()
+        pendingDetach[identityHex] = scheduledAt
+        logger.info("Scheduled detach for \(identityHex.prefix(8), privacy: .public) in \(BLEMeshConstants.detachGracePeriod)s")
+
+        // One-shot grace timer (event-driven; no steady poll). On reconnect the
+        // pendingDetach entry is cleared/superseded and finalizeDetach no-ops.
+        Task { [weak self] in
+            try? await Task.sleep(for: .seconds(BLEMeshConstants.detachGracePeriod))
+            await self?.finalizeDetach(identityHex: identityHex, scheduledAt: scheduledAt)
+        }
+    }
+
+    /// Grace period elapsed: remove the peer interface unless a reconnect arrived. The
+    /// reconnect signal is `addPeer` having cleared (or superseded) this pendingDetach
+    /// entry — mirrors ble-reticulum `_process_pending_detaches` re-checking for a live
+    /// address before detaching. `removePeer` does the actual teardown + transport
+    /// unregistration (idempotent if the peer already tore its connection down).
+    private func finalizeDetach(identityHex: String, scheduledAt: Date) async {
+        // Cancelled (reconnect cleared it) or superseded by a newer drop+schedule.
+        guard pendingDetach[identityHex] == scheduledAt else { return }
+        // Order-independent reconnect guard. A stale `scheduleDetach` from the OLD
+        // connection's loss can land on either side of a hot-swap's
+        // `updateConnection` await and re-create this entry. A hot-swap reuses the
+        // SAME peer and restores `state == .connected`, so if the peer is currently
+        // live it reconnected during the grace window — clear the entry but do NOT
+        // reap the freshly-reconnected peer.
+        if let peer = peers[identityHex], await peer.state == .connected {
+            pendingDetach.removeValue(forKey: identityHex)
+            logger.info("Detach finalize skipped for \(identityHex.prefix(8), privacy: .public) — reconnected (live)")
+            return
+        }
+        // Re-check the token after the `await peer.state` suspension — that await is
+        // itself a reentrancy point. A concurrent `addPeer` (reconnect) clears
+        // `pendingDetach[id]` synchronously before it awaits `updateConnection`, and
+        // the peer actor can answer our `state` query (FIFO) BEFORE `updateConnection`
+        // flips it to `.connected` — so the liveness guard above reads `.disconnected`
+        // and misses the reconnect. Without this re-check, `removePeer` would then run
+        // after `updateConnection` and tear down the freshly reconnected peer.
+        guard pendingDetach[identityHex] == scheduledAt else { return }
+        pendingDetach.removeValue(forKey: identityHex)
+        await removePeer(identityHex: identityHex)
     }
 
     // MARK: - Task 4: Periodic Cleanup
@@ -413,7 +497,10 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         let now = Date()
         var zombies: [String] = []
 
-        for (identityHex, peer) in peers {
+        // Skip peers already awaiting a grace-period detach — the detach timer owns
+        // their lifecycle (and their connection is already torn down, so lastActivity
+        // is necessarily stale).
+        for (identityHex, peer) in peers where pendingDetach[identityHex] == nil {
             let lastActivity = await peer.lastActivity
             if now.timeIntervalSince(lastActivity) > BLEMeshConstants.zombieTimeout {
                 zombies.append(identityHex)
@@ -502,13 +589,20 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
             // python/kotlin "keep existing" rule and could leave iOS↔Android each keeping the
             // opposite link, closing both. Direction-based sorting can't converge cross-platform:
             // iOS has no local BLE MAC and sees peers as opaque CoreBluetooth UUIDs.)
-            if existingState == .connected && !isStale {
+            // A pending grace-period detach means the existing connection already
+            // dropped — treat the newcomer as the reconnect (fall through to reuse),
+            // even if the peer hasn't finished tearing its dead connection down yet.
+            // Without this an in-grace peer still reads as `.connected` and would wrongly
+            // reject the very reconnect the grace window exists to welcome.
+            let isDetaching = pendingDetach[identityHex] != nil
+            if existingState == .connected && !isStale && !isDetaching {
                 logger.info("Duplicate identity \(identityHex.prefix(8), privacy: .public): keeping existing healthy connection, rejecting \(isOutgoing ? "outgoing" : "incoming", privacy: .public)")
                 connection.close()
                 return
             }
 
-            // Hot-swap: the existing connection is stale (MAC rotation) or dead (reconnect).
+            // Hot-swap: the existing connection is stale (MAC rotation), dead (reconnect),
+            // or in its grace window (pending detach).
             if existingState == .connected && isStale {
                 logger.info("MAC rotation: hot-swapping stale connection for \(identityHex.prefix(8), privacy: .public)")
             } else if existingState != .connected {
@@ -520,8 +614,25 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
             if let oldAddress { addressToIdentity.removeValue(forKey: oldAddress) }
             addressToIdentity[connection.address] = identityHex
 
+            // Reconnect arrived — cancel any pending grace-period detach so the
+            // reused interface (and its route) survives. Mirrors ble-reticulum
+            // `_spawn_peer_interface` clearing `_pending_detach` on reuse.
+            if pendingDetach.removeValue(forKey: identityHex) != nil {
+                logger.info("Cancelled pending detach for \(identityHex.prefix(8), privacy: .public) — reconnected")
+            }
+
             // Hot-swap preserves the peer's registration with Transport
             await existingPeer.updateConnection(connection, isOutgoing: isOutgoing)
+
+            // `updateConnection` suspends, and during that suspension the OLD
+            // connection's receive-loop loss (`handleConnectionLost` →
+            // `onConnectionLost` → `Task { scheduleDetach }`) can run on this actor
+            // and re-add a `pendingDetach` entry after the clear above. Clear it
+            // again to close that window. (A loss that lands strictly AFTER this
+            // method returns is caught by the liveness guard in `finalizeDetach`.)
+            if pendingDetach.removeValue(forKey: identityHex) != nil {
+                logger.info("Cleared stale detach that raced in during hot-swap for \(identityHex.prefix(8), privacy: .public)")
+            }
             logger.info("Hot-swapped connection for \(identityHex.prefix(8), privacy: .public) at \(connection.address.prefix(8), privacy: .public)")
             return
         }
@@ -534,10 +645,17 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
             isOutgoing: isOutgoing
         )
 
-        await peer.setOnDetach { [weak self] identityHex in
+        await peer.setOnConnectionLost { [weak self] identityHex in
             guard let self = self else { return }
             Task {
-                await self.removePeer(identityHex: identityHex)
+                await self.scheduleDetach(identityHex: identityHex)
+            }
+        }
+
+        await peer.setOnDataPathDead { [weak self] identityHex in
+            guard let self = self else { return }
+            Task {
+                await self.disconnectDeadDataPath(identityHex: identityHex)
             }
         }
 
@@ -552,8 +670,23 @@ public actor BLEInterface: @preconcurrency NetworkInterface {
         onPeerAdded?(peer)
     }
 
+    /// A peer's data-path probe found the link dead (connected but no real data crossing).
+    /// Force a real driver-level disconnect so it re-establishes — mirrors ble-reticulum's
+    /// `driver.disconnect(address)`. A peer interface's `connection.close()` only ends the
+    /// receive stream; it does not cancel the BLE link, so the probe must go through the
+    /// driver. (Central role: `cancelPeripheralConnection` → reconnect via re-discovery.
+    /// Peripheral role: CoreBluetooth cannot force-disconnect a subscribed central, so full
+    /// recovery there additionally needs the driver to drop the central + allow re-handshake
+    /// — see port-deviations.md.)
+    private func disconnectDeadDataPath(identityHex: String) async {
+        guard let address = addressToIdentity.first(where: { $0.value == identityHex })?.key else { return }
+        logger.info("Data-path dead for \(identityHex.prefix(8), privacy: .public) — forcing reconnect via driver.disconnect")
+        await driver.disconnect(address: address)
+    }
+
     private func removePeer(identityHex: String) async {
         guard let peer = peers.removeValue(forKey: identityHex) else { return }
+        pendingDetach.removeValue(forKey: identityHex)
 
         // Remove address mapping
         let address = addressToIdentity.first { $0.value == identityHex }?.key
