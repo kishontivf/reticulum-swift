@@ -53,7 +53,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install pytest pytest-timeout
+      # Install the conformance suite's own declared deps (pytest, msgpack,
+      # u-msgpack-python, …) so new harness-side imports don't break collection,
+      # plus pytest-timeout for the --timeout cap below. We invoke pytest serially
+      # (no -n), so the bundled pytest-xdist is inert here.
+      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout
 
       - name: Run conformance tests
         working-directory: reticulum-conformance
