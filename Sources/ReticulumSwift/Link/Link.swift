@@ -2506,11 +2506,15 @@ public actor Link {
                 // receiver never saw the advertisement — so just logging would stall the
                 // whole multi-segment transfer permanently (no retry/self-timeout) and
                 // leak the tempfile. Mirror cancel(): drop tracking, unlink the staging
-                // file, and conclude so the caller observes the failure.
+                // file, conclude so the caller observes the failure, and — since this
+                // aborted transfer was holding the pending-outgoing queue (released only
+                // on the FINAL segment's conclusion, :2438-2445) — drain the queue so
+                // resources queued behind it are not stalled until link close.
                 linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
                 outboundResources.removeValue(forKey: nextHash)
                 await next.cleanup()
                 await resourceCallbacks?.resourceConcluded(next)
+                await drainOutgoingQueue()
             }
         } catch {
             // A prepareNextSegment failure leaves `current` owning the shared staging
@@ -2524,6 +2528,10 @@ public actor Link {
             // double-concluding a completed segment.
             linkLogger.error("Failed to prepare next segment: \(error, privacy: .public)")
             await current.cleanup()
+            // The multi-segment transfer that was holding the pending-outgoing queue
+            // (released only on the FINAL segment, :2438-2445) has now aborted, so drain
+            // the queue — otherwise resources queued behind it stall until link close.
+            await drainOutgoingQueue()
         }
     }
 
