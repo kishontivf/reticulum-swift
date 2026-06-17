@@ -981,6 +981,18 @@ The following flagged items are LEFT as constrained/intentional deviations:
     (`BE3(len(packed)) + msgpack.packb(.binary(metadata))`, `RNS/Resource.py:266`)
     and RECEIVE unpack (`receivedMetadata`, `RNS/Resource.py:698-731`) mirror RNS.
 
+    **Tighter bound than RNS (added 2026-06-17):** the clamp ALSO drops metadata whose
+    framed size (`packed.count + 3`) exceeds `MAX_EFFICIENT_SIZE` (1 MiB-1), not just
+    `METADATA_MAX_SIZE` (16 MiB-1). Segment 1 reserves `firstReadSize =
+    MAX_EFFICIENT_SIZE - metadataSize` payload bytes (`resolveSegmentPlaintext`,
+    `Resource.swift:1105`/`:1154`); metadata larger than that yields a NEGATIVE read
+    size which traps at runtime in Swift (`seek(toOffset: UInt64(negative))` on
+    segment 2+, empty read on segment 1) where python's negative-size file ops degrade
+    silently. Category (a) runtime-safety — RNS allows 1–16 MiB metadata that this
+    port's seek/read math cannot express without a trap, so we reject it at
+    construction. Metadata >~1 MiB is pathological for a header field; no real
+    LXMF/LXST caller approaches it.
+
 14. **Progress callback propagation is best-effort** — `Resource/Resource.swift`.
     RNS `progress_callback` recurses into `next_segment` synchronously
     (`RNS/Resource.py:1122-1124`). The swift port propagates the callback to a

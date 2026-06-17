@@ -1481,6 +1481,18 @@ public actor Link {
         let hash = await resource.hash ?? Data()
         if outboundResources.removeValue(forKey: hash) == nil {
             linkLogger.warning("Attempt to cancel a non-existing outgoing resource")
+        } else {
+            // Cancelling an in-flight outbound resource frees the one-at-a-time
+            // outgoing slot, so advance the pending-outgoing queue. Without this a
+            // remote-triggered cancel (e.g. an EXHAUSTED sequence error flowing
+            // through request() -> cancel()) on a callback-less Link.sendResource
+            // transfer stalls the queue permanently: Resource.cancel() removes the
+            // resource HERE, before its callback-gated resourceConcluded, so the
+            // drain inside resourceConcluded never sees it (outboundResources[hash]
+            // is already nil). RNS drains via the __advertise_job poll once
+            // ready_for_new_resource() turns true; this port is event-driven
+            // (see port-deviations.md).
+            await drainOutgoingQueue()
         }
     }
 

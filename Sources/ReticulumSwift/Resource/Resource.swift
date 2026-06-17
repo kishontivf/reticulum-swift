@@ -408,7 +408,19 @@ public actor Resource {
             // (RNS/Resource.py:263-264). Here we clamp by simply not attaching
             // oversized metadata (logged) so construction can't throw — see
             // port-deviations.md.
-            if packed.count <= ResourceConstants.METADATA_MAX_SIZE {
+            //
+            // We ALSO require the framed metadata to fit within MAX_EFFICIENT_SIZE:
+            // segment 1's layout reserves `firstReadSize = MAX_EFFICIENT_SIZE -
+            // metadataSize` payload bytes (resolveSegmentPlaintext, :1105/:1154), so a
+            // larger metadata yields a NEGATIVE read size that traps at runtime
+            // (`seek(toOffset: UInt64(negative))` on segment 2+, empty read on seg 1).
+            // METADATA_MAX_SIZE (16 MiB-1) > MAX_EFFICIENT_SIZE (1 MiB-1), so the python
+            // bound alone is insufficient. Metadata >~1 MiB is pathological for a header
+            // field; drop it rather than crash. (Category (a) runtime-safety: python's
+            // negative-size file ops degrade silently where Swift's trap.)
+            let framedSize = packed.count + 3  // 3-byte big-endian length prefix
+            if packed.count <= ResourceConstants.METADATA_MAX_SIZE,
+               framedSize <= ResourceConstants.MAX_EFFICIENT_SIZE {
                 var meta = Data()
                 let n = packed.count
                 meta.append(UInt8((n >> 16) & 0xFF))
@@ -418,7 +430,7 @@ public actor Resource {
                 self.metadata = meta
                 self.metadataSize = meta.count
             } else {
-                logger.error("Resource metadata size \(packed.count) exceeds METADATA_MAX_SIZE; dropping metadata")
+                logger.error("Resource metadata framed size \(framedSize) exceeds the segmentable bound (METADATA_MAX_SIZE=\(ResourceConstants.METADATA_MAX_SIZE), MAX_EFFICIENT_SIZE=\(ResourceConstants.MAX_EFFICIENT_SIZE)); dropping metadata to avoid a negative first-segment read size")
             }
         }
     }
