@@ -27,6 +27,11 @@ import CryptoKit
 import Foundation
 import ReticulumSwift
 
+// ACCEPT_APP boundary: an inbound Resource is accepted iff its advertised
+// uncompressed data size is <= this many bytes (reference/wire_tcp.py:1212
+// _RESOURCE_APP_ACCEPT_MAX_SIZE). Test payloads sit on either side of it.
+let wireResourceAppAcceptMaxSize = 4096
+
 // MARK: - Per-wire-handle state
 
 /// State for a wire instance.
@@ -51,6 +56,55 @@ final class WireInstance: @unchecked Sendable {
     // Outbound links opened by wire_link_open, keyed by link_id hex.
     var outLinks: [String: Link] = [:]
 
+    // Outbound Resources started by wire_resource_send, keyed by a generated
+    // resource_id hex. Populated for both wait=True and wait=False sends so
+    // wire_resource_cancel can abort a non-blocking transfer mid-flight
+    // (RESOURCE_ICL). Mirrors python's inst["out_resources"] registry
+    // (reference/wire_tcp.py cmd_wire_resource_send / cmd_wire_resource_cancel).
+    var outResources: [String: Resource] = [:]
+
+    // MARK: Captured reticulum_config posture knobs
+    //
+    // RNS resolves these once at Reticulum.__init__ / __apply_config time and
+    // the wire posture commands (wire_instance_posture / wire_transport_enabled
+    // / wire_rpc_authkey) read them straight back off the live RNS objects.
+    // reticulum-swift models no `Reticulum` config object, so wire_start_tcp_*
+    // captures the config values here for the round-trip. The probe /
+    // remote-management DESTINATIONS, by contrast, are genuine library state
+    // (registered on the Transport) — these fields only carry the
+    // standalone-instance posture flags. See port-deviations.md (Transport
+    // probe / remote-management destinations — registration + posture only).
+
+    /// Resolved `enable_transport` posture (RNS.Reticulum.transport_enabled()).
+    /// Tri-state at the config layer: omitted -> True (server default), explicit
+    /// null -> False (option-ABSENT default-off, Reticulum.py:253/:497-499),
+    /// explicit bool -> that value. Reported by wire_instance_posture /
+    /// wire_transport_enabled. Decoupled from the INTERNAL routing-enable
+    /// (`transport.transportEnabled`), which is kept on so directly-connected
+    /// wire peers still answer path requests regardless of posture — RNS keeps
+    /// endpoint behaviour irrespective of transport_enabled.
+    var enableTransport: Bool = true
+    /// `panic_on_interface_error` (Reticulum.py:280 default False, :551-553 knob).
+    var panicOnInterfaceError: Bool = false
+    /// `use_implicit_proof` -> should_use_implicit_proof() (Reticulum.py:256 default True).
+    var useImplicitProof: Bool = true
+    /// `respond_to_probes` (Reticulum.py:257 default False); also drives the
+    /// real Transport.probe_destination registration.
+    var respondToProbes: Bool = false
+    /// `enable_remote_management` (Reticulum.py:255 default False); also drives
+    /// the real Transport.remote_management_destination registration.
+    var remoteManagementEnabled: Bool = false
+    /// `remote_management_allowed` ACL, normalised lowercase-hex (32-hex each).
+    var remoteManagementAllowed: [String] = []
+    /// `blackhole_sources`, validated (16-byte/hex) + deduplicated, lowercase-hex.
+    var blackholeSources: [String] = []
+    /// `interface_discovery_sources`, validated + deduplicated, lowercase-hex.
+    var interfaceDiscoverySources: [String] = []
+    /// A VALID custom `rpc_key` (verbatim bytes). nil => no custom key OR a
+    /// malformed one => fall back to SHA-256(transport private key)
+    /// (Reticulum.py:489-495, :347-348).
+    var rpcKey: Data? = nil
+
     init(
         transport: ReticulumTransport,
         identity: Identity,
@@ -74,6 +128,12 @@ final class WireListener: @unchecked Sendable {
     let identity: Identity
     private let lock = NSLock()
     private var _recvBuffer: [Data] = []
+    // Opportunistic SINGLE-DATA addressed directly to this destination (NOT
+    // routed through a Link), buffered SEPARATELY from link recv data so
+    // wire_opportunistic_poll and wire_link_poll drain distinct surfaces.
+    // Mirrors python's per-listener opportunistic_buffer vs recv_buffer split
+    // (reference/wire_tcp.py:1312-1313).
+    private var _opportunisticBuffer: [Data] = []
     private var _resourceBuffer: [Data] = []
     // Per-link resource hash dedup, matching Kotlin's fix for the
     // double-fire of resourceConcluded. Swift doesn't currently exhibit
@@ -89,6 +149,14 @@ final class WireListener: @unchecked Sendable {
     func append(packetData: Data) {
         lock.lock(); defer { lock.unlock() }
         _recvBuffer.append(packetData)
+    }
+
+    /// Buffer a decrypted opportunistic SINGLE-DATA payload, surfaced by the
+    /// destination's packet callback (DATA not routed through a Link).
+    /// Mirrors python on_opportunistic_packet (reference/wire_tcp.py:1331-1334).
+    func append(opportunisticData: Data) {
+        lock.lock(); defer { lock.unlock() }
+        _opportunisticBuffer.append(opportunisticData)
     }
 
     func append(resource: Data, hash: Data?) {
@@ -119,6 +187,18 @@ final class WireListener: @unchecked Sendable {
         return !_recvBuffer.isEmpty
     }
 
+    func drainOpportunistic() -> [Data] {
+        lock.lock(); defer { lock.unlock() }
+        let out = _opportunisticBuffer
+        _opportunisticBuffer.removeAll()
+        return out
+    }
+
+    func hasAnyOpportunistic() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !_opportunisticBuffer.isEmpty
+    }
+
     func hasAnyResources() -> Bool {
         lock.lock(); defer { lock.unlock() }
         return !_resourceBuffer.isEmpty
@@ -127,11 +207,15 @@ final class WireListener: @unchecked Sendable {
 
 // MARK: - Instance registry
 
-private let wireLock = NSLock()
-nonisolated(unsafe) private var wireInstances: [String: WireInstance] = [:]
+// NOTE: visibility is `internal` (no `private`) so the per-cluster wire
+// sub-handlers in WireTcp+*.swift can share this single instance registry +
+// lock. The dispatch chain in handleWireCommand's default case routes any
+// unmatched wire_* command into those sub-handlers (see Ext+Dispatch.swift).
+let wireLock = NSLock()
+nonisolated(unsafe) var wireInstances: [String: WireInstance] = [:]
 
 /// Generate a fresh, unique handle for `wire_start_*`.
-private func newHandle() -> String {
+func newHandle() -> String {
     Data((0..<8).map { _ in UInt8.random(in: 0...255) })
         .map { String(format: "%02x", $0) }.joined()
 }
@@ -139,7 +223,7 @@ private func newHandle() -> String {
 /// Tear down all wire state: detach interfaces, stop retransmission,
 /// clear handle map. Called at the top of wire_start_* to guarantee
 /// each test starts with a clean slate.
-private func resetWireState() {
+func resetWireState() {
     wireLock.lock()
     let stale = Array(wireInstances.values)
     wireInstances.removeAll()
@@ -184,7 +268,7 @@ private let ifacSalt: Data = hexToBytes(
 /// ```
 ///
 /// Returns nil if both netname and passphrase are empty (no IFAC configured).
-private func deriveIfacKey(networkName: String, passphrase: String) -> Data? {
+func deriveIfacKey(networkName: String, passphrase: String) -> Data? {
     if networkName.isEmpty && passphrase.isEmpty { return nil }
     var ifacOrigin = Data()
     if !networkName.isEmpty {
@@ -202,9 +286,51 @@ private func deriveIfacKey(networkName: String, passphrase: String) -> Data? {
 }
 
 
+// MARK: - enable_transport tri-state parsing
+
+/// Resolve the `enable_transport` knob from raw JSON, mirroring RNS's
+/// option-presence semantics (Reticulum.py:253 default False; :497-499 only
+/// flips True on an explicit Yes):
+///   - key ABSENT entirely -> the conftest's server default (True) — most wire
+///     tests never pass the knob and rely on transport being on;
+///   - key present as JSON null -> the option-ABSENT-from-config posture: False;
+///   - key present as a bool -> that value.
+func parseEnableTransport(_ p: [String: JSONValue]) -> Bool {
+    guard let v = p["enable_transport"] else { return true }   // omitted -> default on
+    switch v {
+    case .null: return false                                   // explicit None -> option absent -> off
+    case .bool(let b): return b
+    default: return true
+    }
+}
+
+// MARK: - Identity-hash ACL/source-list validation
+
+/// Validate a list of identity-hash hex strings the way RNS's `__apply_config`
+/// does at startup (Reticulum.py:575-591): each entry must be exactly
+/// TRUNCATED_HASHLENGTH//8 == 16 bytes (32 hex) AND valid hexadecimal, else the
+/// start aborts (here: a thrown BridgeError, which the pytest `BridgeError`
+/// path expects). Valid entries are DEDUPLICATED preserving first-occurrence
+/// order and returned as canonical lowercase hex.
+func validateIdentityHashList(_ raw: [String], label: String) throws -> [String] {
+    var out: [String] = []
+    var seen = Set<Data>()
+    for entry in raw {
+        guard let bytes = hexToBytes(entry), bytes.count == 16 else {
+            throw BridgeError.invalidData(
+                "\(label) entry must be a 16-byte (32-hex) identity hash, got '\(entry)'"
+            )
+        }
+        if seen.insert(bytes).inserted {
+            out.append(bytesToHex(bytes))
+        }
+    }
+    return out
+}
+
 // MARK: - Interface mode parsing
 
-private func parseWireInterfaceMode(_ raw: String?) throws -> InterfaceMode {
+func parseWireInterfaceMode(_ raw: String?) throws -> InterfaceMode {
     guard let raw, !raw.isEmpty else { return .full }
     switch raw.lowercased() {
     case "full": return .full
@@ -222,7 +348,7 @@ private func parseWireInterfaceMode(_ raw: String?) throws -> InterfaceMode {
 
 /// Pre-allocate a free loopback port by binding then closing.
 /// Tiny race window; acceptable for localhost conformance use.
-private func allocateFreePort() -> UInt16 {
+func allocateFreePort() -> UInt16 {
     let sock = socket(AF_INET, SOCK_STREAM, 0)
     guard sock >= 0 else { return 0 }
     defer { close(sock) }
@@ -275,13 +401,54 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         }
         let mode = try parseWireInterfaceMode(getStringOptional(p, "mode"))
 
+        // --- reticulum_config knobs (all optional) ---
+        // enable_transport tri-state (see parseEnableTransport): the POSTURE
+        // value reported back by wire_instance_posture / wire_transport_enabled.
+        // The internal routing-enable is kept ON unconditionally below so two
+        // directly-connected wire peers still answer path requests regardless of
+        // posture (RNS keeps endpoint behaviour irrespective of transport_enabled,
+        // Reticulum.py; the internal flag couples Swift's PR/forwarding logic).
+        let enableTransport = parseEnableTransport(p)
+        let panicOnInterfaceError = getBoolOptional(p, "panic_on_interface_error") ?? false
+        let respondToProbes = getBoolOptional(p, "respond_to_probes") ?? false
+        // should_use_implicit_proof defaults True (Reticulum.py:256).
+        let useImplicitProof = getBoolOptional(p, "use_implicit_proof") ?? true
+        let enableRemoteManagement = getBoolOptional(p, "enable_remote_management") ?? false
+        // Validate ACL / source lists up front so a malformed entry aborts the
+        // start with a BridgeError BEFORE any interface/Transport is built —
+        // matching RNS's startup ValueError (Reticulum.py:532-536/:575-591).
+        let remoteManagementAllowed = try validateIdentityHashList(
+            getStringArray(p, "remote_management_allowed"), label: "remote_management_allowed"
+        )
+        let blackholeSources = try validateIdentityHashList(
+            getStringArray(p, "blackhole_sources"), label: "blackhole_sources"
+        )
+        let interfaceDiscoverySources = try validateIdentityHashList(
+            getStringArray(p, "interface_discovery_sources"), label: "interface_discovery_sources"
+        )
+        // rpc_key: a VALID hex key is honoured verbatim; a malformed one falls
+        // back to the SHA-256(private key) default (Reticulum.py:489-495). Capture
+        // the parsed bytes (nil => fall back) for wire_rpc_authkey.
+        let capturedRpcKey: Data? = getStringOptional(p, "rpc_key").flatMap { hexToBytes($0) }
+        // fixed_mtu (must be >= Reticulum.MTU, the TCP*Interface init enforces it)
+        // and bitrate (effective-bitrate floor applied at read-back) feed the
+        // InterfaceConfig so the live interface's derived hwMtu / bitrate round-trip.
+        let fixedMtu = getIntOptional(p, "fixed_mtu")
+        let bitrate = getIntOptional(p, "bitrate") ?? 0
+
         let ifacKey = deriveIfacKey(networkName: networkName, passphrase: passphrase)
-        let ifacSize = ifacKey != nil ? 16 : 0
+        // IFAC size: no IFAC configured -> 0 (no validation on the wire); IFAC
+        // configured -> resolve the BITS knob via Interface.resolveIfacSize
+        // (>=8 -> //8, sub-minimum/absent -> DEFAULT_IFAC_SIZE 16), matching
+        // Reticulum.py:719-723 + the DEFAULT_IFAC_SIZE fallback.
+        let ifacSize = ifacKey != nil ? Interface.resolveIfacSize(bits: getIntOptional(p, "ifac_size")) : 0
 
         let identity = Identity()
         let transport = ReticulumTransport(pathTable: PathTable())
 
         try blockingAsync {
+            // Internal routing-enable kept ON regardless of the reported posture
+            // (see enableTransport note above) so PR answering keeps working.
             await transport.setTransportEnabled(true, identity: identity)
             await transport.startRetransmissionLoop()
             // Register the RNS `rnstransport.path.request` callback so
@@ -293,6 +460,21 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             // `handlePathRequest` is never invoked. PipePeer already
             // does this at startup for the same reason.
             await transport.registerPathRequestHandler()
+            // respond_to_probes / enable_remote_management register REAL IN/SINGLE
+            // management destinations under the transport identity (probe ->
+            // PROVE_ALL/accepts_links(false); remote.management -> /status + /path
+            // ALLOW_LIST handlers bound to the ACL), tracked in mgmt_destinations
+            // (+ mgmt_hashes for remote mgmt). Transport.py:396-403 / :252-258.
+            if respondToProbes {
+                await transport.registerProbeDestination(identity: identity)
+            }
+            if enableRemoteManagement {
+                // ACL already validated above (16-byte) — won't throw here.
+                try await transport.registerRemoteManagementDestination(
+                    identity: identity,
+                    allowed: remoteManagementAllowed.compactMap { hexToBytes($0) }
+                )
+            }
         }
 
         // Build the server's InterfaceConfig.
@@ -305,8 +487,10 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             mode: mode,
             host: "127.0.0.1",
             port: bindPort,
+            bitrate: bitrate,
             ifacSize: ifacSize,
-            ifacKey: ifacKey
+            ifacKey: ifacKey,
+            fixedMtu: fixedMtu
         )
 
         let server: TCPServerInterface
@@ -365,6 +549,25 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             port: bindPort,
             serverInterface: server
         )
+        // Stash the captured reticulum_config posture knobs for the read-back
+        // commands (wire_instance_posture / wire_transport_enabled /
+        // wire_rpc_authkey). The probe / remote-management DESTINATIONS are
+        // already live on the Transport (registered above); these flags carry
+        // the standalone-instance posture.
+        inst.enableTransport = enableTransport
+        inst.panicOnInterfaceError = panicOnInterfaceError
+        inst.useImplicitProof = useImplicitProof
+        // Propagate the implicit-proof policy to THIS instance's prover transport
+        // so the single-packet prove path emits the configured form (implicit
+        // signature-only vs explicit packet_hash||signature). Per-instance scoped —
+        // see wire_set_proof_implicit (WireTcp+Iface.swift). Defaults true on both.
+        try blockingAsync { await inst.transport.setUseImplicitProof(useImplicitProof) }
+        inst.respondToProbes = respondToProbes
+        inst.remoteManagementEnabled = enableRemoteManagement
+        inst.remoteManagementAllowed = remoteManagementAllowed
+        inst.blackholeSources = blackholeSources
+        inst.interfaceDiscoverySources = interfaceDiscoverySources
+        inst.rpcKey = capturedRpcKey
         wireLock.lock()
         wireInstances[handle] = inst
         wireLock.unlock()
@@ -372,7 +575,10 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         return [
             "handle": .string(handle),
             "port": .int(Int(bindPort)),
-            "identity_hash": hex(identity.hash)
+            "identity_hash": hex(identity.hash),
+            // Echo the resolved transport posture (python parity, wire_tcp.py:714);
+            // the conftest records it as `configured_transport_enabled`.
+            "transport_enabled": boolean(enableTransport)
         ]
 
     // MARK: wire_start_tcp_client
@@ -386,9 +592,13 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         let targetPortInt = try getInt(p, "target_port")
         let targetPort = UInt16(clamping: targetPortInt)
         let mode = try parseWireInterfaceMode(getStringOptional(p, "mode"))
+        // fixed_mtu mirrors the server side: both ends of a link must pin the
+        // same fixed MTU for the small link SDU to survive negotiation
+        // (TCPInterface.py:110-116). Absent -> autoconfigured (8192 for 10 Mbps).
+        let fixedMtu = getIntOptional(p, "fixed_mtu")
 
         let ifacKey = deriveIfacKey(networkName: networkName, passphrase: passphrase)
-        let ifacSize = ifacKey != nil ? 16 : 0
+        let ifacSize = ifacKey != nil ? Interface.resolveIfacSize(bits: getIntOptional(p, "ifac_size")) : 0
 
         let identity = Identity()
         let transport = ReticulumTransport(pathTable: PathTable())
@@ -417,7 +627,8 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             host: targetHost,
             port: targetPort,
             ifacSize: ifacSize,
-            ifacKey: ifacKey
+            ifacKey: ifacKey,
+            fixedMtu: fixedMtu
         )
 
         let client: TCPInterface
@@ -510,6 +721,10 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         let appName = try getString(p, "app_name")
         let aspects = getStringArray(p, "aspects")
         let appData = getHexOptional(p, "app_data")
+        // enable_ratchets (RNS cmd_wire_announce): grow a per-destination ratchet
+        // store BEFORE announcing so the announce carries the current ratchet
+        // public key and the destination exposes ratchet observables.
+        let enableRatchets = getBoolOptional(p, "enable_ratchets") ?? false
 
         let inst = try requireInstance(handle)
 
@@ -528,7 +743,20 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             await inst.transport.registerDestination(destination)
         }
 
-        let announce = Announce(destination: destination, appData: appData)
+        // Destination.enable_ratchets (Destination.py:466-489): leaves count >= 1
+        // with a valid current ratchet id. Unique temp store per destination to
+        // avoid cross-test contamination / signed-store reload mismatch.
+        var ratchetPub: Data? = nil
+        if enableRatchets {
+            let ratchetStore = FileManager.default.temporaryDirectory
+                .appendingPathComponent("rns-swift-dest-ratchets-\(UUID().uuidString)", isDirectory: true).path
+            try blockingAsync {
+                try await destination.enableRatchets(storagePath: ratchetStore)
+            }
+            ratchetPub = try blockingAsync { await destination.ratchetManager?.currentRatchetPublicBytes() }
+        }
+
+        let announce = Announce(destination: destination, appData: appData, ratchet: ratchetPub)
         let packet: Packet
         do {
             packet = try announce.buildPacket()
@@ -542,10 +770,16 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
 
         inst.destinations.append((identity, destination))
 
-        return [
+        var announceResult: [String: JSONValue] = [
             "destination_hash": hex(destination.hash),
             "identity_hash": hex(identity.hash)
         ]
+        if enableRatchets {
+            let ratchetCount = try blockingAsync { await destination.ratchetManager?.count() ?? 0 }
+            announceResult["ratchets_enabled"] = boolean(destination.ratchetsEnabled)
+            announceResult["ratchet_count"] = .int(ratchetCount)
+        }
+        return announceResult
 
     // MARK: wire_poll_path
 
@@ -758,6 +992,32 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         let handle = try getString(p, "handle")
         let appName = try getString(p, "app_name")
         let aspects = getStringArray(p, "aspects")
+        // resource_strategy ('all'|'none'|'app', default 'all'): how an inbound
+        // Link accepts incoming Resource advertisements (RNS Link.set_resource_strategy,
+        // RNS/Link.py:1087-1098). python cmd_wire_listen validates the same three
+        // values and raises on anything else (reference/wire_tcp.py:1261-1265).
+        let strategyStr = (getStringOptional(p, "resource_strategy") ?? "all").lowercased()
+        let resourceStrategy: ResourceStrategy
+        switch strategyStr {
+        case "all": resourceStrategy = .acceptAll
+        case "none": resourceStrategy = .acceptNone
+        case "app": resourceStrategy = .acceptApp
+        default:
+            throw BridgeError.invalidData(
+                "resource_strategy must be 'all', 'none' or 'app' (got \(strategyStr))"
+            )
+        }
+        // enable_ratchets (RNS cmd_wire_listen): same precondition as wire_announce
+        // — the IN destination grows a ratchet store before its immediate announce.
+        let enableRatchets = getBoolOptional(p, "enable_ratchets") ?? false
+        // proof_strategy ('none' default | 'all'): the IN destination's packet-proof
+        // strategy (RNS cmd_wire_listen, reference/wire_tcp.py:1267,1292-1298 calls
+        // destination.set_proof_strategy). handleRegularData GATES opportunistic
+        // SINGLE-DATA auto-proof on destination.proofStrategy
+        // (ReticulumTransport.swift:2705-2710), so a receiver must be set to PROVE_ALL
+        // to auto-prove (tests/wire/test_opportunistic_proof.py). Default PROVE_NONE
+        // is left untouched so the LXMF/Columba opportunistic path is not double-proofed.
+        let proofStrategyStr = (getStringOptional(p, "proof_strategy") ?? "none").lowercased()
 
         let inst = try requireInstance(handle)
 
@@ -770,6 +1030,20 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
             direction: .in
         )
 
+        // Mirror python's set_proof_strategy mapping exactly: 'all' -> PROVE_ALL,
+        // 'none' -> default PROVE_NONE (no-op), anything else raises
+        // (reference/wire_tcp.py:1292-1298).
+        switch proofStrategyStr {
+        case "all":
+            try destination.setProofStrategy(Destination.PROVE_ALL)
+        case "none":
+            break
+        default:
+            throw BridgeError.invalidData(
+                "Unsupported proof_strategy=\(proofStrategyStr); expected 'none' or 'all'"
+            )
+        }
+
         let listener = WireListener(destination: destination, identity: identity)
 
         // Register destination so inbound packets/link requests get routed
@@ -777,19 +1051,56 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // packet + resource callbacks onto each newly-accepted Link.
         try blockingAsync {
             await inst.transport.registerDestination(destination)
+            // Opportunistic-DATA callback on the SINGLE destination itself
+            // (DATA addressed directly to the destination hash, NOT routed
+            // through a Link). Mirrors python's
+            // destination.set_packet_callback(on_opportunistic_packet)
+            // (reference/wire_tcp.py:1331-1334): the decrypted SINGLE-DATA
+            // payload surfaced by handleRegularData's callbackManager.deliver
+            // (ReticulumTransport.swift:2678) is buffered in the SEPARATE
+            // opportunistic buffer so wire_opportunistic_poll and
+            // wire_link_poll drain distinct surfaces
+            // (reference/wire_tcp.py:1312-1313,10317-10320). registerDestination
+            // above already installed the callback manager, so this never
+            // throws callbackManagerNotSet.
+            try destination.registerCallback { data, _packet in
+                listener.append(opportunisticData: data)
+            }
             await inst.transport.registerDestinationLinkCallback(for: destination.hash) { link in
                 await link.setPacketCallback { data, _packet in
                     listener.append(packetData: data)
                 }
-                await link.setResourceStrategy(.acceptAll)
-                // Set up resource concluded callback
-                let callbacks = WireResourceCallbacks(listener: listener)
+                // Honor the requested resource strategy (RNS/Link.py:1087-1098):
+                // .acceptAll accepts every advertisement, .acceptNone drops them
+                // silently (no parts flow), .acceptApp consults the callback's
+                // resourceAdvertised predicate and sends a RESOURCE_RCL reject on
+                // decline. Mirrors python's link.set_resource_strategy(strategy_const)
+                // + the app_accept callback (reference/wire_tcp.py:1442-1451).
+                await link.setResourceStrategy(resourceStrategy)
+                // Resource lifecycle callbacks: the ACCEPT_APP predicate, the
+                // bz2-bomb decompression-bound lowering (resourceStarted), and the
+                // completed-resource buffering (resourceConcluded).
+                let callbacks = WireResourceCallbacks(
+                    listener: listener, strategy: resourceStrategy
+                )
                 await link.setResourceCallbacks(callbacks)
             }
         }
 
+        // Destination.enable_ratchets (Destination.py:466-489) before the announce,
+        // so the announce carries the current ratchet public key.
+        var ratchetPub: Data? = nil
+        if enableRatchets {
+            let ratchetStore = FileManager.default.temporaryDirectory
+                .appendingPathComponent("rns-swift-dest-ratchets-\(UUID().uuidString)", isDirectory: true).path
+            try blockingAsync {
+                try await destination.enableRatchets(storagePath: ratchetStore)
+            }
+            ratchetPub = try blockingAsync { await destination.ratchetManager?.currentRatchetPublicBytes() }
+        }
+
         // Announce so the sender peer can learn a path to this destination.
-        let announce = Announce(destination: destination)
+        let announce = Announce(destination: destination, ratchet: ratchetPub)
         let packet: Packet
         do {
             packet = try announce.buildPacket()
@@ -803,10 +1114,20 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         inst.destinations.append((identity, destination))
         inst.listeners[destination.hash.map { String(format: "%02x", $0) }.joined()] = listener
 
-        return [
+        var listenResult: [String: JSONValue] = [
             "destination_hash": hex(destination.hash),
-            "identity_hash": hex(identity.hash)
+            "identity_hash": hex(identity.hash),
+            "resource_strategy": .string(strategyStr),
+            // public_key surfaced for the recall byte-identity asserts (conftest
+            // listening_identity); additive, tolerated by older consumers.
+            "public_key": hex(identity.publicKeys)
         ]
+        if enableRatchets {
+            let ratchetCount = try blockingAsync { await destination.ratchetManager?.count() ?? 0 }
+            listenResult["ratchets_enabled"] = boolean(destination.ratchetsEnabled)
+            listenResult["ratchet_count"] = .int(ratchetCount)
+        }
+        return listenResult
 
     // MARK: wire_link_open
 
@@ -916,6 +1237,35 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         let out = listener.drainPackets().map { JSONValue.string(bytesToHex($0)) }
         return ["packets": .array(out)]
 
+    // MARK: wire_opportunistic_poll
+
+    case "wire_opportunistic_poll":
+        // python: cmd_wire_opportunistic_poll (reference/wire_tcp.py:10308-10349).
+        // Receiver-side observable for opportunistic delivery: drains the
+        // destination's opportunistic-DATA buffer (DATA addressed directly to
+        // the SINGLE destination, NOT routed through a Link) populated by the
+        // packet callback registered in wire_listen. Counterpart to the
+        // sender-side wire_send_opportunistic. Kept separate from
+        // wire_link_poll so a test that opens a Link AND receives opportunistic
+        // DATA on the same destination drains each surface unambiguously
+        // (reference/wire_tcp.py:10317-10320). Returns {packets:[hex,...]} of
+        // the decrypted payloads and clears the buffer.
+        let handle = try getString(p, "handle")
+        let destHashHex = try getString(p, "destination_hash")
+        let timeoutMs = getIntOptional(p, "timeout_ms") ?? 5000
+
+        let inst = try requireInstance(handle)
+        guard let listener = inst.listeners[destHashHex] else {
+            throw BridgeError.invalidData("No listener registered for destination_hash=\(destHashHex)")
+        }
+
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
+        while Date() < deadline, !listener.hasAnyOpportunistic() {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        let out = listener.drainOpportunistic().map { JSONValue.string(bytesToHex($0)) }
+        return ["packets": .array(out)]
+
     // MARK: wire_resource_send
 
     case "wire_resource_send":
@@ -923,6 +1273,16 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         let linkIdHex = try getString(p, "link_id")
         let payload = try getHex(p, "data")
         let timeoutMs = getIntOptional(p, "timeout_ms") ?? 30000
+        // metadata (hex) -> packed into the Resource 'x' field + flag bit 5
+        // (RNS/Resource.py:260-268); None omits it. python cmd_wire_resource_send
+        // passes it straight to RNS.Resource (wire_tcp.py resource_send docstring).
+        let metadata = getHexOptional(p, "metadata")
+        // wait (default True): when False, start the transfer and return
+        // immediately with {started, resource_id, ...} so the caller can abort it
+        // mid-flight via wire_resource_cancel — the only way to drive RESOURCE_ICL
+        // (reference/wire_tcp.py:1809-1828). A blocking send polls to a terminal
+        // state instead.
+        let wait = getBoolOptional(p, "wait") ?? true
 
         let inst = try requireInstance(handle)
         guard let link = inst.outLinks[linkIdHex] else {
@@ -933,7 +1293,50 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // wait until the transfer completes (or times out). Poll the
         // resource's state.
         let resource: Resource = try blockingAsync {
-            try await link.sendResource(data: payload)
+            try await link.sendResource(data: payload, metadata: metadata)
+        }
+
+        // Generate a resource_id (python secrets.token_hex(8) — 16 hex chars) and
+        // retain the outbound Resource so wire_resource_cancel can abort it later.
+        // Stored for BOTH wait paths, matching python's inst["out_resources"]
+        // (reference/wire_tcp.py cmd_wire_resource_send).
+        let resourceId = Data((0..<8).map { _ in UInt8.random(in: 0...255) })
+            .map { String(format: "%02x", $0) }.joined()
+        inst.outResources[resourceId] = resource
+
+        // Construction-time observables read off the REAL prepared outbound
+        // Resource (sendResource has already run __init__ + prepare). These keys
+        // mirror the python cmd_wire_resource_send response (total_segments /
+        // has_metadata / compressed / original_hash, read off RNS.Resource — never
+        // recomputed). total_segments and has_metadata are asserted by
+        // test_resource_protocol.py (completeness + metadata_x_flag cases); their
+        // prior absence surfaced as KeyError on the python side.
+        let sendObservables: [String: WireSendObs] = try blockingAsync {
+            let totalSegments = await resource.totalSegments
+            let hasMetadata = await resource.metadataSize > 0
+            let compressed = await resource.compressed
+            let segHash = await resource.hash
+            let originalHash = await resource.originalHash ?? segHash
+            return [
+                "total_segments": .i(totalSegments),
+                "has_metadata": .b(hasMetadata),
+                "compressed": .b(compressed),
+                "original_hash": originalHash.map { WireSendObs.h($0) } ?? .null
+            ]
+        }
+
+        // Non-blocking send (wait=False): the transfer is running on the link's
+        // own tasks; return immediately so the caller can cancel it mid-flight.
+        // Mirrors python's {started, resource_id, size, **info} early return
+        // (reference/wire_tcp.py:1809-1828).
+        if !wait {
+            var startedResult: Result = [
+                "started": boolean(true),
+                "resource_id": .string(resourceId),
+                "size": .int(payload.count)
+            ]
+            for (k, v) in sendObservables { startedResult[k] = wireSendObsToJSON(v) }
+            return startedResult
         }
 
         // Track the most-recent observed state separately from the
@@ -942,13 +1345,19 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         // `status` would hide the actual stage the transfer got stuck
         // in — report `lastSeen` instead so tests can distinguish
         // "never started" from "stalled mid-transfer".
+        //
+        // Break on ANY terminal state (state.isTerminal), not just
+        // .complete/.failed: an ACCEPT_APP/bomb RESOURCE_RCL lands the sender in
+        // .rejected (status 0) and a cancel lands it in .failed/.cancelled — all
+        // must conclude the poll promptly instead of spinning to the full
+        // timeout (RNS REJECTED conclusion, RNS/Link.py handleResourceReject).
         let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000.0)
         var lastSeen: ResourceState = .none
         var terminalState: ResourceState?
         while Date() < deadline {
             let state: ResourceState = try blockingAsync { await resource.state }
             lastSeen = state
-            if state == .complete || state == .failed {
+            if state.isTerminal {
                 terminalState = state
                 break
             }
@@ -957,12 +1366,15 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         let timedOut = terminalState == nil
         let reportedState = terminalState ?? lastSeen
         let success = reportedState == .complete
-        return [
+        var sendResult: Result = [
             "success": boolean(success),
             "status": .int(reportedState.rawValueForBridge),
             "size": .int(payload.count),
-            "timed_out": boolean(timedOut)
+            "timed_out": boolean(timedOut),
+            "resource_id": .string(resourceId)
         ]
+        for (k, v) in sendObservables { sendResult[k] = wireSendObsToJSON(v) }
+        return sendResult
 
     // MARK: wire_resource_poll
 
@@ -984,13 +1396,18 @@ func handleWireCommand(_ command: String, _ p: [String: JSONValue]) throws -> Re
         return ["resources": .array(out)]
 
     default:
+        // Route any wire_* command not matched above into the per-cluster
+        // wire sub-handlers (WireTcp+Link/Resource/Channel/Inject/Send/
+        // Identity/Iface.swift). Each returns nil for commands it doesn't own;
+        // the chain is defined in handleWireExtensionCommand (Ext+Dispatch.swift).
+        if let r = try handleWireExtensionCommand(command, p) { return r }
         throw BridgeError.unknownCommand(command)
     }
 }
 
 // MARK: - Helpers
 
-private func requireInstance(_ handle: String) throws -> WireInstance {
+func requireInstance(_ handle: String) throws -> WireInstance {
     wireLock.lock(); defer { wireLock.unlock() }
     guard let inst = wireInstances[handle] else {
         throw BridgeError.invalidData("Unknown handle: \(handle)")
@@ -1004,7 +1421,46 @@ private func requireInstance(_ handle: String) throws -> WireInstance {
 /// directly.
 private final class WireResourceCallbacks: ResourceCallbacks, @unchecked Sendable {
     let listener: WireListener
-    init(listener: WireListener) { self.listener = listener }
+    let strategy: ResourceStrategy
+    init(listener: WireListener, strategy: ResourceStrategy = .acceptAll) {
+        self.listener = listener
+        self.strategy = strategy
+    }
+
+    /// ACCEPT_APP predicate (consulted only under `.acceptApp`, see
+    /// Link.receiveResourceAdvertisement gate): accept iff the advertised
+    /// uncompressed data size is <= 4096. Mirrors python's app_accept
+    /// (reference/wire_tcp.py:1442-1451:
+    /// `advertisement.get_data_size() <= _RESOURCE_APP_ACCEPT_MAX_SIZE`). The
+    /// inbound `resource` here is built from the advertisement, so its
+    /// `totalDataSize` equals `advertisement.dataSize`, which is exactly what
+    /// RNS `ResourceAdvertisement.get_data_size()` returns (RNS/Resource.py:1312).
+    /// On decline the Link emits a RESOURCE_RCL, landing the sender in REJECTED.
+    func resourceAdvertised(_ resource: Resource) async -> Bool {
+        let dataSize = await resource.totalDataSize
+        return dataSize <= wireResourceAppAcceptMaxSize
+    }
+
+    /// Retain every inbound Resource the instant it starts, keyed by this
+    /// listener's IN destination hash, so wire_resource_receiver_status can read
+    /// its terminal state / receivedMetadata / assembledData / HMU counters after
+    /// it concludes. Mirrors the python listener's resource_started hook that
+    /// appends an incoming_resources record (wire_tcp.py:1368-1407). Resource is
+    /// an actor; Resource.cleanup() keeps assembledData + receivedMetadata in RAM,
+    /// so the retained reference stays readable post-conclusion. The observation
+    /// registry + reader live in WireTcp+Resource.swift (the W-RESOURCE cluster).
+    func resourceStarted(_ resource: Resource) async {
+        // Lower the per-inbound-resource decompression bound so the bz2
+        // decompression-bomb guard trips cheaply at assemble() time. resourceStarted
+        // fires before any part is decompressed, so the bound is in effect when the
+        // bounded bz2 decompressor runs (RNS/Resource.py:686-689). Mirrors python's
+        // on_resource_started setting resource.max_decompressed_size =
+        // _WIRE_RX_MAX_DECOMPRESSED (reference/wire_tcp.py:1368-1384).
+        await resource.setMaxDecompressedSize(wireRxMaxDecompressed)
+        let destHashHex = listener.destination.hash
+            .map { String(format: "%02x", $0) }.joined()
+        wireRegisterInboundResource(destinationHashHex: destHashHex, resource)
+    }
 
     func resourceConcluded(_ resource: Resource) async {
         let state = await resource.state
@@ -1017,6 +1473,26 @@ private final class WireResourceCallbacks: ResourceCallbacks, @unchecked Sendabl
         }
         let hash = await resource.hash
         listener.append(resource: data, hash: hash)
+    }
+}
+
+/// Sendable scalar carrier for the construction observables wire_resource_send
+/// reads off the prepared outbound Resource inside `blockingAsync` (a
+/// `[String: WireSendObs]` is Sendable; the JSONValue helpers are not). Mapped to
+/// JSONValue outside the actor hop.
+private enum WireSendObs: Sendable {
+    case i(Int)
+    case b(Bool)
+    case h(Data)
+    case null
+}
+
+private func wireSendObsToJSON(_ v: WireSendObs) -> JSONValue {
+    switch v {
+    case .i(let x): return .int(x)
+    case .b(let x): return .bool(x)
+    case .h(let d): return hex(d)
+    case .null: return .null
     }
 }
 
@@ -1036,8 +1512,12 @@ private extension ResourceState {
         case .assembling: return 5
         case .complete: return 6
         case .failed: return 7
-        case .rejected: return 8
-        case .cancelled: return 9
+        // RNS REJECTED == NONE == 0; swift `.cancelled` -> RNS FAILED (cancel() sets
+        // FAILED); CORRUPT == 0x08 (RNS/Resource.py:143-152). Unified with the other
+        // two status mappers.
+        case .rejected: return 0
+        case .corrupt: return 8
+        case .cancelled: return 7
         }
     }
 }

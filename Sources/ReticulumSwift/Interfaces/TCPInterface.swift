@@ -64,8 +64,31 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     /// Current connection state
     public private(set) var state: InterfaceState = .disconnected
 
-    /// Hardware MTU — TCP has no practical limit, matches Python TCPInterface.HW_MTU
-    public var hwMtu: Int { 262144 }
+    /// Hardware MTU — derived from the config, mirroring RNS construction order
+    /// (TCPInterface.py:116 + Interface.optimise_mtu via interface_post_init):
+    /// a configured `fixed_mtu` wins; otherwise an autoconfigured TCP link maps
+    /// its (floored) bitrate through `optimise_mtu` — a default 10 Mbps TCP link
+    /// lands on 8192, NOT the 262144 class ceiling. See `Interface.deriveHwMtu`.
+    public var hwMtu: Int {
+        Interface.deriveHwMtu(
+            fixedMtu: config.fixedMtu,
+            autoconfigureMtu: config.autoconfigureMtu,
+            bitrate: config.bitrate,
+            bitrateGuess: Interface.tcpBitrateGuess,
+            classHwMtu: Interface.tcpClassHwMtu
+        )
+    }
+
+    /// `AUTOCONFIGURE_MTU` posture for this interface (TCPInterface.py:78).
+    /// Observable by the conformance bridge's `wire_interface_hw_mtu`.
+    public var autoconfigureMtu: Bool { config.autoconfigureMtu }
+
+    /// Configured `fixed_mtu` (FIXED_MTU value) or nil (TCPInterface.py:110-116).
+    public var fixedMtu: Int? { config.fixedMtu }
+
+    /// `TCPInterface.HW_MTU` pre-autoconfigure ceiling (262144) — the
+    /// class-level constant, distinct from the live `hwMtu` above.
+    public var classHwMtu: Int { Interface.tcpClassHwMtu }
 
     /// Underlying framed transport
     private var transport: FramedTransport?
@@ -134,6 +157,12 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
     public init(config: InterfaceConfig) throws {
         guard config.type == .tcp else {
             throw InterfaceError.invalidConfig(reason: "TCPInterface requires config type .tcp, got \(config.type)")
+        }
+
+        // Mirror TCPInterface.py:113: a configured fixed_mtu below Reticulum.MTU
+        // (500) is rejected at construction.
+        if let fixedMtu = config.fixedMtu, fixedMtu < MTU {
+            throw InterfaceError.invalidConfig(reason: "Configured MTU of \(fixedMtu) bytes is too small")
         }
 
         self.id = config.id

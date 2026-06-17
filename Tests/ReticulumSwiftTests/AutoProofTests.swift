@@ -37,6 +37,13 @@ final class AutoProofTests: XCTestCase {
     /// SINGLE destination, with our identity's private keys present so the
     /// auto-proof handler will fire on inbound DATA.
     ///
+    /// The destination opts into `PROVE_ALL`. RNS only emits an opportunistic
+    /// SINGLE proof when the destination's `proof_strategy` calls for it
+    /// (Transport.py:2156-2165) — the default `PROVE_NONE` proves nothing, so
+    /// without this the auto-proof path (correctly) stays silent. These tests
+    /// pin the proof *wire format* (SINGLE destination-type, IFAC routing), not
+    /// the trigger policy, so they request proving explicitly here.
+    ///
     /// Returns the transport, the interface, the destination, and the
     /// identity (caller needs the identity to encrypt a payload to it).
     private func makeAutoProofFixture(
@@ -52,6 +59,7 @@ final class AutoProofTests: XCTestCase {
             appName: "test",
             aspects: ["autoproof"]
         )
+        try destination.setProofStrategy(Destination.PROVE_ALL)
 
         let transport = ReticulumTransport()
         try await transport.addInterface(interface)

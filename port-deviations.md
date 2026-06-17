@@ -6,6 +6,23 @@ file:line, the python reference site, and the reason.
 
 ## Active deviations
 
+### ConformanceBridge `crypto_provider_op` — single crypto provider
+
+**Sites:** `Sources/ConformanceBridge/Ext+Crypto.swift` — `handleCryptoExtCommand`,
+`crypto_provider_op` case.
+
+**Python reference:** `reticulum-conformance/reference/bridge_server.py`
+`cmd_crypto_provider_op` — drives a primitive through a *named* RNS crypto backend
+(`PROVIDER_INTERNAL` pure-Python vs `PROVIDER_PYCA` OpenSSL), which RNS selects at
+import time, to assert the two backends are byte-identical on the wire.
+
+**Reason:** Category (a) — language/runtime. reticulum-swift has a *single* crypto
+provider (CryptoKit + CryptoSwift); there is no second backend to switch to. The
+bridge command accepts and validates the `provider` arg (`internal`/`pyca`) for
+API parity but maps both onto the same implementation. The conformance test only
+asserts the two providers produce identical output against fixed NIST/RFC vectors,
+which a single shared implementation satisfies trivially. No protocol bytes differ.
+
 ### `ReticulumTransport.onInterfacePeerSpawned` / `onInterfaceConnected` (new feature)
 
 **Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
@@ -93,11 +110,17 @@ fired — that leak is what this fixes.
    `ResourceCompression.decompress` / `bz2Decompress` cap the output buffer at
    `AUTO_COMPRESS_MAX_SIZE` (64 MB) and throw `BZ2Error.exceedsMaxDecompressedSize`
    on overflow, so an over-compressible ("bz2 bomb") payload can't exhaust memory
-   (`assemble()` passes the advertised size as the buffer hint). **Deferred:** python's
-   overflow *response* additionally `reject()`s (RESOURCE_RCL) and tears the link down
-   (the CORRUPT branch of `cancel()`, `Resource.py:1081-1084`); the swift overflow throw
-   currently takes the ordinary corrupt path (drop + conclude, no reject/teardown — the
-   same deferral as the rest of the corrupt-assembly handling above).
+   (`assemble()` passes the advertised size as the buffer hint). **Now wired
+   (2026-06-14):** python's overflow *response* additionally `reject()`s
+   (RESOURCE_RCL) and tears the link down (the CORRUPT branch of `cancel()`,
+   `Resource.py:688-692` → `:1081-1084`). `assemble()` distinguishes this case as
+   `corruptReason == .decompressionOverflow`, and `handleResourceData`'s assembly
+   catch now routes it through `cancelIncomingResource(_:corrupt:true)` (RESOURCE_RCL
+   reject + `close()` teardown) rather than the ordinary drop+conclude path — matching
+   RNS. It does NOT call `resourceConcluded` (python returns before
+   `Resource.py:723`, so no last-window is recorded). The ordinary per-segment
+   hash-mismatch / decrypt corrupt case (`corruptReason == .hashMismatch`,
+   `Resource.py:715/721`) still takes the quiet drop+conclude path above.
 
 ### Resource SEGMENTATION — disk-streaming port (perf/resource-disk-streaming 2026-06-02)
 
@@ -292,6 +315,212 @@ probe frames, not keepalives/handshake). Python already has `_last_real_data`;
 swift previously had only `lastActivity` (which counts keepalives). `lastActivity`
 / `checkZombies` are retained unchanged as the link-liveness backstop; the new
 clock drives data-path liveness.
+
+### Link resource-hooks — registry/queue/conclusion bookkeeping (Link.swift, resource-hooks 2026-06-14)
+
+**Sites:** `Sources/ReticulumSwift/Link/Link.swift` — `resourceConcluded(_:)`,
+`registerOutgoingResource`/`registerIncomingResource`/`cancelOutgoingResource`/
+`cancelIncomingResource(_:corrupt:)`/`hasIncomingResource`/`readyForNewResource`/
+`getLastResourceWindow`, `incomingResourceCount`/`outgoingResourceCount`,
+`sendResource(autoCompress:)` + `pendingOutgoingQueue`/`drainOutgoingQueue`,
+`receiveResourceAdvertisement`/`acceptInboundAdvertisement`.
+
+Python ref: `RNS/Link.py:1281-1330` (resource_concluded / register_* / cancel_* /
+has_incoming_resource / ready_for_new_resource / get_last_resource_window),
+`RNS/Link.py:1065-1098` (RESOURCE_ADV q/u/p dispatch), `RNS/Resource.py:508-538`
+(`__advertise_job` QUEUED gate), `RNS/Resource.py:216-235` (accept body).
+
+1. **`incomingResourceCount` / `outgoingResourceCount` getters.** Category (a):
+   RNS exposes `incoming_resources` / `outgoing_resources` as plain lists
+   (`RNS/Link.py:245-246`); the swift registries are `private` actor state, so
+   read-only count getters provide the same observability the conformance bridge
+   needs without leaking mutable storage. Semantics identical (list length).
+
+2. **Event-driven outgoing-resource queue instead of a 0.25s poll.** RNS
+   `Resource.__advertise_job` spins `while not link.ready_for_new_resource():
+   sleep(0.25)` (`RNS/Resource.py:522-524`) on a per-resource thread, staying in
+   `QUEUED`. The swift port has no per-resource thread and Torlando's standing
+   prefer-event-driven rule forbids polling, so `sendResource` either advertises
+   immediately (link free) or parks the prepared resource in `pendingOutgoingQueue`
+   (its prepared, non-advertised state is the swift analogue of RNS `QUEUED`), and
+   `resourceConcluded(_:)` drains the next one when the in-flight transfer
+   concludes. Category (a) — same one-at-a-time gate, push instead of poll.
+   `sendResource` also reorders to advertise-then-`registerOutgoingResource`,
+   matching RNS order (`RNS/Resource.py:527→534`) so `readyForNewResource()` reads
+   empty until the first advertisement is sent.
+
+3. **`resourceConcluded(_:)` omits `expected_rate`.** RNS recomputes
+   `self.expected_rate` here (`RNS/Link.py:1287/1290`); nothing in this port
+   consumes it, so it is omitted. Category (b) — faithful drop of an unused field.
+   The window record (`last_resource_window = resource.window`, `RNS/Link.py:1284`)
+   IS ported.
+
+4. **`cancelIncomingResource(_:corrupt:)` — `corrupt:true` flag (Plan-A seam).**
+   Category (a)/(b): `corrupt:false` mirrors RNS `cancel_incoming_resource`
+   exactly (`RNS/Link.py:1324-1326`, plain registry removal). `corrupt:true` is a
+   port addition that routes the receiver-side CORRUPT teardown (RNS
+   `Resource.cancel()` CORRUPT branch — reject + bz2-overflow teardown,
+   `RNS/Resource.py:688-692`/`:1079-1085`) through the **Link** rather than letting
+   the `Resource` actor re-enter the `Link` mid-cancel (reentrancy hazard).
+   **Now wired (2026-06-14):** `handleResourceData`'s assembly catch calls
+   `cancelIncomingResource(_:corrupt:true)` when `assemble()` reports
+   `corruptReason == .decompressionOverflow`, so the production receive path now
+   exercises this teardown (it is no longer a dormant seam).
+
+5. **RESOURCE_ADV `acceptNone` no longer sends a reject (RNS fidelity fix).**
+   Previously the swift handler rejected on every non-accept path; RNS sends a
+   reject ONLY from the declined `ACCEPT_APP` branch (`RNS/Link.py:1094`) and does
+   `pass` for `ACCEPT_NONE` (`RNS/Link.py:1087`). `receiveResourceAdvertisement`
+   now matches RNS. This is a fix toward upstream, not a divergence; noted here for
+   traceability.
+
+6. **`request_id`-without-`p`-flag response fallback (open risk).** RNS keys
+   response-resource detection on the `p` flag (`is_response`,
+   `RNS/Resource.py:1251-1257`). This port additionally accepts an advertisement
+   that carries a `request_id` matching a pending request even when `p` is unset,
+   preserving the pre-existing live LXMF/Columba request/response behaviour. If
+   real senders are confirmed to always set `p`, drop this fallback. Category (b),
+   provisional. **Re-confirmed 2026-06-14:** still accurate — RNS `is_response`
+   (`RNS/Resource.py:1254`) is `adv.q != None and adv.p`; this fallback remains a
+   deliberate permissive divergence kept for live interop, not yet retired.
+
+7. **`sendResource(autoCompress:)` default is `false` (RNS default is `true`).**
+   Category (b), intentional. RNS `Resource.__init__` defaults `auto_compress=True`
+   (`RNS/Resource.py:248`, applied `:366-372`). This port plumbs `autoCompress`
+   faithfully through `sendResource` → `Resource.init` → `prepare()` (no longer
+   hardcoded), but the DEFAULT is `false` because this port's BZ2 output has not
+   been interop-verified against the Python receiver (see inline note
+   `Link.swift:1455-1459`/`1489-1491`). Wire effect: a caller relying on the RNS
+   default gets an UNcompressed resource. Flip the default to `true` once E2E BZ2
+   interop is verified. **Re-confirmed 2026-06-14:** still accurate and still
+   intentional.
+
+8. **`sendResource(metadata:)` pass-through** — `Link.swift` `sendResource`.
+   Category (a)/faithful. RNS has no `Link.send_resource`; an outbound resource is
+   sent by constructing `RNS.Resource(data, link, metadata=…, advertise=True)`
+   (`RNS/Resource.py:248`). The swift `sendResource` is the port-convenience wrapper
+   for that construction, so adding a `metadata: Data? = nil` argument it forwards to
+   `Resource.init(metadata:)` mirrors RNS exactly. Default `nil` keeps every existing
+   call site (and its byte layout / `total_size`) unchanged — `metadataSize` stays 0,
+   adv flag bit 5 stays clear. Added 2026-06-14 so the conformance bridge can drive a
+   metadata-bearing live transfer (wire_resource_send metadata round-trip).
+
+**Wired in this file (2026-06-14 fidelity pass):**
+- `acceptInboundAdvertisement` now calls
+  `applyInheritedWindow(getLastResourceWindow())` BEFORE `resource.accept()`, so a
+  second inbound transfer on the same link inherits the prior receiver window
+  exactly as RNS `Resource.accept` (`RNS/Resource.py:216-219`). Previously only the
+  conformance bridge wired this, leaving the production path stuck on slow-start.
+- `handleResourceProof` now routes through the faithful port
+  `Resource.validate_proof` (`Resource.swift:1696`), which enforces
+  `proof_data[32:] == expected_proof` (`RNS/Resource.py:782-787`) before
+  concluding/advancing — the prior inline `transitionState(.complete)` path
+  concluded on the 32-byte hash match alone and dropped the integrity check. On a
+  proof mismatch the resource now stays awaiting-proof (RNS fall-through,
+  `RNS/Resource.py:822-823`).
+- `handleResourceData`'s assembly catch now branches on `corruptReason`: the bz2
+  over-size case tears the link down (see the corrupt-assembly entry above), the
+  ordinary hash-mismatch case concludes quietly.
+
+**Still deferred to Plan A (Resource.swift) integration — NOT yet wired in this file:**
+`acceptInboundAdvertisement` does not yet call `deriveReceiverPartCount(self.mdu)`
+(RNS `Resource.accept:187`), explicit `hashmapUpdate(0, adv.m)` (RNS `:233`), or
+per-instance `maxDecompressedSize`; `handleResourceRequest` has no
+`registerRequestHash` dedup; and `handleResourceHMU` still calls
+`appendHashmapSegment` (the future `hashmapUpdate(segment:hashmap:)` alias). These
+depend on Plan A's Resource API surface, which is not present in this tree; the
+existing receive/HMU behaviour is preserved so the regression suite stays green
+until Plan A lands. (Consistent in practice because both peers share the negotiated
+link MDU, so receiver part-count derivation from the advertisement matches
+`ceil(size/self.mdu)` except under asymmetric/renegotiated MDU.)
+
+### Link watchdog/timing observability + identify/request gaps (Link.swift, Link+Identify.swift, Link+Request.swift, RequestReceipt.swift, W-LINK 2026-06-15)
+
+**Sites:** `Sources/ReticulumSwift/Link/Link.swift` — `staleTime` field +
+`setWatchdog`/`updateKeepalive`/`checkLiveness`, `lastInboundAt`/`lastKeepaliveAt`/
+`lastKeepaliveByte`/`lastDataAt`/`activatedAt` accessors + `noInboundForMs()`,
+`encrypt`/`decrypt`/`sendKeepalive`/`processKeepalive`/`transitionState`,
+response-resource `has_metadata` fork + `handleRequestResponse(...,metadata:)`;
+`Sources/ReticulumSwift/Link/Link+Identify.swift` — `identify(identity:)`;
+`Sources/ReticulumSwift/Link/Link+Request.swift` — `respond(to:file:metadata:)`;
+`Sources/ReticulumSwift/Request/RequestReceipt.swift` — `metadata` field +
+`timeoutInterval` accessor + `receiveResponse(_:metadata:)`.
+
+Python ref: `RNS/Link.py:248-266` (timing fields), `:657-663` (no_inbound_for),
+`:689-692` (had_outbound), `:792-808/:844-846` (watchdog + __update_keepalive),
+`:459-475` (identify), `:884-895/:906-954` (handle_request file response /
+handle_response metadata / response_resource_concluded), `:1149-1153` (keepalive
+echo), `RequestReceipt` `:1369/:1377/:1457-1461` (metadata/timeout/response_received).
+
+1. **Public timing accessors for private actor fields.** Category (a): RNS exposes
+   `last_inbound`/`last_keepalive`/`last_data`/`activated_at`/`stale_time`/
+   `keepalive` as plain attributes (`RNS/Link.py:248-266`); Swift actor
+   encapsulation hides them, so `lastInboundAt`/`lastKeepaliveAt`/`lastDataAt`/
+   `activatedAt`/`staleTime` (read-only) and `noInboundForMs()` (mirrors
+   `no_inbound_for()`, `RNS/Link.py:657-663`: `now - max(last_inbound, activated_at)`,
+   returning nil only when neither reference exists) provide the same
+   observability the conformance bridge reads. Semantics identical.
+
+2. **`staleTime` is a stored, settable field read by the watchdog (was inline
+   `keepaliveInterval * 2`).** RNS `__watchdog_job` reads `self.stale_time`
+   directly (`RNS/Link.py:796`) and `__update_keepalive` keeps
+   `stale_time = keepalive * STALE_FACTOR` (`:846`). The port previously hard-coded
+   `keepaliveInterval * 2.0` inside `checkLiveness()`, so neither knob could be
+   driven at runtime. `staleTime` now defaults to `keepaliveInterval * STALE_FACTOR`
+   (2) — identical to the old inline value for any un-driven link, so the 454-test
+   regression behavior is unchanged — and `setWatchdog(keepalive:staleTime:)`
+   overrides both (RNS sets `link.keepalive`/`link.stale_time` as plain attributes,
+   `RNS/Link.py:262-263`). `updateKeepalive(forRTT:)` recomputes both together at
+   RTT measurement, mirroring `__update_keepalive`. Category (a) (settable knob via
+   explicit method instead of attribute assignment). `checkLiveness` also folds
+   `activatedAt` into its activity baseline to match `RNS/Link.py:789`.
+
+3. **`lastKeepaliveByte` / `lastKeepaliveAt` recorded on emit + echo.** New
+   observability for the bytes RNS puts on the wire (`send_keepalive` 0xFF,
+   `RNS/Link.py:849`; non-initiator answers 0xFE, `:1149-1153`). `sendKeepalive`
+   records both; `processKeepalive` additionally sets `lastKeepaliveByte = 0xFE`
+   synchronously when answering an inbound 0xFF, so the read-back is race-free
+   despite the echo send being dispatched on a detached `Task` (the swift
+   keepalive echo is already async — a pre-existing structural deviation). Category
+   (a).
+
+4. **`lastDataAt` (last_data) split from `last_inbound`.** RNS bumps `last_data`
+   only for non-KEEPALIVE traffic (`RNS/Link.py:691` outbound / `:979-980`
+   inbound). The swift port centralizes inbound/outbound timestamping in
+   `decrypt()`/`encrypt()` (a pre-existing structural deviation — there is no single
+   `receive()`); since keepalives are raw bytes routed through `processKeepalive`
+   (never `decrypt`), every `encrypt`/`decrypt` is payload and advances both
+   `lastDataAt` and `lastOutbound`/`lastInbound`, while a keepalive advances only
+   `lastInbound` (+`lastKeepaliveAt`). Net semantics match RNS. Category (a).
+
+5. **`identify(identity:)` — restriction removed + silent ACTIVE-only guard.**
+   BEHAVIOR CHANGE. RNS `identify` signs `link_id + identity.get_public_key()` with
+   the PRESENTED identity and reveals it, with NO check that the identity matches
+   the link's local identity, and is a silent no-op when `not (initiator and
+   status == ACTIVE)` (`RNS/Link.py:468-475`). The port previously (a) threw
+   `LinkError.invalidState` when `identity.hash != localIdentity.hash` and (b) threw
+   on a non-initiator / non-established link. Both were Swift-only restrictions
+   diverging from RNS; removed. Guard failures now return silently (no throw, no
+   packet) — backing identify-on-PENDING-is-a-no-op — while genuine crypto/send
+   errors still throw. No existing reticulum-swift test relied on the old throwing
+   contract (no test exercises `identify()`). The `had_outbound()` after send
+   (`:475`) is covered by `encrypt()` bumping `lastOutbound`/`lastDataAt`.
+
+6. **RequestReceipt `metadata` + `timeoutInterval` + `receiveResponse(_:metadata:)`
+   and the response-Resource `has_metadata` fork.** Category (a)/feature parity:
+   RNS `RequestReceipt.metadata`/`.timeout` are plain attributes
+   (`RNS/Link.py:1369/:1377`) and `response_received(response, metadata)` stores
+   metadata (`:1457-1461`); `response_resource_concluded` delivers a metadata-bearing
+   (file) response as raw bytes + metadata rather than `umsgpack([request_id,
+   response])` (`:939-954`). The port adds a read-only `metadata` field, a
+   `timeoutInterval` accessor (exposes the real `rtt*TRAFFIC_TIMEOUT_FACTOR(6) +
+   RESPONSE_MAX_GRACE_TIME*1.125` value), a default-nil `metadata:` param on
+   `receiveResponse` (existing call sites unchanged), the has_metadata fork in the
+   Link response-resource delivery path (keyed on `Resource.receivedMetadata`), and
+   `Link.respond(to:file:metadata:)` to emit a file response Resource. NOTE: the
+   end-to-end (file,metadata) round-trip ALSO needs server-side request dispatch
+   (`Destination.request_handlers` + REQUEST routing), which lives in Destination/
+   Transport (a sibling agent's files) and is NOT implemented here.
 
 ## Resolved deviations
 
@@ -517,3 +746,970 @@ survives, so it is safe to increase.
 `cleanup` (incl. the interface-absent cull) are unchanged. This PR fixes the
 *interface lifecycle* so a transient drop keeps its interface registered long
 enough to be reused — the layer ble-reticulum fixes it at.
+
+---
+
+## Resource core: cancel / request / validate_proof / prove / metadata / CORRUPT / hashmap_update
+
+These cover the receiver/sender Resource APIs added so the Link's resource hooks
+(`receiveResourceAdvertisement`, `resourceConcluded`, `cancelIncomingResource(corrupt:)`,
+the QUEUED gate) and the conformance bridge's `wire_resource_*` / `wire_inject_*`
+commands can drive real production logic instead of working around library gaps.
+
+1. **`.corrupt` as a distinct `ResourceState` case** — `Resource/ResourceState.swift`.
+   RNS models CORRUPT as a status code `0x08` alongside FAILED `0x07`
+   (`RNS/Resource.py:151`). The swift port adds a real enum case `.corrupt`
+   (terminal, not active, not complete). `canTransition` is RELAXED to mirror RNS:
+   (a) any non-terminal state may go to `.failed` (RNS `cancel()` sets `FAILED`
+   for any `status < COMPLETE`, `RNS/Resource.py:1086-1087`); (b) `.transferring` /
+   `.assembling` may go to `.corrupt` (`assemble()` CORRUPT outcomes,
+   `RNS/Resource.py:689/715`). Category (a) (Swift's exhaustive enum vs python's
+   loose int status). The three ConformanceBridge status mappers
+   (`WireTcp.swift` `rawValueForBridge`, `WireTcp+Resource.swift`
+   `wireResourceStatusCode`/`wireResourceStatusName`) were updated in lockstep —
+   forced because Swift `switch` over the enum is exhaustive — and UNIFIED to RNS
+   codes: `corrupt -> 8 / "CORRUPT"`, `rejected -> 0` (RNS REJECTED == NONE == 0),
+   `cancelled -> 7` (RNS `cancel()` -> FAILED).
+
+2. **`ResourceError.corruptResource` (new error case)** — `Resource/ResourceErrors.swift`.
+   `assemble()` throws this (replacing the generic `transferFailed`) on the CORRUPT
+   path so the Link can `catch ResourceError.corruptResource` and branch on
+   `corruptReason`. Category (b) (new typed error for the new CORRUPT contract).
+   Equatable + LocalizedError updated for the case (exhaustive switch).
+
+3. **`assemble()` does NOT call back into the Link** — `Resource/Resource.swift`.
+   RNS `assemble()` calls `self.link.resource_concluded(self)` and the final-segment
+   callback inline (`RNS/Resource.py:723-747`). The swift actor port instead RETURNS
+   the assembled bytes on success and THROWS `corruptResource` on failure; the Link
+   calls `resourceConcluded` after `assemble()` returns/throws. This avoids
+   Resource(actor) → Link(actor) reentrancy while `assemble()` still holds the
+   Resource's executor. Category (a) (actor reentrancy).
+
+4. **Auto-prove + idempotent `prove()` / `sendProof()` alias** — `Resource/Resource.swift`.
+   `assemble()` auto-proves on success via `prove()` (`RNS/Resource.py:713`).
+   `prove()` is idempotent (`proveCallCount`, sends at most one RESOURCE_PRF) and
+   `sendProof()` is retained ONLY as a thin alias so the Link's legacy receive path
+   and the bridge keep compiling: because `prove()` is send-once, a stray
+   `sendProof()` after auto-prove is a no-op and cannot emit a second proof (would
+   break `test_resource_no_per_part_proofs`). `prove()` hashes `provePlaintext`
+   (the FULL per-segment plaintext, metadata INCLUDED — `self.data` at RNS
+   `:684/755`), retained separately from the metadata-stripped `assembledData`, so a
+   metadata transfer's proof still matches the sender's `expectedProof =
+   full_hash(plaintext + hash)` (`RNS/Resource.py:443`). Category (a)/(b)
+   (idempotency added for the cross-agent transitional double-call; the
+   per-segment-plaintext proof source is a faithful port that also fixes the
+   metadata-proof mismatch).
+
+5. **`validate_proof(_:)` does NOT advance the Link** — `Resource/Resource.swift`.
+   RNS `validate_proof` calls `link.resource_concluded` and advertises the next
+   segment inline (`RNS/Resource.py:786-821`). The swift port only sets `state =
+   .complete`; the Link calls `validate_proof` then inspects `state` to choose
+   conclude-vs-advance. Category (a) (actor reentrancy / single-source segment
+   chaining in the Link).
+
+6. **`cancel()` CORRUPT branch delegated to the Link** — `Resource/Resource.swift`.
+   `cancel()` recurses into `nextSegment`, then: if already `.corrupt` it is a
+   no-op (the Link owns RESOURCE_RCL + teardown via `cancelIncomingResource(corrupt:
+   true)`, mirroring `RNS/Resource.py:1081-1084` but driven from the Link to avoid
+   reentrancy); otherwise it sets `.failed`, emits RESOURCE_ICL via the
+   `sendCallback` closure (not an actor hop) when `isInitiator` and the link is
+   active, and calls `link.cancelOutgoingResource` / `cancelIncomingResource` +
+   `resourceConcluded`. Category (a) (actor reentrancy).
+
+7. **Receiver hashmap kept as a CONTIGUOUS blob (not a `[None]*total_parts` slot
+   list)** — `Resource/Resource.swift` `hashmapUpdate(segment:hashmap:)` /
+   `hashmapHeight`. RNS stores per-slot entries and writes `hashmap[i + segment *
+   HASHMAP_MAX_LEN]` (`RNS/Resource.py:492-503`). This port keeps the existing
+   contiguous representation that grows as sequentially-numbered HMU segments arrive
+   (the order RNS's HMU handshake actually uses), preserving the existing
+   `handlePartPacket` search / `getPartHash` / `receivePart` validation readers with
+   no off-by-one slot arithmetic. `hashmapHeight` is the contiguous coverage
+   (`bytes/4`); `hashmapUpdate` returns whether coverage grew (false on a duplicate
+   segment) and is idempotent for re-applied segments. Out-of-order HMU segments are
+   not slotted (logged) — RNS requests them in order. Category (a) (representation
+   choice; observable height/grew/idempotency contracts preserved).
+   `appendHashmapSegment(_:wireSegment:)` is retained as a thin forwarding alias to
+   the canonical `hashmapUpdate(segment:hashmap:)`.
+
+8. **Receiver init keeps loading the advertisement hashmap chunk directly** —
+   `Resource/Resource.swift` `init(advertisement:link:)`. RNS `accept` preallocates
+   `[None]*total_parts` then calls `hashmap_update(0, hashmap_raw)`
+   (`RNS/Resource.py:210/233`). The swift inbound init loads `adv.m` into the
+   contiguous hashmap directly so a Resource built straight from an advertisement
+   (unit tests; bridge) is immediately usable; a later Link-driven
+   `hashmapUpdate(0, adv.m)` is idempotent (segment 0 already covered → false).
+   Category (a).
+
+9. **`deriveReceiverPartCount(sdu:)` is a separate async step** —
+   `Resource/Resource.swift`. RNS computes `total_parts = ceil(size/sdu)` inside
+   `accept` from `link.mtu`/`link.mdu` (`RNS/Resource.py:187`). The swift actor
+   `init` cannot `await link.mdu`, so the Link calls `deriveReceiverPartCount(self.mdu)`
+   exactly once right after construction (and before routing the initial hashmap).
+   It resizes the `parts`/`partsReceived` buffers; the hashmap is (re)loaded by the
+   Link's `hashmapUpdate(0, adv.m)`. Category (a) (actor init can't await).
+
+10. **`applyInheritedWindow` async + `ResourceWindow.setInitialWindow`** —
+    `Resource/Resource.swift`, `Resource/ResourceWindow.swift`. RNS seeds
+    `resource.window = link.get_last_resource_window()` inline in `accept`
+    (`RNS/Resource.py:216-219`). The swift port exposes `applyInheritedWindow(_:)
+    async` (cross-actor call from the Link) which calls a new
+    `ResourceWindow.setInitialWindow(_:)` setter (the window is otherwise
+    `private(set)`). Category (a).
+
+11. **`setMapHashInjector` / `injectPartRaw` test seams** — `Resource/Resource.swift`.
+    Swift has no monkeypatching, so the collision-guard remap loop
+    (`RNS/Resource.py:435-474`) and the per-part map-hash validation
+    (`RNS/Resource.py:866`) each expose an inert hook a conformance command can use
+    to force a map-hash collision (`wire_resource_force_collision`) or to land a
+    deliberately-corrupt part that survives to `assemble()`'s full-stream check
+    (`wire_inject_corrupt_assembled_resource`). Both MUST be unset/no-op in
+    production. Category (b) (test seams).
+
+### Resource receive-path fidelity-fix pass (2026-06-14)
+
+A review pass (`resource_fidelity_issues.txt`) re-aligned the receiver flow-control
+to `RNS/Resource.py`. Several flagged items were GENUINE divergences and are now
+fixed (no deviation remains, cited inline):
+
+- **`getAdvertisement` u/p flag derivation** (`Resource/Resource.swift`
+  `getAdvertisement`). Now derives `u`(is_request)/`p`(is_response) from
+  `request_id` per `ResourceAdvertisement.__init__` (`RNS/Resource.py:1295-1307`):
+  both 0 when `request_id == nil`, `u` set for an outbound request, `p` for a
+  response. The prior code never set `u`, so a swift-originated request advertised
+  with `u=0` and a python peer's `is_request()` (`:1242-1247`) misread it as a
+  plain resource (Link request/response interop break). FIXED — faithful, no
+  deviation.
+- **Window growth on batch drain** (`receivePart`). The window now grows on every
+  request-batch drain (`outstanding_parts == 0`, not just at full completion),
+  matching `RNS/Resource.py:894-904`. FIXED.
+- **`outstanding_parts` reset at request top** (`requestNextParts` →
+  `ResourceWindow.resetOutstanding`). Mirrors `self.outstanding_parts = 0` at the
+  top of `request_next` (`RNS/Resource.py:937`). FIXED.
+- **Part→index resolution scans only the current window** (`handlePartPacket`).
+  Now scans `hashmap[height : height+window]` instead of the whole hashmap, so a
+  4-byte map-hash collision outside the collision-guard span can no longer return
+  a wrong index (`RNS/Resource.py:863-866`). A part not found in-window is dropped
+  silently (no throw), matching receive_part. FIXED.
+- **Request pacing** (`handlePartPacket`). The next `RESOURCE_REQ` now issues only
+  when the batch fully drains (`outstanding == 0`) rather than on every part
+  (`outstanding < window`), matching `RNS/Resource.py:897-926`. FIXED.
+- **`hashmap_update` sets TRANSFERRING** (`hashmapUpdate`). Now self-heals
+  `ADVERTISED → TRANSFERRING` at the top (`RNS/Resource.py:493-494`) instead of
+  relying on the Link having ordered accept() before any HMU. FIXED.
+
+The following flagged items are LEFT as constrained/intentional deviations:
+
+12. **Window height model is 0-based exclusive, not python's -1-based inclusive**
+    — `Resource/ResourceWindow.swift` (`consecutiveCompletedHeight`),
+    `Resource/Resource.swift` (`receivePart` accept window). RNS
+    `consecutive_completed_height` starts at -1 and is the INCLUSIVE index of the
+    last consecutively-completed part (`RNS/Resource.py:214`); its windows are
+    `[cch, cch+window)`. This port's `windowManager.height` is a 0-based EXCLUSIVE
+    count of leading completed parts (`== cch_python + 1`), so the accept window
+    `[height, height+window)` is shifted UP by one vs python. It is internally
+    self-consistent — the request range (`getNextPartIndices`) and the accept
+    range share the same lower bound `height`, and a sender only sends requested
+    parts, so every accepted part is in-window and **interop is unaffected**. The
+    conformance bridge maps to the python value with `height - 1`
+    (`ConformanceBridge/WireTcp+Resource.swift`), and the oracle asserts
+    `consecutive_height == -1` initially against that mapping. Switching to the
+    literal -1 model would require editing the bridge's `-1` compensation (a
+    sibling-owned file) and would break that oracle assertion. Category (a)
+    (representation choice; interop-neutral).
+
+13. **`ResourceWindow.getRequestRange` scans PAST `height+window`** —
+    `Resource/ResourceWindow.swift`. RNS `request_next` requests only the `None`
+    slots inside the FIXED slice `parts[cch+1 : cch+1+window]`
+    (`RNS/Resource.py:945-957`); this port keeps scanning past `height+window`
+    until it has collected `window` incomplete indices, so on a holey transfer it
+    can request indices beyond the window (chattier than python). It is NOT changed
+    because the regression test `ResourceWindowTests.testGetRequestRangeSkipsIntermediateCompleteParts`
+    (out of this pass's edit scope — `Tests/`) asserts the scan-past-window result
+    `[2,4,5,6]` for `parts[0,1,3]=true, window=4`, which the RNS fixed-slice would
+    instead return as `[2,4,5]`. Latent on in-order transfers (the only shape the
+    oracle/regression suites exercise), where both models agree.
+
+14. **`ResourceWindow.onTimeout` halves the window; `updateWindowMin` recomputes**
+    — `Resource/ResourceWindow.swift`. RNS decrements `window`/`window_max` by 1
+    (and window_min ratchets +1, `RNS/Resource.py:616-621/902-903`); this port
+    HALVES `window`/`window_max` on timeout and recomputes
+    `window_min = max(WINDOW_MIN, window - WINDOW_FLEXIBILITY)` each call. NOT
+    changed because (a) no watchdog drives `onTimeout` in this port (latent), and
+    (b) the regression tests `ResourceWindowTests.testTimeoutHalvesWindow`
+    (asserts `window <= beforeTimeout/2 + 1`) and the `window_min` recompute curve
+    are baked into `Tests/` (out of this pass's edit scope). Fixing the math would
+    break those protected tests, which the pass is forbidden to edit.
+
+15. **`assemble()` retains the encrypted-side `assembled.count == transferSize`
+    guard** — `Resource/Resource.swift` `assemble()`. RNS has no pre-decrypt size
+    check; it relies on the per-segment hash check (`RNS/Resource.py:694-695`,
+    ported at the Step-5 hash check). The guard is defensive and CANNOT fire on a
+    valid transfer (parts are sized + map-hash-validated on receipt, and
+    `transferSize` is this segment's own `t`). Note: if it ever did fire it throws
+    `ResourceError.transferFailed` (vs `.corruptResource`), a slightly different
+    Link branch than the hash-mismatch CORRUPT path; this is acknowledged and
+    accepted as defensive-only. Already covered by deviation #8 above; reconfirmed
+    accurate in this pass.
+
+16. **`completionCallback` models RNS `self.callback` for cancel() gating** —
+    `Resource/Resource.swift` (`completionCallback`, `setCompletionCallback`,
+    `cancel()`). RNS gates `link.resource_concluded(self)` + the conclusion
+    callback on `self.callback != None` inside `cancel()`
+    (`RNS/Resource.py:1099-1104`). This port routes the normal success conclusion
+    through the Link's `ResourceCallbacks`, so it previously had no per-resource
+    conclusion callback and called `link.resourceConcluded(self)` unconditionally
+    on cancel. This pass adds the optional callback and gates the call on it,
+    matching RNS. (Net effect is also neutral because `cancelIncoming/OutgoingResource`
+    de-lists the resource first, so `resourceConcluded`'s membership-guarded
+    window record is a no-op after cancel either way — but the gate now mirrors the
+    python control flow rather than relying on that.) Category (a).
+
+12. **`assemble()` decompresses via `bz2Decompress` to distinguish overflow** —
+    `Resource/Resource.swift`. The compressed branch calls
+    `ResourceCompression.bz2Decompress(..., maxDecompressedSize:)` directly (rather
+    than the `decompress` wrapper) so it can pattern-match
+    `BZ2Error.exceedsMaxDecompressedSize` → `corruptReason = .decompressionOverflow`
+    (RNS over-size CORRUPT, `RNS/Resource.py:688-692`) vs. any other decompress
+    failure → `.hashMismatch`. `maxDecompressedSize` is now a per-instance settable
+    field (`RNS/Resource.py:364`). Category (a) (Swift error typing) — faithful to RNS.
+
+13. **Metadata oversize is clamped, not raised** — `Resource/Resource.swift`
+    `init(data:metadata:...)`. RNS raises `SystemError` when packed metadata exceeds
+    `METADATA_MAX_SIZE` (`RNS/Resource.py:263-264`). The swift initializer cannot
+    `throw`, so oversized metadata is dropped (logged) instead. Category (a)
+    (non-throwing initializer). Otherwise the metadata SEND packing
+    (`BE3(len(packed)) + msgpack.packb(.binary(metadata))`, `RNS/Resource.py:266`)
+    and RECEIVE unpack (`receivedMetadata`, `RNS/Resource.py:698-731`) mirror RNS.
+
+14. **Progress callback propagation is best-effort** — `Resource/Resource.swift`.
+    RNS `progress_callback` recurses into `next_segment` synchronously
+    (`RNS/Resource.py:1122-1124`). The swift port propagates the callback to a
+    segment when it is prepared (`prepareNextSegment`), not retroactively from
+    `setProgressCallback`. Category (a) (avoids an async hop in the setter).
+
+15. **Collision-guard remap loop is retry-capped** — `Resource/Resource.swift`
+    `prepare()`. RNS's `while not hashmap_ok` loop (`RNS/Resource.py:435-474`) has
+    no retry bound because it relies on real link encryption making every part
+    unique, so a fresh `random_hash` always breaks a map-hash collision. A fresh
+    `random_hash` CANNOT break a collision between two BYTE-IDENTICAL encrypted
+    parts (both `full_hash(part + random_hash)[:4]` are equal for any random_hash),
+    which an identity/echo encryptor over repetitive plaintext produces — spinning
+    the loop forever (observed: `ResourceCompletionTests` prepares
+    `Data(repeating: 0xAB, 4096)` with an identity `linkEncrypt`). The port caps the
+    retries at `RETRY_LIMIT` (16) and, on the final attempt, builds the hashmap
+    accepting duplicate map_hashes — exactly the pre-existing single-pass behavior —
+    so `prepare()` always terminates. The realistic (unique encrypted parts) path
+    still converges on attempt 1 with no duplicates. Category (a) (termination
+    guarantee for degenerate non-encrypting inputs).
+
+### Destination request-handler / proof-strategy / links state — NSLock-guarded (2026-06-15)
+
+**Sites:** `Sources/ReticulumSwift/Crypto/Destination.swift` — `stateLock`,
+`_requestHandlers` / `_proofStrategy` / `_proofRequestedCallback` / `_links`, and
+the public accessors `proofStrategy` / `proofRequestedCallback` / `links` plus the
+mutators `registerRequestHandler` / `deregisterRequestHandler` /
+`requestHandler(forPathHash:)` / `setProofStrategy` / `setProofRequestedCallback` /
+`appendLink`.
+
+**Python reference:** RNS stores these as plain instance attributes —
+`self.request_handlers = {}` (`RNS/Destination.py:157`), `self.proof_strategy`
+(`:160`), `self.callbacks.proof_requested` (`:43`,`:357`), `self.links = []`
+(`:172`,:`424`) — read/written directly under the GIL.
+
+**Reason:** Category (a) — language/runtime. `Destination` is a non-actor
+`final class @unchecked Sendable` shared concurrently by the Transport actor, the
+Link actor, and the conformance-bridge threads. Python serializes these
+attribute mutations under the GIL; swift has no GIL, so the map/strategy/callback/
+links storage is guarded by an internal `NSLock`. `proofStrategy` is exposed as a
+lock-guarded computed getter rather than a literal `private(set)` stored property
+for the same reason. Semantics, defaults (`PROVE_NONE`, `ALLOW_NONE`), and byte
+values are identical to RNS; only the access discipline differs.
+
+### Destination request-handling types — fixed-arity generator + `RequestResponse` enum (new feature)
+
+**Sites:** `Sources/ReticulumSwift/Crypto/Destination.swift` —
+`ResponseGenerator` typealias, `RequestResponse` enum, `RequestHandler` struct,
+`ProofRequestedCallback` typealias.
+
+**Python reference:** RNS `response_generator(path, data, request_id, link_id,
+remote_identity, requested_at)` (`RNS/Destination.py:375`) and the
+`Link.handle_request` response fork (`RNS/Link.py:877-901`), where the handler is
+the bare python list `[path, response_generator, allow, allowed_list,
+auto_compress]` (`:386`) and the generator returns a raw value or `None`.
+
+**Reason:** Category (a) — language/runtime. RNS inspects the generator's arity at
+call time (5 vs 6 args); swift has no runtime arity inspection, so the port fixes a
+single 6-argument `async` form. RNS's "return a value or `None`" is modeled by the
+`RequestResponse` enum (`.none` / `.bytes` / `.file`) so the `.none` (no-response)
+branch is type-safe rather than a nil sentinel. Wire-observable response framing is
+unchanged (the existing `respond(to:with:)` / `respond(to:file:metadata:)` send
+fork is reused). The python `[...]` list is mirrored by the `RequestHandler` struct
+field-for-field (`path`, `generator`, `allow`, `allowedList`, `autoCompress`).
+
+### Interface MTU / bitrate / IFAC helpers — `Interface` namespace (no base class)
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/Interface.swift` (new) —
+`Interface.optimiseMtu(bitrate:)`, `effectiveBitrate(configured:guess:)`,
+`deriveHwMtu(...)`, `resolveIfacSize(bits:)`, and the `tcpClassHwMtu` /
+`tcpBitrateGuess` / `MINIMUM_BITRATE` constants.
+
+**Python reference:** `RNS/Interfaces/Interface.py:198-221` (`optimise_mtu` tier
+table), `RNS/Reticulum.py:765-768` (configured-bitrate floor), `:719-723` +
+`:860-862`/`:1049-1050` (ifac_size bit→byte resolution + DEFAULT_IFAC_SIZE
+fallback), `RNS/Interfaces/TCPInterface.py:42/:76/:78` (HW_MTU/BITRATE_GUESS/
+AUTOCONFIGURE_MTU).
+
+**Reason:** Category (a) — language/runtime. RNS keeps `optimise_mtu` and the
+MTU/bitrate/IFAC constants on the base `Interface` class (mutating `self.HW_MTU`).
+reticulum-swift has no base `Interface` class — concrete interfaces conform to the
+`NetworkInterface` protocol and expose `hwMtu` as a *computed* property — so the
+tier mapping is a pure static (returns `Int?`, mirroring RNS's `HW_MTU = None`
+bottom branch) and the gate/floor/derivation are separate statics the concrete
+interfaces call. Tier boundaries, the strict-`>`-except-top-tier rule, the
+`MINIMUM_BITRATE`(5) floor, and the `ifac_size//8` + `DEFAULT_IFAC_SIZE`(16)
+fallback are byte-identical to RNS. `optimiseMtu == nil` (RNS `None`) is surfaced
+to the non-optional `hwMtu` as `Reticulum.MTU` (500), the same value link signaling
+falls back to (`Link.init: hwMtu ?? 500`); for TCP this branch is unreachable
+(bitrate floored to the 10 Mbps guess → 8192).
+
+### InterfaceConfig `fixedMtu` / `autoconfigureMtu` — struct fields, not class attrs
+
+**Sites:** `Sources/ReticulumSwift/Interfaces/InterfaceConfig.swift` —
+`fixedMtu: Int?`, `autoconfigureMtu: Bool`; `TCPInterface.swift` /
+`TCPServerInterface.swift` `hwMtu`/`autoconfigureMtu`/`fixedMtu`/`classHwMtu`
+computed properties + `fixedMtu < MTU` init validation.
+
+**Python reference:** `RNS/Interfaces/TCPInterface.py:110-116` (fixed_mtu →
+FIXED_MTU=True / AUTOCONFIGURE_MTU=False / HW_MTU=fixed_mtu, ValueError if
+`< RNS.Reticulum.MTU`), `:599-600`/`:626` (spawned child inherits parent
+bitrate→optimise_mtu then `HW_MTU = parent.HW_MTU`).
+
+**Reason:** Category (a) — language/runtime. RNS stores FIXED_MTU/AUTOCONFIGURE_MTU
+as per-class interface attributes set during `__init__`; reticulum-swift's
+`InterfaceConfig` is a Codable struct constructed by the bridge/API (HARD RULE 5:
+no INI/.conf pipeline), so the posture rides on the config struct (default
+`fixedMtu=nil`, `autoconfigureMtu=true`; a set `fixedMtu` forces `autoconfigureMtu=
+false` in the init, mirroring TCPInterface.py:112-114). Codable stays backward
+compatible (`decodeIfPresent`, defaults `nil`/`true`). The live `hwMtu` of a
+default TCP interface changes from the old hardcoded 262144 ceiling to the
+RNS-faithful autoconfigured 8192 — the negotiated link MTU for default TCP links
+follows. **Minor behavioral deviation:** RNS's `TCPServerInterface.__init__`
+ignores `fixed_mtu` (only `TCPClientInterface` reads it) and spawned children
+inherit the server's *autoconfigured* HW_MTU; the swift server honors
+`config.fixedMtu` uniformly (the bridge sets it on both peers). The negotiated link
+MTU is `min(initiator-signalled, responder)` so the observable result is identical
+(the client's fixed value wins either way); honoring it on both sides keeps spawned
+children consistent.
+
+### Transport probe / remote-management destinations — registration + posture only
+
+**Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`registerProbeDestination(identity:)`, `registerRemoteManagementDestination(
+identity:allowed:)`, `probeDestination`/`remoteManagementDestination`/
+`mgmtDestinations`/`mgmtHashes`/`respondToProbes`/`remoteManagementEnabled`/
+`remoteManagementAllowed`/`panicOnInterfaceError`; `TransportErrors.swift`
+`invalidConfiguration(reason:)`.
+
+**Python reference:** `RNS/Transport.py:396-403` (probe_destination: IN/SINGLE
+`rnstransport.probe`, PROVE_ALL, accepts_links(False), mgmt_destinations),
+`:252-258` (remote_management_destination: IN/SINGLE `rnstransport.remote.
+management`, `/status` + `/path` ALLOW_LIST handlers bound to
+remote_management_allowed, mgmt_destinations + mgmt_hashes), `RNS/Reticulum.py:280`
+(panic_on_interface_error default False).
+
+**Reason:** Mostly category (a). The destination construction, hashes
+(`full_hash(full_hash(name)[:10] + identity.hash)[:16]`), proof strategy (0x23),
+ALLOW_LIST(0x02) handler binding, and mgmt_destinations/mgmt_hashes tracking are
+RNS-faithful. Deviations: (1) the `/status` and `/path` response generators are
+stubs returning `RequestResponse.none` — remote status/path *response bodies* are
+not modeled (out of scope; only registration + ACL binding round-trip). (2)
+`panicOnInterfaceError` is posture-only instance state: it round-trips the config
+flag but does NOT actually abort the process on a real interface error (RNS crashes
+the instance). (3) These registrations are triggered explicitly by the bridge from
+the captured `respond_to_probes` / `enable_remote_management` knobs rather than from
+RNS's `Transport.start` / config pipeline. `transportEnabled` already defaults
+false (Reticulum.py:253) — no change there.
+
+---
+
+## Identity/Destination ratchets + announce recall (Identity.swift, Crypto/Destination.swift, Crypto/RatchetManager.swift)
+
+This subsystem ports RNS's received-ratchet store, known_destinations recall,
+the Destination-level ratchet lifecycle, and the SINGLE auto-ratchet
+encrypt/decrypt path. Most logic is byte-faithful to RNS; the deviations below
+are all category (a) (value-type / actor / no-global-singleton accommodations) or
+explicit feature stubs.
+
+### Static Identity stores backed by an NSLock singleton
+
+**Sites:** `Sources/ReticulumSwift/Crypto/Identity.swift` — `IdentityStore`
+(fileprivate `@unchecked Sendable` final class), `Identity.known*`/`remember`/
+`recall`/`recallAppData`/`rememberRatchet`/`getRatchet`/`cleanRatchets`/
+`registerLocalDestination`/`save`/`loadKnownDestinations`/`storagePath`.
+
+**Python reference:** `RNS/Identity.py:94-98` (class dicts `known_destinations`,
+`known_ratchets` + `threading.Lock`s), `:101-265` (remember/recall/recall_app_data/
+save/load), `:424-522` (_remember_ratchet/get_ratchet/_clean_ratchets/
+current_ratchet_id/_get_ratchet_id/_ratchet_public_bytes).
+
+**Reason:** Category (a). RNS keeps these as module-level mutable dicts on the
+`Identity` class guarded by `threading.Lock`. Swift `Identity` is a value type, so
+the process-wide mutable state cannot live on it; it lives in the `IdentityStore`
+NSLock-guarded singleton, with `Identity` exposing RNS-named static methods that
+delegate. `RNS.Reticulum.storagepath` (a global) becomes the settable static
+`Identity.storagePath` (nil ⇒ in-memory only). `recall` skips RNS's
+`_used_destination_data` LRU bookkeeping (`:135/:146`) — there is no Reticulum
+instance in the library to mark usage against; the `used` element is stored as 0
+and round-trips, but is not incremented. The recall Transport.destinations
+fallback (`:151-159`) is served from an explicit `localDestinations` registry
+(`registerLocalDestination`) the owner/bridge populates on destination
+registration, because the library `Transport` is an actor that a synchronous
+static `recall` cannot await.
+
+### Identity.app_data as a stored property
+
+**Site:** `Identity.swift` — `public var appData: Data?`.
+
+**Python reference:** `RNS/Identity.py:138/:149/:156` (recall attaches
+`identity.app_data = entry[3]`, or `None` for the local fallback).
+
+**Reason:** Category (a). RNS dynamically attaches `app_data` to the recalled
+identity object. Swift has no dynamic attributes, so it is a settable stored
+property (default nil) that `recall` populates on the value-type copy it returns.
+
+### RatchetManager factors Destination ratchet state into an actor
+
+**Sites:** `Crypto/RatchetManager.swift` — `rotate(interval:retained:)`,
+`cleanRatchets(retained:)`, `previousRatchetPublicBytes()`, `latestTime()`;
+`Crypto/Destination.swift` — `rotateRatchets()`, `setRatchetInterval`,
+`setRetainedRatchets`, `encrypt`, `decrypt`, `latestRatchetId`, `ratchetInterval`,
+`retainedRatchets`.
+
+**Python reference:** `RNS/Destination.py:205-241` (_clean_ratchets/rotate_ratchets),
+`:466-531` (enable/enforce/set_retained/set_ratchet_interval), `:585-643`
+(encrypt/decrypt). `RNS/Identity.py:865-913` (Identity.decrypt with
+`ratchet_id_receiver`).
+
+**Reason:** Category (a). RNS stores `self.ratchets` (the private key list) and
+rotation timing directly on the `Destination` and mutates them under the GIL; the
+swift port keeps the key list in the `RatchetManager` actor, so
+`Destination.decrypt`/`rotateRatchets`/`setRetainedRatchets` are `async` (they
+await the actor). `Destination.encrypt` stays synchronous — it selects via
+`Identity.getRatchet(self.hash)` (the NSLock store), not the actor. The
+`ratchet_id_receiver=self` pattern becomes the `RatchetIdReceiver` protocol
+(`AnyObject`) that `Destination` conforms to, so `Identity.decrypt` can write
+`latestRatchetId` back. `_clean_ratchets` faithfully preserves RNS's quirk: the
+gate compares `len > retained_ratchets` but truncates to the static `RATCHET_COUNT`
+(512), not to the retained cap (Destination.py:206-207).
+
+### enable/rotate remember the current ratchet (announce-time effect)
+
+**Site:** `Destination.swift` — `enableRatchets` (and conceptually the announce
+path) call `Identity.rememberRatchet(self.hash, currentPub)`.
+
+**Python reference:** `RNS/Destination.py:284-287` — RNS calls
+`Identity._remember_ratchet(self.hash, ratchet)` inside `Destination.announce()`,
+not in `enable_ratchets`.
+
+**Reason:** Category (a). The swift port has no `Destination.announce()` method —
+announces are assembled separately (the `Announce` type / bridge). To keep
+`Destination.encrypt`'s RNS-faithful `Identity.getRatchet(self.hash)` selection
+finding the destination's own current ratchet (the end state RNS reaches after its
+enable→announce→remember sequence), the remember is performed at `enableRatchets`.
+The end state is identical to RNS post-announce.
+
+### validate_announce app_data None-vs-empty helper
+
+**Site:** `Identity.swift` — `Identity.announceAppData(rawAppData:hasRatchet:)`.
+
+**Python reference:** `RNS/Identity.py:542,560-561` (app_data starts b"", becomes
+the trailing field if present, then is set to None only when the packet is not
+longer than KEYSIZE+NAME_HASH+10+SIG — i.e. a ratcheted no-app_data announce keeps
+b"" while a ratchetless one becomes None).
+
+**Reason:** New feature surface (category b). RNS computes this inline in
+`validate_announce`. The swift announce-reception path lives in
+`Routing/AnnounceHandler.swift` + `Protocol/AnnounceValidator.swift` (outside this
+subsystem's files), whose parser returns nil for any no-trailing-field announce,
+losing the ratcheted-empty-vs-ratchetless-none distinction. This static helper
+centralises the RNS rule so the integration site can call
+`remember(... appData: Identity.announceAppData(rawAppData:hasRatchet:))`.
+
+**Wiring (done 2026-06-15):** `AnnounceHandler.process` now calls
+`Identity.remember(... appData: Identity.announceAppData(rawAppData: parsed.appData,
+hasRatchet: parsed.ratchet?.isEmpty == false))`. `parsed.appData` is nil whenever the
+announce carried no trailing field (AnnounceValidator.swift:329), and a ratchet adds
+the 32 bytes that push the announce past the 148-byte threshold, so `hasRatchet`
+faithfully reconstructs RNS's len>148 test: ratcheted-no-app_data -> b"" (empty),
+ratchetless-no-app_data -> None. Fixes `test_recall_app_data_none_vs_empty` and
+`test_explicit_empty_app_data_matches_omitted`.
+
+### AnnounceHandler.process performs validate_announce's remember/ratchet side-effects
+
+**Site:** `Routing/AnnounceHandler.swift` — `process(...)` now calls
+`Identity.remember(packetHash:destinationHash:publicKey:appData:)` and
+`Identity.rememberRatchet(destinationHash:ratchet:)` immediately after
+`AnnounceValidator.parseAndValidate` succeeds, before `PathTable.record`.
+
+**Python reference:** `RNS/Identity.py:591` (`Identity.remember(packet.get_hash(),
+destination_hash, public_key, app_data)`) and `:612` (`if ratchet:
+Identity._remember_ratchet(destination_hash, ratchet)`) — both live inside
+`Identity.validate_announce`, which `RNS/Transport.py:1712` (`received_announce`)
+calls before the `should_add` path-table acceptance block (Transport.py:1740+).
+
+**Reason:** Category (a) structural split. RNS bundles the known_destinations /
+known_ratchets refresh inside `validate_announce`. The swift port's
+`AnnounceValidator` is a pure `Sendable` parser/signature-checker with no
+`IdentityStore` access, so the remember/ratchet side-effects are performed at the
+single call site (`AnnounceHandler.process`) right after validation, preserving
+RNS's exact ordering: the refresh is UNCONDITIONAL and runs before — and
+independent of — `PathTable.record`'s freshness/hop acceptance gate. This is what
+lets a same/near-second re-announce refresh recalled app_data
+(`test_reannounce_refreshes_recalled_app_data`) and replace the adopted ratchet
+(`test_newer_announce_replaces_adopted_ratchet`) even when the path table rejects
+the duplicate path. `app_data` is now sourced from
+`Identity.announceAppData(rawAppData: parsed.appData, hasRatchet: parsed.ratchet?
+.isEmpty == false)` (the None-vs-empty helper documented above), matching RNS
+overwrite-in-place semantics (Identity.py:108-113) AND the validate_announce
+threshold-null rule (Identity.py:542,560-561).
+
+## Transport — best-effort outbound + synchronous inbound entry
+
+### Graceful-shutdown link teardown: `activeLinkList()` + `Link.closeAndFlush()`
+
+**Sites:** `Transport/ReticulumTransport.swift` — `activeLinkList() -> [Link]`;
+`Link/Link.swift` — `closeAndFlush(reason:) async`.
+
+**Python reference:** `RNS/Transport.py` `Transport.active_links` (the established-
+link registry RNS's exit handler iterates) and `RNS/Link.py:694-708` (`teardown` →
+`__teardown_packet`, role-derived `teardown_reason`).
+
+**Reason:** Category (a) concurrency/observability for a process-exit teardown path.
+`activeLinkList()` exposes the otherwise-private `activeLinks` map so a graceful-
+shutdown caller can enumerate every established link (RNS reaches these via the
+class-level `active_links`). `Link.close()`/`finishClose(emitClose:true)` detaches
+the LINKCLOSE send in a `Task { try? await send(...) }` so callers aren't blocked;
+that detached task does NOT run if the process exits immediately afterwards (e.g. the
+conformance bridge hitting stdin EOF), so the peer never sees the close and falls
+back to a watchdog TIMEOUT instead of DESTINATION_CLOSED. `closeAndFlush()` builds +
+encrypts the SAME LINKCLOSE frame `finishClose` would (RNS `__teardown_packet`,
+Link.py:694-697), `await`s its delivery inline, then runs the shared teardown with
+`emitClose:false` so the packet is sent exactly once. The local teardown reason is
+derived from role exactly like RNS `teardown()` (Link.py:706-707): initiator ⇒
+INITIATOR_CLOSED, responder ⇒ DESTINATION_CLOSED (overridable). Both are additive —
+the existing `close()`/`finishClose` paths are unchanged, so the 454-suite is
+unaffected. The bridge process-exit handler that calls these (main.swift EOF path) is
+the complementary bridge-layer step.
+
+### Outbound send paths are best-effort (no spurious noInterfacesAvailable)
+
+**Sites:** `Transport/ReticulumTransport.swift` —
+- `send(packet:)` empty-interfaces guard (was `throw .noInterfacesAvailable`,
+  now logs and returns).
+- `sendToAllInterfaces(_:)` zero-success branch.
+- `sendRawBytes(_:interfaceId:)` zero-success branch.
+
+**Python reference:** `RNS/Transport.py:1090-1326` — `Transport.outbound`
+iterates every OUT interface, calls `Transport.transmit`, and returns a plain
+`sent` boolean (`return sent` at the tail). It NEVER raises. `Transport.transmit`
+(:1050-1087) wraps `interface.process_outgoing` in `try/except` and only logs on
+error. There is no peer-connected gate — an interface with no connected peer is
+still attempted, and zero successes simply yields `sent == False`.
+
+**Reason:** Bug fix toward RNS fidelity (the previous throw was the divergence).
+The port was raising `TransportError.noInterfacesAvailable` whenever the connected-
+interface loop produced zero successes (no interface registered yet, or all
+registered interfaces not `.connected`). That made announce/transmit *fail* when a
+send was issued before a peer connected — e.g. a TCP server whose interface map is
+momentarily empty/racing. RNS treats this as a normal best-effort no-op. The three
+sites now log and return instead of throwing `noInterfacesAvailable`.
+
+**Retained conservative deviation:** when a *genuine* per-interface send error
+occurred (`lastError != nil`, i.e. an interface's `send` actually threw),
+`sendToAllInterfaces`/`sendRawBytes` still `throw .sendFailed(...)`. Strict RNS
+swallows even this (the `transmit` try/except). The port keeps surfacing a real
+transmit failure so Columba call sites are not silently blinded to an actual I/O
+error — this is an additive safety deviation that does NOT affect the
+no-peer/empty case the fix targets. `sendLinkData(packet:)` deliberately STILL
+throws `.noInterfacesAvailable` on a truly empty interface map: that is a
+separate, test-pinned Columba protection (`LinkDataSendTests
+.testSendLinkDataThrowsWhenNoInterfaces`) preventing "state=SENT but never
+delivered" link-DATA regressions, and is left unchanged.
+
+### Transport.inbound(frame:interface:) — synchronous public inbound entry
+
+**Site:** `Transport/ReticulumTransport.swift` — new
+`public func inbound(frame:interface:) async -> Bool`.
+
+**Python reference:** `RNS/Transport.py:1387-1447` — `Transport.inbound(raw,
+interface)` runs the short-packet guard (`if len(raw) > 2: ... else: return`,
+:1397) and the IFAC pre-unpack guards (flag-on-open / flag-missing / min-length /
+IFAC-mismatch drops) before unpacking.
+
+**Reason:** Category (a) + observability. The existing delegate sink
+`handleReceivedData(data:from:)` runs the identical IFAC validation + parse but
+dispatches `receive` on a detached `Task` (fire-and-forget), which forces callers
+to sleep-and-poll for results. `inbound` mirrors RNS's entry name/semantics and
+additionally `await`s `receive` to completion so an injector (e.g. the conformance
+bridge raw-frame path) gets a deterministic learned-result and returns a `Bool`
+indicating the frame passed IFAC + parsed (vs a pre-unpack drop). The IFAC unmask
+math itself lives in the existing `validateIFAC`/`applyIFAC`
+(RNS/Transport.py:1398-1447 / :1050-1080); the `frame.count > 2` short-packet
+guard is added in `inbound` because `validateIFAC` only enforces the
+`>2+ifac_size` min-length on the IFAC-configured path, not RNS's top-level
+`len(raw) > 2` gate for the IFAC-less path.
+
+### Per-transport implicit/explicit single-packet PROOF policy
+
+**Sites:** `Transport/ReticulumTransport.swift` — `_useImplicitProof` (stored),
+`shouldUseImplicitProof()`, `setUseImplicitProof(_:)`, and the SINGLE-destination
+opportunistic prove branch in `handleRegularData` (proof-data implicit/explicit
+selection).
+
+**Python reference:** `RNS/Identity.py:959-970` (`Identity.prove`: signs the FULL
+`packet.packet_hash`; `proof_data = signature` when implicit, else
+`packet.packet_hash + signature`); `RNS/Reticulum.py:256` (default `True`),
+`:555-558` (config knob), `:1699-1705` (`should_use_implicit_proof()`).
+
+**Reason:** Category (a) — language/runtime. RNS stores the implicit-proof flag as
+a **process-global** class attribute (`Reticulum.__use_implicit_proof`). The swift
+port hosts MULTIPLE concurrent transports/wire-peers in one process (e.g. the
+conformance bridge), so a process-global would let peers cross-contaminate each
+other's proof policy. The flag is therefore scoped **per-transport**. The emitted
+bytes are byte-identical to RNS: implicit ⇒ `sign(getFullHash())` (64 B); explicit
+⇒ `getFullHash() || sign(getFullHash())` (96 B), signing the FULL (not truncated)
+hash. Default remains `true` (RNS parity). The previous prove path hardcoded the
+64-byte implicit form; honoring the policy is additive (default unchanged).
+
+### `ReticulumTransport` proof-carrying delivery-receipt callback overloads
+
+**Sites:** `Transport/ReticulumTransport.swift` — `ReceivedProofPacket` struct,
+`registerReceipt(hash:timeout:proofCallback:)`,
+`send(packet:proofReceiptCallback:receiptTimeout:)`, the `receipts` storage type
+(callback now `(ReceivedProofPacket?) async -> Void`), and the proof-dispatch site
+that populates `ReceivedProofPacket(data: packet.data, raw: packet.encode())`.
+
+**Python reference:** `RNS/Packet.py:498-537` (`PacketReceipt.validate_proof`
+stashes the matched PROOF packet as `receipt.proof_packet`, whose `.data` is the
+proof payload and `.raw` the full encoded proof packet); `RNS/Transport.py:2155-2165`
+(proof routed to the receipt).
+
+**Reason:** Category (a) — language/runtime / observability. The existing swift
+delivery-receipt callback is `() async -> Void` and discards the received PROOF
+packet's bytes, so a caller cannot read `proof_data`/`proof_raw` to classify
+IMPLICIT (64 B) vs EXPLICIT (96 B). The proof-carrying overloads surface those
+bytes ADDITIVELY: the legacy `() async -> Void` `registerReceipt`/`send` overloads
+are retained and wrap onto the same storage (discarding the proof), so existing
+Columba/LXMFSwift delivery-receipt call sites are byte-for-byte unchanged.
+
+### `Link.setInboundPacketObserver(_:)` — per-link inbound packet observation hook
+
+**Sites:** `Link/Link.swift` — `inboundPacketObserver` (stored),
+`setInboundPacketObserver(_:)`, and its invocation in `handleResponsePacket`
+(RESPONSE 0x0A) and `handleResourcePacket` (RESOURCE_ADV 0x02).
+
+**Python reference:** `RNS/Link.py:897-901` — `Link.receive` routes a sub-MDU
+handler response as a single RESPONSE (0x0A) packet vs forking a >MDU response into
+a response Resource (observable as a RESOURCE_ADV 0x02); `RNS/Packet.py` context
+bytes 0x0A/0x02.
+
+**Reason:** Category (b) — new instrumentation feature. RNS routes inbound RESPONSE
+/ RESOURCE_ADV frames through `Link.receive` with no app-visible wrap point. The
+hook exposes each observed inbound frame's wire context byte + decrypted plaintext
+so a conformance/instrumentation consumer can assert the sub-MDU-vs-Resource fork
+and the RESPONSE msgpack `[request_id, response]` layout. It is a no-op when unset
+and runs before dispatch WITHOUT altering routing, ordering, or timing.
+
+### `RatchetManager` public persist/reload wrappers + ratchet-inflate instrument
+
+**Sites:** `Crypto/RatchetManager.swift` — `persistRatchets()`, `reloadRatchets()`
+(public wrappers over the private `persist()`/`load()`), `_padRatchets(to:)`.
+
+**Python reference:** `RNS/Destination.py:210-225` (`_persist_ratchets`: signed
+`msgpack({"signature": sign(packed), "ratchets": packed})`), `:426-464`
+(`_reload_ratchets`: signature-validated reload, raises on bad signature),
+`:205-208`/`:504-517` (`_clean_ratchets` / `set_retained_ratchets` pad+truncate;
+`_generate_ratchet()`).
+
+**Reason:** `persistRatchets()`/`reloadRatchets()` are category (a) —
+encapsulation: RNS exposes `Destination.ratchets` as a plain attribute and calls
+`_persist_ratchets`/`_reload_ratchets` directly; the swift `persist()`/`load()` are
+private, so public wrappers let an instrument drive a REAL signed write +
+signature-validated reload. Semantics are unchanged (reload throws on bad
+signature; the in-memory list is replaced byte-for-byte; `latestRatchetTime` is
+left untouched, matching RNS `_reload_ratchets`). `_padRatchets(to:)` is category
+(b) — instrument-only: it appends freshly generated ratchets (mirroring repeated
+`Identity._generate_ratchet()`) to inflate the in-memory list PAST the retained cap
+so `cleanRatchets` truncation to `RATCHET_COUNT` (512) is observable; it appends at
+the END so the current (index-0) ratchet is preserved, and is not part of RNS's
+runtime path.
+
+### RNS.Discovery subsystem port (interface auto-discovery)
+
+**Sites:** `Sources/ReticulumSwift/Discovery/` — `DiscoveryConstants.swift`,
+`DiscoveryAddress.swift`, `DiscoveryStamp.swift`, `DiscoveredInterface.swift`,
+`InterfaceAnnouncer.swift`, `InterfaceAnnounceHandler.swift`,
+`InterfaceDiscovery.swift`. Bridge wiring: `Sources/ConformanceBridge/Ext+Discovery.swift`.
+
+**Python reference:** `RNS/Discovery.py` (InterfaceAnnouncer
+`get_interface_announce_data`:96-186 / identity selection:54-58; InterfaceAnnounceHandler
+`sanitize_name`:205-212 / `received_announce`:214-362; InterfaceDiscovery
+`interface_discovered`:450-505 / `list_discovered_interfaces`:402-448; address
+grammar:769-790; constants:12-38,189-190,365-377). The msgpack info-map key
+numbering, flag bits, STAMP_SIZE, work-block expansion rounds, hostname grammar
+and per-type `config_entry` format strings are ported byte/string-for-byte.
+
+The autoconnect / monitor / teardown / `BlackholeUpdater` halves of Discovery.py
+(Transport interface lifecycle, `BackboneClientInterface`, the daemon `job()`
+announce loop) are intentionally OUT OF SCOPE and not ported.
+
+The following category-(a)/(b) deviations are documented:
+
+1. **LXStamper PoW inlined (forced).** RNS imports the proof-of-work from
+   `LXMF.LXStamper` (`stamp_workblock`/`stamp_value`/`stamp_valid`/`generate_stamp`,
+   used at Discovery.py:172,235-237). reticulum-swift has NO LXMF dependency, so
+   `DiscoveryStamp` inlines the PoW on the library's own primitives
+   (`KeyDerivation.deriveKey` == HKDF, `Hashing.fullHash` == SHA-256,
+   `packMsgPack(.uint(round))` == msgpack salt). Wire-identical: the work-block is
+   the concat of 20 HKDF(256B) expansions salted with SHA-256(material||msgpack(round)),
+   the value is the leading-zero-bit count of SHA-256(workblock||stamp), validity is
+   the 256-bit `<= 2^(256-cost)` compare. Ref: LXMF/LXStamper.py.
+
+2. **Record dict -> typed struct (category a).** RNS models the discovered-interface
+   record as a dynamic dict whose key set varies by interface type (Discovery.py:263-357).
+   `DiscoveredInterface` is a Swift struct with typed core fields plus per-type
+   optionals; `toDictionary()` OMITS nil keys so the projection mirrors RNS's
+   per-type-varying dict (a Weave record carries no `sf`/`cr`, a Backbone record no
+   radio keys) — satisfying the receiver-info negative assertions.
+
+3. **In-memory record store (category a).** RNS persists one msgpack file per
+   `discovery_hash` under `Reticulum.storagepath/discovery/interfaces`
+   (Discovery.py:394-395,459-495). `InterfaceDiscovery` uses an in-memory
+   `[Data: DiscoveredInterface]` keyed by `discovery_hash` with the identical
+   one-record-per-hash dedup / heard_count / list-time purge semantics, avoiding
+   iOS-sandbox filesystem coupling. The store is reset per inject/store invocation.
+   Cross-launch persistence is deferred (not needed for conformance; may matter for
+   Columba UX later — see open risks).
+
+4. **Feature-default gates as spec literals (forced).** `DiscoveryFeatureDefaults`
+   surfaces the opt-in gates (Interface.py:105-106 `discoverable`/`supports_discovery`;
+   Reticulum.py:259-260,1802-1807 `discover_interfaces` /
+   `should_autoconnect_discovered_interfaces()` / `max_autoconnected_interfaces()`)
+   as their RNS spec-literal defaults (all OFF), because reticulum-swift models no
+   Reticulum config object nor per-Interface discovery flags to read live state from.
+   A future genuinely-configurable discovery toggle would need a real config source.
+
+5. **`hops` injectable constant (category a).** RNS reads `Transport.hops_to(dest)`
+   in `received_announce` (Discovery.py:271). The conformance/library context has no
+   live Transport path table, so `InterfaceAnnounceHandler.hops` is an injectable
+   constant (default 0); the receive path still emits an int, as RNS does.
+
+**Build/verification:** `swift build -c release` clean; the 454-test ReticulumSwift
+regression suite passes 0 failures with these additions.
+
+### Resource part-split SDU = link.mtu - 36 (cluster-C/D interop fix, 2026-06-15)
+
+**Bug fix, not a deviation — restores RNS fidelity.** `Link.sendResource`
+(Link.swift:~1748) previously sized outbound resource parts at `self.mdu` (the
+link-*encrypted* MDU, 431 @ MTU 500). RNS sizes resource parts at the resource
+SDU = `self.link.mtu - Reticulum.HEADER_MAXSIZE - Reticulum.IFAC_MIN_SIZE`
+(RNS/Resource.py:338), i.e. `mtu - 35 - 1 = mtu - 36 = 464 @ MTU 500`. Resource
+data parts (context 0x01) are sent UNENCRYPTED at the link layer — the Resource
+pre-encrypts the whole stream once (RNS/Resource.py:~430) — so they ride the
+larger Reticulum-level MDU, not the smaller link MDU. The python receiver IGNORES
+the advertised part count and re-derives `total_parts = ceil(size/sdu)` from its
+OWN sdu=464 (RNS/Resource.py:187), so a swift sender splitting at 431 advertised
+~115 parts where the python receiver allocated a 106-slot hashmap; `hashmap_update`
+then IndexErrored on the surplus parts ("Could not decode... dropping resource")
+and the transfer never completed. swift<->swift only "worked" because both ends
+agreed on the wrong 431. Now `partSize = self.mtu - 35 - TransportConstants.IFAC_MIN_SIZE`
+and it propagates to child segments via `Resource.prepareNextSegment`
+(Resource.swift:1362, which reuses the parent's stored `partSize`).
+Ref: RNS/Resource.py:338 (sdu), :187 (receiver total_parts), :432/:454 (sender
+split at sdu). HEADER_MAXSIZE=2+1+(128//8)*2=35 (RNS/Reticulum.py:147),
+IFAC_MIN_SIZE=1 (:148).
+
+**Port-structure note (category a):** RNS computes `self.sdu` inside
+`Resource.__init__`; this port computes the equivalent value in `Link.sendResource`
+and threads it through `Resource.prepare(partSize:)`. Same value, different
+ownership boundary (the Swift `Resource` takes `partSize` as a construction param
+rather than reading `link.mtu` directly). No behavioral divergence.
+
+**Three sizes deliberately NOT conflated (decision record):** This fix touches ONLY
+the part-split SDU. Two adjacent sizes intentionally stay put because RNS keeps them
+distinct:
+  1. **Part-split SDU** = `link.mtu - 36` — the FIXED value above (Resource part data).
+  2. **Link MDU** = 431 @ MTU 500 (`self.mdu`) — used ONLY as the >MDU request/response
+     fork THRESHOLD (`Link+Request.swift:82,220`, RNS/Link.py:496/898). Correctly
+     stays `self.mdu`.
+  3. **HASHMAP_MAX_LEN cap** = `hashmapMaxLength(linkMDU: LinkConstants.LINK_MDU)` = 74,
+     the per-segment hashmap-chunk cap (advertisement + HMU). RNS derives this from
+     the **class constant** `RNS.Link.MDU` (=431), NOT the per-link negotiated mdu:
+     `ResourceAdvertisement.HASHMAP_MAX_LEN = floor((RNS.Link.MDU - 134)/4) = 74`
+     (RNS/Resource.py:1236). It is therefore a fixed 74 at every negotiated MTU.
+     A sibling diagnosis suggested re-pointing the advertisement/HMU `linkMDU:`
+     params (Link.swift:1568/1760/2130/2139/2143/2487, Resource.swift sendHashmapUpdate)
+     to `self.mdu` for "high-MTU fidelity" — that would DIVERGE from RNS (which uses
+     the class constant), so it was deliberately NOT done. These params stay
+     `LinkConstants.LINK_MDU`.
+
+**`deriveReceiverPartCount` guidance corrected (Resource.swift:~2493):** the
+docstring previously said the Link should call it "with `self.mdu`". Corrected to
+`self.mtu - 36` (the resource SDU) — passing `self.mdu` would re-derive a smaller
+sdu than a correct sender splits at and over-count parts. The method stays UNWIRED
+(the receiver keys `numParts` off the advertised `n` at init, which is exactly right
+once the sender splits at mtu-36). RNS/Resource.py:187.
+
+**Build/verification:** `swift build -c release` clean. Fixes (swift-sender arm):
+test_hmu_handshake_over_small_mtu_link, test_metadata_x_flag_round_trip,
+test_multi_segment_transfer_reassembles_byte_exact,
+test_three_segment_transfer_reassembles_byte_exact (cluster D), and the response-
+Resource completion for test_link_request_large_response_round_trips_as_resource /
+test_large_response_forks_to_resource_not_response_packet (cluster C). Clean-disconnect
+DESTINATION_CLOSED (test_clean_peer_disconnect) relies on the already-present
+`Link.closeAndFlush()` (Link.swift:1348, gated on state.isEstablished) plus the
+bridge exit handler + `Transport.activeLinkList()` (sibling-owned).
+
+## Announce: dispatch subsystem + replay-gate alignment (cluster A/B, 2026-06-15)
+
+### Removed non-RNS `AnnounceHandler.seenAnnounces` per-announce-hash dedup
+
+**Site:** `Routing/AnnounceHandler.swift` — deleted the `seenAnnounces: Set<Data>`
+field, its `seenAnnouncesMaxSize` cap, the `computeAnnounceHash`/`addToSeenAnnounces`
+helpers, the top-of-`process` early-return, the add-on-reject/add-on-accept call
+sites, and the `seenCount`/`hasSeen`/`clearSeen` test hooks.
+
+**Python reference:** `RNS/Transport.py:1687-1823` — RNS re-processes EVERY
+signature-valid announce. There is no per-announce-hash dedup set; replay/loop
+forging is prevented SOLELY by the random_blob membership test inside the path-table
+decision (`if not random_blob in random_blobs`, Transport.py:1763/1796/1808). SINGLE
+announces are also explicitly exempted from the packet-hashlist filter
+(Transport.py:1376-1378).
+
+**Reason:** Bug fix — the `seenAnnounces` set was a category-(b)-style addition with
+NO RNS counterpart, and it over-deduped: a re-heard byte-identical announce was
+dropped at the top of `process` before reaching `PathTable.record`, so the
+expired-path (Transport.py:1790-1801) and equal-emission-unresponsive
+(Transport.py:1818-1823) replacement branches could never run on a repeat sighting.
+Removing it makes replay protection RNS-exact (the random_blob check in
+`PathTable.record` is the sole gate) and fixes
+`test_path_replace_expired_path_larger_hops` and
+`test_path_replace_equal_emission_unresponsive`. Verified non-regressing:
+`test_announce_random_blob_replay_is_rejected` stays green (a re-heard identical blob
+is `isNewBlob==false` -> `record` returns false -> `.ignored`, no announce_table
+churn), and `test_duplicate_single_announce_is_not_deduplicated` is a `packet_filter`
+test unaffected by this layer. As a side effect `Identity.remember`/`rememberRatchet`
+now run on every re-heard announce (previously short-circuited) — this is MORE
+RNS-faithful (`validate_announce` runs unconditionally) and idempotent (overwrite in
+place, Identity.py:108-113).
+
+### External announce-handler dispatch subsystem (`AnnounceHandlerProtocol` + dispatch loop)
+
+**Site:** `Routing/AnnounceHandler.swift` — new public protocol
+`AnnounceHandlerProtocol` (AnyObject, Sendable). `Transport/ReticulumTransport.swift`
+— new `announceHandlers` registry, `registerAnnounceHandler(_:) -> Bool`,
+`deregisterAnnounceHandler(_:)`, `announceHandlerCount`, the
+`dispatchAnnounceToHandlers(packet:destinationHash:)` loop, and the
+`announceHandlerExpectedHash(aspectFilter:identity:)` helper. Dispatch is invoked
+from `processAnnounce` in BOTH the `.recorded` and `.recordedAndRebroadcast` result
+arms (== RNS `should_add==True`), BEFORE/outside the `if transportEnabled || isLocal`
+rebroadcast block, passing the ORIGINAL packet.
+
+**Python reference:** `RNS/Transport.py:2034-2086` (the dispatch loop nested inside
+`if should_add:`, which sits inside `if local_destination == None and
+validate_announce(packet):` — i.e. it runs for every accepted announce regardless of
+`transport_enabled`), `:2465-2477` (`register_announce_handler`: guard on
+`hasattr(handler, "aspect_filter")`), `:2481-2489` (`deregister_announce_handler`),
+`RNS/Destination.py:139-148` (`hash_from_name_and_identity` / `app_and_aspects_from_name`).
+
+**Reason:** Genuinely-missing behavior (category b, new subsystem). The port had only
+the fixed internal `AnnounceHandler` actor (dedup/validate/record-path) and NO
+externally-registered handler registry or dispatch loop, so apps (LXMF registers
+`lxmf.delivery` + `lxmf.propagation` handlers) were never notified. The loop mirrors
+RNS exactly: aspect_filter `nil` matches all else compares
+`Destination.hash(identity, app, *aspects) == destination_hash`; the PATH_RESPONSE
+delivery gate (`packet.context==PATH_RESPONSE` delivered only to
+`receivePathResponses` handlers); the recalled `announced_identity`/`app_data` come
+from the process-global `known_destinations` populated by `process`'s unconditional
+`remember`; `announce_packet_hash == packet.getFullHash()`.
+
+**Forced deviations within this subsystem (category a):**
+  1. **Explicit `callbackParameterCount`.** RNS selects 3/4/5-arg delivery via
+     `len(inspect.signature(handler.received_announce).parameters)` (Transport.py:
+     2055/2063/2071). Swift cannot introspect a closure's arity, so the handler
+     declares its arity explicitly; the single protocol method
+     `receivedAnnounce(...)` always takes all params and the dispatch passes nil for
+     `announcePacketHash` (arity 3) and `isPathResponse` (arity 3/4). Semantically
+     identical.
+  2. **Throwing protocol method for per-handler exception isolation.** RNS wraps each
+     callback in try/except (Transport.py:2083-2086); the swift dispatch wraps each
+     `receivedAnnounce` call in do/catch (a raising handler is logged and cannot block
+     a later handler).
+  3. **Synchronous in-actor delivery.** RNS spawns a daemon `threading.Thread` per
+     delivery (Transport.py:2057 etc.); the swift dispatch records synchronously
+     inside the Transport actor. Observably equivalent and race-free for the
+     poll-based conformance tests; avoids leaking detached Tasks.
+  4. **`hasAspectFilter` models `hasattr`.** RNS's registration guard is
+     `hasattr(handler, "aspect_filter")` (a handler with NO aspect_filter attribute is
+     silently not registered). Swift has no dynamic attribute test, so the protocol
+     exposes `hasAspectFilter` (distinct from `aspectFilter == nil`, which means
+     "match all"). `registerAnnounceHandler` returns the registered Bool.
+
+Fixes `test_aspect_filter_none_matches_all`, `test_aspect_filter_match_and_mismatch`,
+`test_path_response_delivery_gate`, `test_callback_arity_packet_hash`,
+`test_registration_guard_and_exception_isolation`.
+
+### `Transport.packetHashlistCount()` / `packetHashlistContains(_:)` accessors
+
+**Site:** `Transport/ReticulumTransport.swift`.
+
+**Python reference:** `RNS/Transport.py:1469-1480` (`add_packet_hash` /
+`packet_hashlist` membership) — RNS exposes `Transport.packet_hashlist` as a plain
+list attribute.
+
+**Reason:** Category (a) observability. The swift `PacketHashlist` actor is held
+privately; these async accessors surface the count and membership so the conformance
+bridge can prove an inbound frame was accepted+recorded (count delta) for the inbound
+IFAC-gate tests. No behavioral change. `PacketHashlist.count`/`shouldAccept` were
+already public; only the actor-held instance was internal.
+
+### `AnnounceTable.entryPacketHash(_:)` accessor
+
+**Site:** `Transport/AnnounceTable.swift` (additive accessor mirroring the existing
+`entryTimestamp` precedent; outside cluster A's named 4-file set but required by the
+cluster-A bridge observable — see scope note in the agent report).
+
+**Python reference:** `RNS/Transport.py:3559-3567` — the announce_table entry stores
+the packet whose `.packet_hash` the cross-check reads.
+
+**Reason:** Category (a) observability. Returns the stored entry packet's
+`getFullHash()`. The stored packet is the rebroadcast packet (hops+1) but
+`Packet.getHashablePart` excludes the hop byte, so its hash equals the dispatched
+original announce's packet hash — the equality `test_callback_arity_packet_hash`
+cross-checks. No behavioral change.
+
+### `ReticulumTransport.detachInterfaces()` — link-teardown + 150ms drain prefix only (fix/conformance-endpoint-resolve 2026-06-16)
+
+**Site:** `Transport/ReticulumTransport.swift` (new `public func detachInterfaces() async`);
+called from the conformance bridge's stdin-EOF shutdown handler
+(`Sources/ConformanceBridge/main.swift`).
+
+**Python reference:** `RNS/Transport.py:3076-3088` (`detach_interfaces`: tear down every
+`active_links` then `pending_links` via `link.teardown()`, counting `closed_links`, then
+`if closed_links: time.sleep(0.15)` — a 150ms window so the LINKCLOSE teardown packets
+leave local transport). The full python method continues at `:3090-` to enumerate and
+socket-`detach()` every interface / local_client_interface on RNS teardown.
+
+**Reason:** Category (a) language/runtime + scoped role. The swift port reproduces the
+link-teardown + 150ms-drain prefix faithfully (active links first, then pending; the 150ms
+value is RNS's exact constant — not enlarged), using `Link.closeAndFlush()` as the swift
+analog of `link.teardown()` (it emits the CONTEXT_LINKCLOSE packet and `await`s the
+`NWConnection` send). It intentionally **omits** the subsequent interface socket-detach loop
+(`Transport.py:3090+`): in the swift port a connection's socket lifecycle is owned by its
+`NWConnection` and is closed when the bridge process exits, and there is no
+`Interface.detach()` threading model to mirror here. The method's role is specifically to
+flush in-flight LINKCLOSE bytes before process exit so a peer records `DESTINATION_CLOSED`
+rather than a watchdog `TIMEOUT`
+(`test_clean_peer_disconnect_closes_destination_closed`), not to perform a full RNS
+interface teardown. A genuinely SIGKILL'd peer still yields `TIMEOUT` (the drain only runs
+on the graceful stdin-EOF path).
