@@ -2510,11 +2510,21 @@ public actor Link {
                 // aborted transfer was holding the pending-outgoing queue (released only
                 // on the FINAL segment's conclusion, :2438-2445) — drain the queue so
                 // resources queued behind it are not stalled until link close.
+                //
+                // Gate all of that on WE still owning `next`: the link can close during
+                // the `await sendAdvertisement` suspension above, and finishClose's
+                // cancel-on-close snapshots `next` from outboundResources, clears the
+                // dict, and schedules its conclusion in a detached Task (:1295-1311).
+                // If that already happened, `removeValue` returns nil — re-cleaning /
+                // re-concluding would be a resourceConcluded double-fire. Actor isolation
+                // makes this removeValue check atomic with finishClose's removeAll, so
+                // exactly one path tears `next` down.
                 linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
-                outboundResources.removeValue(forKey: nextHash)
-                await next.cleanup()
-                await resourceCallbacks?.resourceConcluded(next)
-                await drainOutgoingQueue()
+                if outboundResources.removeValue(forKey: nextHash) != nil {
+                    await next.cleanup()
+                    await resourceCallbacks?.resourceConcluded(next)
+                    await drainOutgoingQueue()
+                }
             }
         } catch {
             // A prepareNextSegment failure leaves `current` owning the shared staging
