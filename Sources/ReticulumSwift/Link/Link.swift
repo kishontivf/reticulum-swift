@@ -1839,11 +1839,18 @@ public actor Link {
             do {
                 try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
             } catch {
-                // Advertise failed after registration — unregister (idempotent;
-                // no-op if a close race already took it) so the one-at-a-time gate
-                // isn't left stuck, then propagate the failure to the caller.
+                // Advertise failed after registration. If WE still own the resource
+                // (finishClose didn't snapshot+cleanup it on a close race), unregister
+                // so the one-at-a-time gate isn't left stuck AND unlink the staging
+                // tempfile — prepare() may have created one for a multi-segment
+                // resource, and without cleanup it leaks (acute under the NE sandbox's
+                // limited temp space, compounding across retries). The throw is the
+                // caller's conclusion signal, so unlike the fire-and-forget drain
+                // paths we do NOT fire resourceConcluded here.
                 let h = await resource.hash ?? Data()
-                outboundResources.removeValue(forKey: h)
+                if outboundResources.removeValue(forKey: h) != nil {
+                    await resource.cleanup()
+                }
                 throw error
             }
             linkLogger.info("Advertisement sent for resource \(hashHex, privacy: .public), outboundResources count=\(self.outboundResources.count, privacy: .public)")
