@@ -1580,14 +1580,30 @@ public actor Link {
             return
         }
         do {
-            // Advertise THEN register, matching RNS Resource.__advertise_job order
-            // (RNS/Resource.py:527→534).
-            try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+            // Register BEFORE advertising. RNS advertises-then-registers
+            // (RNS/Resource.py:527→534), but those are consecutive SYNCHRONOUS
+            // statements — no RESOURCE_REQ can interleave between them. Here
+            // `sendAdvertisement` and `registerOutgoingResource` each suspend the
+            // Link actor (the latter via `await resource.hash`), so advertising
+            // first would leave a window where the advertisement is on the wire
+            // but the resource is untracked, and a fast peer's RESOURCE_REQ would
+            // not find it in `outboundResources`. Register first to preserve RNS's
+            // effective atomicity (advertiseNextSegment already does this,
+            // :2495-2501; see port-deviations.md).
             await registerOutgoingResource(next)
+            try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
         } catch {
             linkLogger.error("Failed to advertise queued resource: \(error, privacy: .public)")
-            await next.cleanup()
-            await resourceCallbacks?.resourceConcluded(next)
+            // Advertise failed after registration: undo it and conclude — but only
+            // if WE still own `next`. The link can close during the await above,
+            // and finishClose's cancel-on-close snapshots+concludes registered
+            // resources (:1295-1311); re-concluding would be a resourceConcluded
+            // double-fire. Actor isolation makes removeValue atomic vs finishClose.
+            let nextHash = await next.hash ?? Data()
+            if outboundResources.removeValue(forKey: nextHash) != nil {
+                await next.cleanup()
+                await resourceCallbacks?.resourceConcluded(next)
+            }
             // Move on to the next queued resource (the link is still free).
             await drainOutgoingQueue()
         }
@@ -1778,13 +1794,28 @@ public actor Link {
         // polls `link.ready_for_new_resource()` and stays QUEUED until the link
         // is free, RNS/Resource.py:522-534; RNS/Link.py:1328-1330). Port-deviation:
         // event-driven instead of a 0.25s poll — if the link is free we advertise
-        // now and register AFTER the send (RNS order :527→534, so the link reads
-        // empty until the first adv goes out); otherwise the resource waits in
-        // pendingOutgoingQueue (its prepared, non-advertised state is the swift
-        // equivalent of RNS QUEUED) and resourceConcluded drains it on conclusion.
+        // now, otherwise the resource waits in pendingOutgoingQueue (its prepared,
+        // non-advertised state is the swift equivalent of RNS QUEUED) and
+        // resourceConcluded drains it on conclusion.
+        //
+        // Register BEFORE advertising: RNS advertises-then-registers (:527→534) but
+        // synchronously (no yield between), so a RESOURCE_REQ can't interleave. Here
+        // the two awaits release the Link actor, so advertising first would leave a
+        // window where the adv is on the wire but the resource is untracked and a
+        // fast peer's RESOURCE_REQ is dropped (see port-deviations.md;
+        // advertiseNextSegment/drainOutgoingQueue do the same).
         if readyForNewResource() {
-            try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
             await registerOutgoingResource(resource)
+            do {
+                try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+            } catch {
+                // Advertise failed after registration — unregister (idempotent;
+                // no-op if a close race already took it) so the one-at-a-time gate
+                // isn't left stuck, then propagate the failure to the caller.
+                let h = await resource.hash ?? Data()
+                outboundResources.removeValue(forKey: h)
+                throw error
+            }
             linkLogger.info("Advertisement sent for resource \(hashHex, privacy: .public), outboundResources count=\(self.outboundResources.count, privacy: .public)")
         } else {
             pendingOutgoingQueue.append(resource)

@@ -345,9 +345,18 @@ has_incoming_resource / ready_for_new_resource / get_last_resource_window),
    (its prepared, non-advertised state is the swift analogue of RNS `QUEUED`), and
    `resourceConcluded(_:)` drains the next one when the in-flight transfer
    concludes. Category (a) — same one-at-a-time gate, push instead of poll.
-   `sendResource` also reorders to advertise-then-`registerOutgoingResource`,
-   matching RNS order (`RNS/Resource.py:527→534`) so `readyForNewResource()` reads
-   empty until the first advertisement is sent.
+   All three send paths (`sendResource`, `drainOutgoingQueue`, `advertiseNextSegment`)
+   `registerOutgoingResource` BEFORE advertising, which REORDERS vs RNS's
+   advertise-then-register (`RNS/Resource.py:527→534`). RNS runs those two steps as
+   consecutive SYNCHRONOUS statements with no yield, so a `RESOURCE_REQ` cannot
+   interleave between them; in this actor port `sendAdvertisement` and
+   `registerOutgoingResource` each suspend the Link actor (the latter via
+   `await resource.hash`), so advertising first would leave a window where the
+   advertisement is on the wire but the resource is untracked in `outboundResources`
+   and a fast peer's `RESOURCE_REQ` would be dropped. Registering first preserves RNS's
+   effective atomicity. Category (a) — actor await points create an interleaving window
+   RNS's synchronous code does not have. Each path unregisters the resource on an
+   advertise failure so the one-at-a-time gate is not left stuck.
 
 3. **`resourceConcluded(_:)` omits `expected_rate`.** RNS recomputes
    `self.expected_rate` here (`RNS/Link.py:1287/1290`); nothing in this port
