@@ -1801,7 +1801,10 @@ public actor Link {
         // (RNS/Reticulum.py:147); IFAC_MIN_SIZE = 1 (RNS/Reticulum.py:148).
         // `self.mtu` is updated by MTU discovery in processProof, so by the time
         // sendResource runs it reflects whatever MTU the peers negotiated.
-        let partSize = self.mtu - 35 - TransportConstants.IFAC_MIN_SIZE
+        // Clamp to >= 1: a pathological MTU below 37 would make partSize <= 0 and
+        // trap `resource.prepare`'s parts-count division. No real Reticulum transport
+        // negotiates an MTU that small, so for every realistic MTU this is a no-op.
+        let partSize = max(1, self.mtu - 35 - TransportConstants.IFAC_MIN_SIZE)
         try await resource.prepare(partSize: partSize, linkEncrypt: { plaintext in
             return try encryptToken.encrypt(plaintext)
         }, autoCompress: autoCompress)
