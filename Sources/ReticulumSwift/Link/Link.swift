@@ -1854,6 +1854,14 @@ public actor Link {
                 if outboundResources.removeValue(forKey: h) != nil {
                     await resource.cleanup()
                 }
+                // Advance the pending-outgoing queue before rethrowing: a resource may
+                // have queued behind this one while it was (briefly) the in-flight
+                // outbound, and this failure is its only release point — without the
+                // drain it would stall until link close. (drainOutgoingQueue and
+                // advertiseNextSegment drain on their own advertise failures too.)
+                // Guarded internally by readyForNewResource(): a close race that already
+                // cleared the queue makes this a no-op.
+                await drainOutgoingQueue()
                 throw error
             }
             linkLogger.info("Advertisement sent for resource \(hashHex, privacy: .public), outboundResources count=\(self.outboundResources.count, privacy: .public)")
