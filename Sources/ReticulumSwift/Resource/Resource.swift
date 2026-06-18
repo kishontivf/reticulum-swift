@@ -515,14 +515,19 @@ public actor Resource {
         self.split = advertisement.totalSegments > 1
         self.inboundHasMetadata = advertisement.flags.hasMetadataFlag
 
-        // Initialize parts array with nil placeholders
-        self.parts = Array(repeating: nil, count: advertisement.numParts)
+        // Initialize parts arrays with placeholders. Clamp the (peer-controlled) count
+        // to >= 0 defensively: a negative count is an uncatchable Array fatalError. The
+        // caller (Link.receiveResourceAdvertisement) already rejects out-of-range
+        // numParts before reaching here; this guarantees the non-throwing init can never
+        // trap even if reached another way.
+        let safePartCount = max(0, advertisement.numParts)
+        self.parts = Array(repeating: nil, count: safePartCount)
 
         // Store hashmap chunk from first segment
         self.hashmap = advertisement.hashmapChunk
 
         // Initialize parts received tracking
-        self.partsReceived = Array(repeating: false, count: advertisement.numParts)
+        self.partsReceived = Array(repeating: false, count: safePartCount)
 
         // Start transfer timer
         self.transferStartTime = Date()
@@ -2422,6 +2427,18 @@ public actor Resource {
         } else {
             await link?.cancelIncomingResource(self, corrupt: false)
         }
+
+        // Free disk: cancel() is the one terminal path that previously skipped cleanup,
+        // so a cancelled transfer > MAX_EFFICIENT_SIZE permanently orphaned its named
+        // staging tempfile (NSTemporaryDirectory()/rns_resource_out_<UUID>, the full
+        // payload) — acute under the NE sandbox, and reachable WITHOUT an API call via
+        // the sender's request() -> cancel() on a hashmap-exhausted boundary under BLE
+        // loss/reorder. (This port uses a NAMED persistent file where python uses a
+        // GC-reclaimed TemporaryFile, so it must unlink explicitly — every other
+        // terminal path already does.) abandonChain unlinks the partial inbound chain
+        // too; idempotent and cheap. cleanup() does not touch hash/completionCallback/
+        // link, so the conclusion bookkeeping below is unaffected.
+        cleanup(abandonChain: true)
 
         // Link conclusion bookkeeping + conclusion callback, gated on a registered
         // callback EXACTLY as RNS (RNS/Resource.py:1099-1104):

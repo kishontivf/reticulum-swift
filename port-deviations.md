@@ -1765,3 +1765,22 @@ hash via a per-link `Set`; `Set.insert` is synchronous, so even when both racers
 `await`, exactly one observes `inserted == true` and fires. The set is bounded by the link's lifetime
 resource count and freed on dealloc. Supersedes the earlier per-site `removeValue != nil` double-fire
 guards (those remain for cleanup/queue-drain ownership, which fire-once does not dedup).
+
+### Wire-input hardening — reject hostile msgpack/sizes that would trap (fix/proactive-bugclass-audit 2026-06-18)
+
+**Sites:** `Resource/ResourceAdvertisement.swift` (`unpack` getInt → `Int(exactly:)`, flags →
+`UInt8(exactly:)`), `Link/Link.swift` (`receiveResourceAdvertisement` numParts range-drop +
+`Resource.init(advertisement:)` `max(0, numParts)` clamp), `Protocol/MessagePack.swift`
+(`decodeArray`/`decodeMap` `reserveCapacity` bounded by remaining bytes).
+
+**Python reference:** `RNS/vendor/umsgpack.py` (no pre-allocation; unbounded python ints) and
+`RNS/Resource.py` accept path (derives part count, wraps decode in try/except → log + drop).
+
+**Reason:** Category (a) language/runtime safety. Python ints are unbounded and its lists are lazy,
+so a hostile RESOURCE_ADV / msgpack payload is at worst a caught exception. In Swift the same values
+are UNCATCHABLE traps: `Int(uint64 > Int64.max)`, `UInt8(>255)`, `Array(repeating:count: <0)` (a
+fatalError), and eager `reserveCapacity(2^32-1)` (allocation abort) — three of them are single-packet
+remote process-aborts from any authenticated peer, reachable even on a `resourceStrategy=.acceptNone`
+node. The fixes make hostile input a clean decode-failure / dropped-advertisement (mirroring RNS's
+graceful drop) and are NO-OPS for every valid value, so behaviour matches RNS for all reachable
+non-malicious inputs. Found by a proactive bug-class sweep, not by a reviewer.

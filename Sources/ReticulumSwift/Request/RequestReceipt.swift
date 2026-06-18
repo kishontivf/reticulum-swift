@@ -272,15 +272,10 @@ public actor RequestReceipt {
 
             guard !Task.isCancelled else { return }
 
-            // Check current status - timeout only if still waiting
-            let currentStatus = await self.status
-            switch currentStatus {
-            case .pending, .delivered:
-                await self.handleTimeout()
-            default:
-                // Already completed, no timeout needed
-                break
-            }
+            // handleTimeout re-checks status atomically inside the actor — the response
+            // can arrive between this point and handleTimeout running, so the gate must
+            // be there, not here (this pre-read would already be stale).
+            await self.handleTimeout()
         }
     }
 
@@ -288,6 +283,19 @@ public actor RequestReceipt {
     ///
     /// Updates status to timeout and invokes the failure callback.
     private func handleTimeout() async {
+        // Re-check status atomically here (no await before this guard, so no actor
+        // message can interleave between the read and the transition). Between the
+        // timeout monitor firing and this call, the RESPONSE may have arrived —
+        // response_received transitions status to .ready and cancels the timeout — so
+        // only time out if still waiting. Otherwise overwriting to .timeout would clobber
+        // a delivered/ready request AND double-fire its callback. Mirrors RNS
+        // request_timed_out's status gate.
+        switch status {
+        case .pending, .delivered:
+            break
+        default:
+            return
+        }
         status = .timeout
         statusContinuation?.yield(status)
         statusContinuation?.finish()

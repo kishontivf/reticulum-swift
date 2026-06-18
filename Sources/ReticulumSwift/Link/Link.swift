@@ -2052,6 +2052,21 @@ public actor Link {
     /// - Returns: true if the advertisement was accepted (an inbound resource was
     ///   started), false otherwise.
     public func receiveResourceAdvertisement(_ advertisement: ResourceAdvertisement) async -> Bool {
+        // Drop a malformed advertisement BEFORE allocating anything: numParts is a
+        // peer-controlled msgpack field that feeds Array(repeating:count:) in the
+        // Resource init (Resource.swift:519/525). A negative count is an UNCATCHABLE
+        // fatalError ("Can't construct Array with count < 0") and a multi-billion count
+        // is an allocation trap — a single crafted RESOURCE_ADV could abort the process,
+        // even on a resourceStrategy=.acceptNone node (this runs first). A real
+        // per-segment part count is far below MAX_EFFICIENT_SIZE (a segment is at most
+        // that many BYTES, hence far fewer parts), so reject anything outside
+        // [0, MAX_EFFICIENT_SIZE] as nonsensical — mirroring RNS's graceful decode-drop.
+        guard advertisement.numParts >= 0,
+              advertisement.numParts <= ResourceConstants.MAX_EFFICIENT_SIZE else {
+            linkLogger.warning("Dropping resource advertisement: out-of-range numParts=\(advertisement.numParts, privacy: .public)")
+            return false
+        }
+
         // Inbound resource scaffold (RNS Resource.accept builds it from the adv).
         let resource = Resource(advertisement: advertisement, link: self)
 
@@ -2573,8 +2588,17 @@ public actor Link {
                 // still busy with this multi-segment resource, so the
                 // pending-outgoing queue must not advance until the FINAL segment
                 // concludes.
-                outboundResources.removeValue(forKey: hash)
-                await advertiseNextSegment(after: resource)
+                //
+                // Gate the advance on actually OWNING the segment (removeValue != nil),
+                // mirroring this file's other defended conclusion sites. RESOURCE_PRF is
+                // in skipDedup, so a duplicate/retransmitted proof on a lossy BLE/mesh
+                // link can drive two concurrent handleResourceProof calls for the same
+                // segment; without the gate both would advanceNextSegment and double-
+                // advertise the next segment. Actor isolation makes removeValue atomic,
+                // so exactly one caller advances.
+                if outboundResources.removeValue(forKey: hash) != nil {
+                    await advertiseNextSegment(after: resource)
+                }
             } else {
                 // Final segment concluded (RNS/Resource.py:788-792): fire the
                 // app-facing conclusion callback ONCE for the whole transfer, then

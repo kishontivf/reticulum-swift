@@ -418,7 +418,11 @@ private func decodeBinary(length: Int, from data: Data, at offset: inout Int) th
 
 private func decodeArray(count: Int, from data: Data, at offset: inout Int) throws -> MessagePackValue {
     var elements: [MessagePackValue] = []
-    elements.reserveCapacity(count)
+    // Bound the reservation by bytes actually remaining (each element is >= 1 byte): the
+    // wire `count` can be up to 2^32-1 (array32) and reserveCapacity is eager, so a tiny
+    // crafted header would otherwise trap on an impossible multi-GB allocation BEFORE the
+    // loop's "unexpected end of data" guard fires. umsgpack (RNS) does no pre-allocation.
+    elements.reserveCapacity(min(count, max(0, data.count - offset)))
     for _ in 0..<count {
         elements.append(try decodeValue(from: data, at: &offset))
     }
@@ -427,7 +431,9 @@ private func decodeArray(count: Int, from data: Data, at offset: inout Int) thro
 
 private func decodeMap(count: Int, from data: Data, at offset: inout Int) throws -> MessagePackValue {
     var map: [MessagePackValue: MessagePackValue] = [:]
-    map.reserveCapacity(count)
+    // Each entry is >= 2 bytes (key + value); bound the reservation accordingly so a
+    // crafted map32 count can't trap on pre-allocation (see decodeArray).
+    map.reserveCapacity(min(count, max(0, data.count - offset) / 2))
     for _ in 0..<count {
         let key = try decodeValue(from: data, at: &offset)
         let value = try decodeValue(from: data, at: &offset)

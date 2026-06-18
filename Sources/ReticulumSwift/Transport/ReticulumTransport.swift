@@ -2261,13 +2261,25 @@ public actor ReticulumTransport {
             logger.info("Link \(hexPrefix) moved to activeLinks, total=\(self.activeLinks.count)")
 
         } catch {
-            // PROOF validation failed - close link
-            logger.error("PROOF processing failed: \(error.localizedDescription)")
-            await link.close(reason: .proofInvalid)
-            pendingLinks.removeValue(forKey: packet.destination)
+            // Only tear the link down if it is NOT already established. A duplicate or
+            // late LRPROOF — the SAME proof arriving via two interfaces on a shared
+            // medium / BLE mesh, which is exactly why LRPROOF dedup exists but is only
+            // recorded AFTER processProof succeeds (above) — makes processProof throw an
+            // invalid-STATE error, because the first copy already promoted the link to
+            // .active. That is not a bad proof: closing here would flap a just-
+            // established link and emit a spurious LINKCLOSE to the peer. RNS gates proof
+            // validation on `status == PENDING` and silently ignores a proof otherwise.
+            if await link.state.isEstablished {
+                let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.warning("Ignoring duplicate/late LRPROOF on already-established link \(hexPrefix, privacy: .public)...: \(error.localizedDescription, privacy: .public)")
+            } else {
+                logger.error("PROOF processing failed: \(error.localizedDescription)")
+                await link.close(reason: .proofInvalid)
+                pendingLinks.removeValue(forKey: packet.destination)
 
-            let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
-            logger.warning("Link \(hexPrefix, privacy: .public)... PROOF validation failed: \(error.localizedDescription, privacy: .public)")
+                let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.warning("Link \(hexPrefix, privacy: .public)... PROOF validation failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
