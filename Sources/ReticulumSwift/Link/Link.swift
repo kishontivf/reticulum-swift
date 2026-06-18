@@ -292,6 +292,18 @@ public actor Link {
     /// `register_outgoing_resource` runs synchronously. See port-deviations.md.
     private var outgoingReservationActive = false
 
+    /// Resource hashes whose app-facing conclusion callback has already fired, so it
+    /// fires AT MOST ONCE per resource regardless of which path reaches the conclusion
+    /// first. RNS fires `self.callback(self)` exactly once per resource
+    /// (RNS/Resource.py:738/792), but this actor port concludes the same resource from
+    /// several racing paths — the inbound handlers (cancel/reject/data/proof), the
+    /// outbound segment chain, and `finishClose`'s cancel-on-close detached Task — and
+    /// the `await resource.hash` suspensions between "match" and "fire" let two of them
+    /// interleave. Routing every app callback through `fireResourceConcludedOnce(_:)`
+    /// (which checks+inserts here) collapses all those double-fire windows into one
+    /// guard. Bounded by the link's lifetime resource count (cleared on dealloc).
+    private var firedResourceConclusions: Set<Data> = []
+
     // MARK: - Identity
 
     // MARK: - Close Callback
@@ -1312,13 +1324,16 @@ public actor Link {
         outboundResources.removeAll()
         pendingOutgoingQueue.removeAll()
         if !inflightResources.isEmpty {
-            let callbacks = resourceCallbacks
-            Task {
+            Task { [weak self] in
                 for resource in inflightResources {
                     try? await resource.transitionState(to: .failed)
                     // Link is going away — abandon any partial inbound chain.
                     await resource.cleanup(abandonChain: true)
-                    await callbacks?.resourceConcluded(resource)
+                    // Route through the actor's fire-once guard so a handler that
+                    // concludes the same resource concurrently can't double-fire the
+                    // app callback (this detached Task is the other half of every
+                    // finishClose-vs-handler race).
+                    await self?.fireResourceConcludedOnce(resource)
                 }
             }
         }
@@ -1579,6 +1594,30 @@ public actor Link {
         }
     }
 
+    /// Fire the APP-facing resource-conclusion callback at most ONCE per resource.
+    ///
+    /// Several actor paths can conclude the same resource — the inbound handlers, the
+    /// outbound segment chain, and `finishClose`'s cancel-on-close — and the
+    /// `await resource.hash` suspension between matching a resource and firing its
+    /// callback lets two of them interleave, double-firing the app callback (which the
+    /// LXMF layer is not required to tolerate). This dedups on the resource hash
+    /// (`firedResourceConclusions`): the FIRST caller to insert wins and fires; later
+    /// callers no-op. `Set.insert` is synchronous, so even though both callers may pass
+    /// the `await resource.hash` above, exactly one observes `inserted == true`.
+    /// Preserves RNS's once-per-resource callback (RNS/Resource.py:738/792). See
+    /// port-deviations.md.
+    private func fireResourceConcludedOnce(_ resource: Resource) async {
+        let hash = await resource.hash ?? Data()
+        // No stable identity to dedup on — fire best-effort (does not happen for a
+        // real resource, whose hash is always set).
+        guard !hash.isEmpty else {
+            await resourceCallbacks?.resourceConcluded(resource)
+            return
+        }
+        guard firedResourceConclusions.insert(hash).inserted else { return }
+        await resourceCallbacks?.resourceConcluded(resource)
+    }
+
     /// Advertise + register the next queued outbound resource, if any, now that
     /// the link is free. Event-driven replacement for RNS
     /// `Resource.__advertise_job`'s `while not link.ready_for_new_resource():
@@ -1625,7 +1664,7 @@ public actor Link {
             let nextHash = await next.hash ?? Data()
             if outboundResources.removeValue(forKey: nextHash) != nil {
                 await next.cleanup()
-                await resourceCallbacks?.resourceConcluded(next)
+                await fireResourceConcludedOnce(next)
             }
             // Move on to the next queued resource (the link is still free).
             await drainOutgoingQueue()
@@ -2337,7 +2376,7 @@ public actor Link {
                     // App-facing conclusion callback, then Link-internal bookkeeping
                     // (registry removal + last-window record; RNS resource_concluded,
                     // RNS/Link.py:1281-1290).
-                    await resourceCallbacks?.resourceConcluded(resource)
+                    await fireResourceConcludedOnce(resource)
                     await resourceConcluded(resource)
                     return
                 }
@@ -2370,7 +2409,7 @@ public actor Link {
                     // segment's fresh Resource appends to the same on-disk file
                     // (keyed by original_hash). Conclude so a fresh advertisement
                     // for the next segment is accepted.
-                    await resourceCallbacks?.resourceConcluded(resource)
+                    await fireResourceConcludedOnce(resource)
                     await resourceConcluded(resource)
                     linkLogger.debug("Segment \(segIndex, privacy: .public)/\(segTotal, privacy: .public) received, awaiting next segment advertisement")
                     return
@@ -2453,7 +2492,7 @@ public actor Link {
                 }
 
                 // Notify callback (python final-segment callback, Resource.py:738)
-                await resourceCallbacks?.resourceConcluded(resource)
+                await fireResourceConcludedOnce(resource)
 
                 // Unlink the inbound storagepath now the data is surfaced
                 // (python os.unlink(storagepath), Resource.py:744) and close
@@ -2543,7 +2582,7 @@ public actor Link {
                 // Resource.py:796-797) and run the Link-internal conclusion
                 // (registry removal + drain the next queued outbound resource; RNS
                 // resource_concluded, RNS/Link.py:1281-1290).
-                await resourceCallbacks?.resourceConcluded(resource)
+                await fireResourceConcludedOnce(resource)
                 await resource.cleanup()
                 await resourceConcluded(resource)
             }
@@ -2624,7 +2663,7 @@ public actor Link {
                 linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
                 if outboundResources.removeValue(forKey: nextHash) != nil {
                     await next.cleanup()
-                    await resourceCallbacks?.resourceConcluded(next)
+                    await fireResourceConcludedOnce(next)
                     await drainOutgoingQueue()
                 }
             }
@@ -2728,7 +2767,7 @@ public actor Link {
                     // transitionState, which would silently no-op the TRANSFERRING/
                     // AWAITING_PROOF cases and leave the sender un-rejected.
                     await resource.markRejected()
-                    await resourceCallbacks?.resourceConcluded(resource)
+                    await fireResourceConcludedOnce(resource)
                     // Terminal path: close + unlink staging tempfile.
                     await resource.cleanup()
                     // Link-internal conclusion: remove + drain the next queued
@@ -2744,7 +2783,7 @@ public actor Link {
             let resourceState = await resource.state
             if resourceState == .advertised {
                 await resource.markRejected()  // RNS _rejected() (RNS/Resource.py:1106-1117)
-                await resourceCallbacks?.resourceConcluded(resource)
+                await fireResourceConcludedOnce(resource)
                 await resource.cleanup()
                 await resourceConcluded(resource)
             }
@@ -2767,7 +2806,7 @@ public actor Link {
                 if let resourceHash = await resource.hash, Data(cancelHash) == resourceHash {
                     do {
                         try await resource.transitionState(to: .cancelled)
-                        await resourceCallbacks?.resourceConcluded(resource)
+                        await fireResourceConcludedOnce(resource)
                     } catch {}
                     await resource.cleanup()
                     // Link-internal conclusion: remove + drain next queued outbound.
@@ -2781,7 +2820,7 @@ public actor Link {
                 if let resourceHash = await resource.hash, Data(cancelHash) == resourceHash {
                     do {
                         try await resource.transitionState(to: .cancelled)
-                        await resourceCallbacks?.resourceConcluded(resource)
+                        await fireResourceConcludedOnce(resource)
                     } catch {}
                     await resource.cleanup(abandonChain: true)
                     // Link-internal conclusion: record final window + remove

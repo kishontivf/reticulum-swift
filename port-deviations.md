@@ -1745,3 +1745,23 @@ rather than a watchdog `TIMEOUT`
 (`test_clean_peer_disconnect_closes_destination_closed`), not to perform a full RNS
 interface teardown. A genuinely SIGKILL'd peer still yields `TIMEOUT` (the drain only runs
 on the graceful stdin-EOF path).
+
+### `fireResourceConcludedOnce` — centralized once-per-resource app callback (fix/conformance-greploop 2026-06-18)
+
+**Site:** `Link/Link.swift` (`firedResourceConclusions: Set<Data>` + `fireResourceConcludedOnce(_:)`);
+every app-facing conclusion site routes through it (inbound handlers cancel/reject/data/proof,
+the outbound segment chain, `drainOutgoingQueue`, and `finishClose`'s cancel-on-close Task).
+
+**Python reference:** `RNS/Resource.py:738` / `:792` — RNS fires the resource's `self.callback(self)`
+EXACTLY ONCE per resource, from synchronous code.
+
+**Reason:** Category (a) language/runtime concurrency. This actor port concludes the same resource from
+several racing paths, and the `await resource.hash` suspension between matching a resource and firing
+its callback lets two of them interleave — most reachably `finishClose`'s detached cancel-on-close Task
+vs. an inbound handler on an overlapping BLE teardown — double-firing the app callback (which the LXMF
+layer is not required to tolerate). RNS has no such race (synchronous, single conclusion site per path).
+The fix ENFORCES RNS's once-per-resource invariant rather than diverging from it: dedup on the resource
+hash via a per-link `Set`; `Set.insert` is synchronous, so even when both racers pass the preceding
+`await`, exactly one observes `inserted == true` and fires. The set is bounded by the link's lifetime
+resource count and freed on dealloc. Supersedes the earlier per-site `removeValue != nil` double-fire
+guards (those remain for cleanup/queue-drain ownership, which fire-once does not dedup).
