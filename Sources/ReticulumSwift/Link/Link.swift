@@ -163,14 +163,71 @@ public actor Link {
     /// Calculated keep-alive interval based on RTT
     public private(set) var keepaliveInterval: TimeInterval = LinkConstants.KEEPALIVE_MIN
 
-    /// Last inbound traffic timestamp
+    /// RNS Link.STALE_FACTOR (Link.py:98): stale_time = keepalive * 2.
+    private static let staleFactor: Double = 2.0
+
+    /// Stale-detection window. Mirrors RNS `self.stale_time` (Link.py:263,
+    /// default STALE_TIME == KEEPALIVE * STALE_FACTOR). Kept proportional to
+    /// `keepaliveInterval` whenever the keepalive cadence is (re)computed from
+    /// RTT (RNS __update_keepalive, Link.py:846) UNLESS explicitly overridden
+    /// via `setWatchdog`. Read by `checkLiveness()` so the watchdog window can
+    /// be compressed (or extended) at runtime — previously the watchdog used an
+    /// inline `keepaliveInterval * 2`, which could not be driven by the peer.
+    public private(set) var staleTime: TimeInterval = LinkConstants.KEEPALIVE_MIN * Link.staleFactor
+
+    /// Last inbound traffic timestamp (keepalives included).
+    /// Mirrors RNS `self.last_inbound` (Link.py:248/:978).
     private var lastInbound: Date?
+
+    /// Public read-back of the last inbound-traffic timestamp (keepalives
+    /// included). Mirrors RNS `self.last_inbound` (Link.py:248). Backs the
+    /// bridge's wire_link_status / keepalive-probe observation of inbound
+    /// liveness without exposing the mutable field.
+    public var lastInboundAt: Date? { lastInbound }
 
     /// Last outbound traffic timestamp
     private var lastOutbound: Date?
 
+    /// Timestamp of the last keepalive packet WE emitted (initiator periodic
+    /// keepalive, or responder 0xFE echo). Mirrors RNS `self.last_keepalive`
+    /// (Link.py:250, set by had_outbound(is_keepalive=True), Link.py:692).
+    /// A keepalive bumps THIS, not `lastDataAt`.
+    public private(set) var lastKeepaliveAt: Date?
+
+    /// Last keepalive byte this link put on the wire — 0xFF when an initiator
+    /// emits its periodic keepalive, 0xFE when a non-initiator answers an
+    /// inbound 0xFF (RNS send_keepalive Link.py:849 / receive() echo
+    /// Link.py:1149-1153). Backs the wire_last_keepalive read-back.
+    public private(set) var lastKeepaliveByte: UInt8?
+
+    /// Timestamp of the last PAYLOAD traffic (inbound decrypt or outbound
+    /// encrypt), EXCLUDING keepalives. Mirrors RNS `self.last_data`
+    /// (Link.py:252, set at Link.py:691 outbound / Link.py:980 inbound). A
+    /// keepalive must NOT advance this, which lets the watchdog/bridge tell
+    /// "link is alive via keepalives" from "real data is flowing".
+    public private(set) var lastDataAt: Date?
+
+    /// Timestamp when the link first transitioned to `.active` (establishment).
+    /// Mirrors RNS `self.activated_at` (Link.py:266, set at validate_proof
+    /// :430 / rtt_packet :542). Set ONCE; a STALE->ACTIVE recovery does not
+    /// reset it. Used by `noInboundForMs()` as the inbound-idle baseline.
+    public private(set) var activatedAt: Date?
+
     /// Last proof received timestamp (for stale detection, L10)
     private var lastProof: Date?
+
+    // MARK: - Physical-layer statistics (RNS Link.py:257-259, 273)
+
+    /// Physical-layer Received Signal Strength Indication, if the interface
+    /// reports it and tracking is enabled. nil otherwise. (RNS Link.rssi)
+    public private(set) var rssi: Double?
+    /// Physical-layer Signal-to-Noise Ratio. (RNS Link.snr)
+    public private(set) var snr: Double?
+    /// Physical-layer Link Quality. (RNS Link.q)
+    public private(set) var q: Double?
+    /// Whether physical-layer statistics are tracked for this link
+    /// (RNS Link.__track_phy_stats, default False).
+    private var trackPhyStatsEnabled: Bool = false
 
     /// Interface ID this link is attached to (H2: validates DATA delivery source)
     public private(set) var attachedInterfaceId: String?
@@ -206,6 +263,46 @@ public actor Link {
 
     /// Inbound resources indexed by resource hash
     private var inboundResources: [Data: Resource] = [:]
+
+    /// Window size (parts) of the most recently concluded INBOUND resource.
+    /// RNS records the just-finished receiver's window on the link so the NEXT
+    /// inbound resource can inherit it and skip slow-start (RNS/Link.py:243 +
+    /// resource_concluded bookkeeping :1314-1315). nil until the first inbound
+    /// resource concludes. Read via `getLastResourceWindow()`; written by
+    /// `resourceConcluded(_:)`.
+    private var lastResourceWindow: Int?
+
+    /// FIFO of outbound resources offered while another outgoing transfer is
+    /// already in flight. RNS serves ONE outgoing resource at a time
+    /// (RNS/Link.py:1328-1330 `ready_for_new_resource`); resources queued here
+    /// stay in `.queued` and are advertised+registered as each predecessor
+    /// concludes (event-driven drain in `resourceConcluded(_:)`, never polled).
+    private var pendingOutgoingQueue: [Resource] = []
+
+    /// Synchronous reservation closing the register-window in the one-at-a-time
+    /// outbound gate. `readyForNewResource()` reads `outboundResources.isEmpty`, but
+    /// committing a resource as the in-flight outbound requires awaits (the Resource
+    /// actor's `state` read, and `await resource.hash` inside registerOutgoingResource)
+    /// that release the Link actor while `outboundResources` is STILL empty — a window
+    /// where a concurrent `sendResource`/`drainOutgoingQueue` would wrongly see the
+    /// link free and advertise a SECOND resource, violating the one-at-a-time invariant
+    /// and confusing the receiver's request/hashmap machinery. This is set true
+    /// SYNCHRONOUSLY before those awaits and cleared once the resource is registered
+    /// (the gate is then held by `outboundResources`). RNS has no such window —
+    /// `register_outgoing_resource` runs synchronously. See port-deviations.md.
+    private var outgoingReservationActive = false
+
+    /// Resource hashes whose app-facing conclusion callback has already fired, so it
+    /// fires AT MOST ONCE per resource regardless of which path reaches the conclusion
+    /// first. RNS fires `self.callback(self)` exactly once per resource
+    /// (RNS/Resource.py:738/792), but this actor port concludes the same resource from
+    /// several racing paths — the inbound handlers (cancel/reject/data/proof), the
+    /// outbound segment chain, and `finishClose`'s cancel-on-close detached Task — and
+    /// the `await resource.hash` suspensions between "match" and "fire" let two of them
+    /// interleave. Routing every app callback through `fireResourceConcludedOnce(_:)`
+    /// (which checks+inserts here) collapses all those double-fire windows into one
+    /// guard. Bounded by the link's lifetime resource count (cleared on dealloc).
+    private var firedResourceConclusions: Set<Data> = []
 
     // MARK: - Identity
 
@@ -255,6 +352,24 @@ public actor Link {
         guard let callback = packetCallback else { return false }
         await callback(data, packet)
         return true
+    }
+
+    /// Per-link inbound packet observation hook (additive instrumentation).
+    ///
+    /// Invoked for an observed inbound packet AFTER link-decryption, carrying the
+    /// wire context byte and the decrypted plaintext, so an instrumentation
+    /// consumer (the conformance bridge) can capture the RESPONSE (0x0A) frame's
+    /// msgpack `[request_id, response]` and the >MDU response fork's RESOURCE_ADV
+    /// (0x02) advertisement. RNS routes both through `Link.receive` with no
+    /// app-visible wrap point (RNS/Link.py:897-901); this hook adds one WITHOUT
+    /// altering routing, ordering, or timing. No-op when unset.
+    private var inboundPacketObserver: (@Sendable (UInt8, Data) async -> Void)?
+
+    /// Set (or clear) the inbound packet observation hook. See
+    /// `inboundPacketObserver`. Additive instrumentation — documented in
+    /// port-deviations.md (no RNS-named equivalent).
+    public func setInboundPacketObserver(_ observer: (@Sendable (UInt8, Data) async -> Void)?) {
+        self.inboundPacketObserver = observer
     }
 
     /// Channel for typed message communication (lazy-created via getOrCreateChannel).
@@ -444,7 +559,7 @@ public actor Link {
         // Parse RTT from msgpack (optional, mainly for stats)
         if let value = try? unpackMsgPack(data), case .double(let rttValue) = value {
             self.rtt = rttValue
-            self.keepaliveInterval = LinkConstants.keepaliveInterval(forRTT: rttValue)
+            updateKeepalive(forRTT: rttValue)
         }
 
         // Transition to active
@@ -515,6 +630,12 @@ public actor Link {
         let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
         linkLogger.info("Link \(linkIdHex, privacy: .public) transitioning: \(String(describing: self.state), privacy: .public) -> \(String(describing: newState), privacy: .public)")
         state = newState
+        // RNS records activated_at exactly once at establishment (validate_proof
+        // Link.py:430 / rtt_packet Link.py:542); a later STALE->ACTIVE recovery
+        // must NOT reset it (no_inbound_for baselines off it, Link.py:661).
+        if newState == .active && activatedAt == nil {
+            activatedAt = Date()
+        }
         stateContinuation?.yield(newState)
     }
 
@@ -607,7 +728,7 @@ public actor Link {
         // Measure RTT
         if let sentAt = requestSentAt {
             rtt = Date().timeIntervalSince(sentAt)
-            keepaliveInterval = LinkConstants.keepaliveInterval(forRTT: rtt)
+            updateKeepalive(forRTT: rtt)
             linkLogger.info("RTT measured: \(String(format: "%.3f", self.rtt), privacy: .public)s")
         }
 
@@ -786,7 +907,12 @@ public actor Link {
         }
 
         do {
-            lastOutbound = Date()
+            let now = Date()
+            lastOutbound = now
+            // RNS had_outbound(is_keepalive=False) bumps last_data on outbound
+            // payload (Link.py:691). Keepalives are never encrypted (raw bytes),
+            // so every encrypt() is payload and advances lastDataAt.
+            lastDataAt = now
             return try token.encrypt(plaintext)
         } catch {
             throw LinkError.encryptionFailed(reason: error.localizedDescription)
@@ -814,7 +940,13 @@ public actor Link {
 
         do {
             let plaintext = try token.decrypt(ciphertext)
-            lastInbound = Date()
+            let now = Date()
+            lastInbound = now
+            // RNS receive() bumps last_data alongside last_inbound for every
+            // non-KEEPALIVE inbound packet (Link.py:979-980). Keepalives are raw
+            // bytes routed through processKeepalive() (never decrypt()), so an
+            // inbound decrypt is always payload and advances lastDataAt.
+            lastDataAt = now
             return plaintext
         } catch {
             throw LinkError.decryptionFailed(reason: error.localizedDescription)
@@ -852,6 +984,45 @@ public actor Link {
     #endif
 
     // MARK: - Keep-Alive
+
+    /// Recompute the keepalive cadence and stale window from a measured RTT.
+    /// Mirrors RNS `__update_keepalive` (Link.py:844-846): keepalive is derived
+    /// from RTT, then stale_time = keepalive * STALE_FACTOR. The two always move
+    /// together unless `setWatchdog` later overrides them.
+    private func updateKeepalive(forRTT rtt: TimeInterval) {
+        keepaliveInterval = LinkConstants.keepaliveInterval(forRTT: rtt)
+        staleTime = keepaliveInterval * Link.staleFactor
+    }
+
+    /// Override the watchdog timing windows at runtime.
+    ///
+    /// RNS exposes `link.keepalive` and `link.stale_time` as plain settable
+    /// attributes (Link.py:262-263) that the watchdog reads directly
+    /// (Link.py:792-808). Swift's actor encapsulation requires an explicit
+    /// setter for the same operation (category (a) language/runtime). Lets the
+    /// keepalive cadence and stale window be compressed (or extended) after
+    /// establishment without re-measuring RTT — e.g. to force a STALE/timeout
+    /// quickly, or to hold a link ACTIVE through a long silence.
+    ///
+    /// - Parameters:
+    ///   - keepalive: New keepalive interval in seconds.
+    ///   - staleTime: New stale window in seconds (inbound silence after which
+    ///     the link is treated as STALE).
+    public func setWatchdog(keepalive: TimeInterval, staleTime: TimeInterval) {
+        self.keepaliveInterval = keepalive
+        self.staleTime = staleTime
+    }
+
+    /// Time in milliseconds since the last inbound packet (keepalives included).
+    /// Mirrors RNS `no_inbound_for()` (Link.py:657-663):
+    /// `now - max(last_inbound, activated_at)`. Returns nil when the link has no
+    /// inbound reference yet (never received and never activated), so the bridge
+    /// can report a null rather than a spuriously huge idle time.
+    public func noInboundForMs() -> Int? {
+        let refs = [lastInbound, activatedAt].compactMap { $0 }
+        guard let ref = refs.max() else { return nil }
+        return Int(Date().timeIntervalSince(ref) * 1000.0)
+    }
 
     /// Start the keep-alive task.
     ///
@@ -921,7 +1092,13 @@ public actor Link {
             let encoded = packet.encode()
             try await send(encoded)
             keepaliveSendCount += 1
-            lastOutbound = Date()
+            // RNS had_outbound(is_keepalive=True): bump last_outbound +
+            // last_keepalive but NOT last_data (Link.py:851 → :690-692). Record
+            // the emitted byte for the wire_last_keepalive read-back (Link.py:849).
+            let now = Date()
+            lastOutbound = now
+            lastKeepaliveAt = now
+            lastKeepaliveByte = keepaliveData[keepaliveData.startIndex]
             let linkHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
             linkLogger.debug("Keepalive sent #\(self.keepaliveSendCount, privacy: .public) for \(linkHex, privacy: .public), byte=0x\(String(format: "%02x", keepaliveData[0]), privacy: .public), pktLen=\(encoded.count, privacy: .public)")
         } catch {
@@ -954,7 +1131,11 @@ public actor Link {
         }
 
         // H1: Responder echoes 0xFE when receiving initiator's 0xFF
+        // (RNS Link.py:1149-1153). Record the answered byte synchronously so the
+        // wire_last_keepalive read-back is race-free even though the echo send is
+        // dispatched on a detached Task (sendKeepalive also sets it).
         if !initiator && byte == LinkConstants.KEEPALIVE_INITIATOR {
+            lastKeepaliveByte = LinkConstants.KEEPALIVE_RESPONDER
             Task { [weak self] in await self?.sendKeepalive() }
         }
     }
@@ -1009,15 +1190,19 @@ public actor Link {
             return
         }
 
-        // L10: Consider lastProof as activity alongside lastInbound
-        let lastActivity = [lastInbound, lastProof].compactMap { $0 }.max() ?? lastIn
+        // L10: Consider lastProof as activity alongside lastInbound. RNS also
+        // folds activated_at into the baseline (Link.py:789).
+        let lastActivity = [lastInbound, lastProof, activatedAt].compactMap { $0 }.max() ?? lastIn
         let elapsed = Date().timeIntervalSince(lastActivity)
-        let staleTime = keepaliveInterval * 2.0
+        // RNS watchdog reads self.stale_time directly (Link.py:796), which is
+        // settable via setWatchdog. Default == keepaliveInterval * STALE_FACTOR,
+        // so an un-driven link behaves exactly as the former inline `* 2.0`.
+        let staleWindow = self.staleTime
 
-        if state == .active && elapsed > staleTime {
+        if state == .active && elapsed > staleWindow {
             // Transition to stale
             transitionState(to: .stale)
-        } else if state == .stale && elapsed > (staleTime + rtt * LinkConstants.KEEPALIVE_TIMEOUT_FACTOR + LinkConstants.STALE_GRACE) {
+        } else if state == .stale && elapsed > (staleWindow + rtt * LinkConstants.KEEPALIVE_TIMEOUT_FACTOR + LinkConstants.STALE_GRACE) {
             // M8: Stale grace includes RTT-proportional timeout (Python: rtt * KEEPALIVE_TIMEOUT_FACTOR + STALE_GRACE)
             close(reason: .timeout)
         }
@@ -1040,12 +1225,64 @@ public actor Link {
     ///
     /// - Parameter reason: Reason for closing (defaults to initiatorClosed)
     public func close(reason: TeardownReason = .initiatorClosed) {
+        // Locally-initiated close: emit the LINKCLOSE packet (RNS `teardown()` ->
+        // `__teardown_packet`, Link.py:692-704). Received closes go through
+        // handleClose, which mirrors `teardown_packet` and emits NOTHING.
+        finishClose(reason: reason, emitClose: true)
+    }
+
+    /// Handle an inbound LINKCLOSE packet from the peer.
+    ///
+    /// Faithful port of RNS `Link.teardown_packet` (RNS/Link.py:710-722): validate
+    /// the decrypted payload carries our link_id, choose the role-correct teardown
+    /// reason, run the `link_closed` cleanup, and — crucially — emit NO LINKCLOSE in
+    /// reply (only the locally-initiated `teardown()` sends a packet, Link.py:704).
+    /// The previous Transport path called `close(reason: .destinationClosed)`, which
+    /// both HARDCODED the reason (mislabeling a responder's received close, which is
+    /// really INITIATOR_CLOSED) AND re-emitted a redundant echoed LINKCLOSE.
+    ///
+    /// - Parameter plaintext: The decrypted LINKCLOSE payload (expected == linkId).
+    public func handleClose(_ plaintext: Data) async {
+        // RNS teardown_packet only acts when plaintext == self.link_id (Link.py:712).
+        guard plaintext == linkId else {
+            linkLogger.warning("LINKCLOSE payload mismatch, ignoring")
+            return
+        }
+        guard !state.isTerminal else { return }
+        // RNS teardown_packet sets the reason from OUR role (Link.py:714-717): an
+        // initiator receiving a close means the DESTINATION closed it; a responder
+        // receiving a close means the INITIATOR closed it. (This is the INVERSE of
+        // the locally-initiated teardown() reason, Link.py:706-707 — which is exactly
+        // why handleClose must NOT reuse close()/its reason.)
+        let reason: TeardownReason = initiator ? .destinationClosed : .initiatorClosed
+        finishClose(reason: reason, emitClose: false)
+    }
+
+    /// Shared teardown body for both locally-initiated `close()` and inbound
+    /// `handleClose()`. Mirrors RNS `Link.link_closed` (RNS/Link.py:724-733) with an
+    /// `emitClose` gate selecting whether a LINKCLOSE packet is sent first: `close()`
+    /// (RNS `teardown` -> `__teardown_packet`) passes `true`; `handleClose()` (RNS
+    /// `teardown_packet`, which sends nothing) passes `false`. Every other step —
+    /// cancel in-flight resources, transition to `.closed`, finish the state stream,
+    /// single-fire the close callback, purge the ephemeral key material — is identical
+    /// and order-preserving across both paths.
+    ///
+    /// - Parameters:
+    ///   - reason: The teardown reason recorded on the closed state.
+    ///   - emitClose: Whether to send a LINKCLOSE packet first (true only for a
+    ///     locally-initiated close).
+    private func finishClose(reason: TeardownReason, emitClose: Bool) {
         guard !state.isTerminal else { return }
 
-        // Send LINKCLOSE to remote peer if link was active
-        // Python RNS sends encrypted(link_id) with context LINKCLOSE
-        // Encrypt BEFORE state transition (encrypt() checks state.isEstablished)
-        if state.isEstablished, let send = sendCallback, let token = token {
+        // Send LINKCLOSE to the remote peer if this is a LOCAL close and the link
+        // is in a teardown-emitting state. RNS teardown() sends the packet for any
+        // status != PENDING and != CLOSED (RNS/Link.py:704) — i.e. .handshake too,
+        // not just .active/.stale — so a responder still in .handshake (awaiting the
+        // initiator's RTT packet) still tells the peer DESTINATION_CLOSED instead of
+        // letting it fall back to a watchdog TIMEOUT. Python RNS sends
+        // encrypted(link_id) with context LINKCLOSE; the link token exists from the
+        // handshake on, so token.encrypt works here.
+        if emitClose, state.canEmitTeardown, let send = sendCallback, let token = token {
             let linkIdCopy = linkId
             if let encrypted = try? token.encrypt(linkIdCopy) {
                 let header = PacketHeader(
@@ -1072,6 +1309,35 @@ public actor Link {
         stopKeepalive()
         stopWatchdog()
 
+        // Mirror python Link.link_closed (Link.py:724-726): cancel in-flight resources
+        // on close. With the link already closing, cancel()'s non-corrupt FAILED branch
+        // fires the resource-conclusion callback (the LXMF handler ignores non-.complete)
+        // and drops the resource; no RESOURCE_ICL is sent because the link is no longer
+        // ACTIVE (Resource.py:1088-1092 gates the cancel packet on link status == ACTIVE).
+        // Include resources still waiting in the outgoing queue (prepared but not
+        // yet advertised under the one-at-a-time gate): the link is going away, so
+        // they will never be advertised and must be concluded too.
+        let inflightResources = Array(inboundResources.values)
+            + Array(outboundResources.values)
+            + pendingOutgoingQueue
+        inboundResources.removeAll()
+        outboundResources.removeAll()
+        pendingOutgoingQueue.removeAll()
+        if !inflightResources.isEmpty {
+            Task { [weak self] in
+                for resource in inflightResources {
+                    try? await resource.transitionState(to: .failed)
+                    // Link is going away — abandon any partial inbound chain.
+                    await resource.cleanup(abandonChain: true)
+                    // Route through the actor's fire-once guard so a handler that
+                    // concludes the same resource concurrently can't double-fire the
+                    // app callback (this detached Task is the other half of every
+                    // finishClose-vs-handler race).
+                    await self?.fireResourceConcludedOnce(resource)
+                }
+            }
+        }
+
         transitionState(to: .closed(reason: reason))
         stateContinuation?.finish()
 
@@ -1080,7 +1346,110 @@ public actor Link {
             closeCallback = nil  // clear to prevent double-fire
             Task { await cb(reason) }
         }
+
+        // Purge ephemeral key material on close — mirror RNS Link.link_closed
+        // (Link.py:729-733: prv/pub/pub_bytes/shared_key/derived_key = None). The
+        // LINKCLOSE frame above already captured `token` before this point, and a
+        // closed link is terminal (encrypt/decrypt guard on state.isEstablished),
+        // so dropping these is safe and ensures the session keys don't outlive the
+        // link. (peerEncryptionPublicKey ≙ pub, derivedKey ≙ derived_key, token
+        // holds the derived AES/HMAC material ≙ shared_key.)
+        peerEncryptionPublicKey = nil
+        derivedKey = nil
+        token = nil
     }
+
+    /// Graceful-shutdown teardown that AWAITS the LINKCLOSE send inline before
+    /// returning.
+    ///
+    /// `close()` (`finishClose(emitClose: true)`) detaches the LINKCLOSE send in a
+    /// `Task { try? await send(...) }` (above) so callers aren't blocked. That detached
+    /// task will NOT run if the process exits immediately afterwards (e.g. the
+    /// conformance bridge hitting stdin EOF), so the peer never receives the close and
+    /// can only fall back to a watchdog TIMEOUT instead of DESTINATION_CLOSED. This
+    /// variant builds + encrypts the same LINKCLOSE packet (RNS `__teardown_packet`,
+    /// Link.py:692-704), `await`s its delivery via the send callback, and ONLY THEN runs
+    /// the shared teardown with `emitClose: false` so the packet is sent exactly once.
+    /// Use it from synchronous process-exit / interface-shutdown paths (RNS tears active
+    /// links down in its exit handler so peers observe DESTINATION_CLOSED).
+    ///
+    /// - Parameter reason: Optional override for the teardown reason recorded on the
+    ///   local closed state. When nil (the default) it is derived from role exactly like
+    ///   RNS `teardown()` (Link.py:706-707): initiator ⇒ INITIATOR_CLOSED, responder ⇒
+    ///   DESTINATION_CLOSED. The peer computes its OWN reason in `handleClose`; an
+    ///   initiator that receives this close records DESTINATION_CLOSED (Link.py:714-717).
+    public func closeAndFlush(reason: TeardownReason? = nil) async {
+        guard !state.isTerminal else { return }
+
+        // RNS teardown() sets the local reason from role (Link.py:706-707).
+        let teardownReason = reason ?? (initiator ? .initiatorClosed : .destinationClosed)
+
+        // Emit + flush the LINKCLOSE inline (same frame finishClose(emitClose:true)
+        // would build), awaiting the send so the bytes are handed to the transport
+        // before we proceed to teardown/exit.
+        if state.canEmitTeardown, let send = sendCallback, let token = token,
+           let encrypted = try? token.encrypt(linkId) {
+            let header = PacketHeader(
+                headerType: .header1,
+                hasContext: true,
+                transportType: .broadcast,
+                destinationType: .link,
+                packetType: .data,
+                hopCount: 0
+            )
+            let packet = Packet(
+                header: header,
+                destination: linkId,
+                context: LinkConstants.CONTEXT_LINKCLOSE,
+                data: encrypted
+            )
+            try? await send(packet.encode())
+        }
+
+        // Run the shared teardown WITHOUT re-emitting — we already flushed above.
+        finishClose(reason: teardownReason, emitClose: false)
+    }
+
+    // MARK: - Diagnostic / test instrumentation
+
+    /// Override the link's measured round-trip time. In RNS `link.rtt` is a
+    /// plain settable attribute (Link.py); tests and diagnostics assign it
+    /// directly (e.g. to drive Channel rate-promotion bands). Swift's actor
+    /// encapsulation requires an explicit setter for the same operation —
+    /// category (a) language/runtime, no logic change. Does NOT recompute the
+    /// keepalive interval (matches RNS, where setting rtt is a raw assignment).
+    public func setRtt(_ value: TimeInterval) {
+        self.rtt = value
+    }
+
+    // MARK: - Physical-layer statistics (RNS Link.py:559-595)
+
+    /// Enable/disable physical-layer statistics tracking for this link
+    /// (RNS Link.track_phy_stats, Link.py:559). When disabled, get_rssi/snr/q
+    /// return nil even if values were recorded.
+    public func setTrackPhyStats(_ track: Bool) {
+        trackPhyStatsEnabled = track
+    }
+
+    /// Whether physical-layer stats are currently tracked.
+    public var isTrackingPhyStats: Bool { trackPhyStatsEnabled }
+
+    /// Record physical-layer statistics for the link — called by an interface
+    /// that supports phy-stat reporting when a packet arrives (RNS sets
+    /// link.rssi/snr/q directly from the interface). Stored regardless of the
+    /// track flag; the getters apply the gate.
+    public func updatePhyStats(rssi: Double? = nil, snr: Double? = nil, q: Double? = nil) {
+        if let rssi { self.rssi = rssi }
+        if let snr { self.snr = snr }
+        if let q { self.q = q }
+    }
+
+    /// RSSI if phy-stat tracking is enabled, else nil (RNS get_rssi, Link.py:573).
+    public func getRssi() -> Double? { trackPhyStatsEnabled ? rssi : nil }
+    /// SNR if phy-stat tracking is enabled, else nil (RNS get_snr, Link.py:582).
+    public func getSnr() -> Double? { trackPhyStatsEnabled ? snr : nil }
+    /// Link quality if phy-stat tracking is enabled, else nil (RNS get_q, Link.py:591).
+    public func getQ() -> Double? { trackPhyStatsEnabled ? q : nil }
 
     // MARK: - Resource Management
 
@@ -1096,6 +1465,210 @@ public actor Link {
     /// - Parameter callbacks: Callback handler conforming to ResourceCallbacks
     public func setResourceCallbacks(_ callbacks: (any ResourceCallbacks)?) {
         self.resourceCallbacks = callbacks
+    }
+
+    // MARK: - Resource Registry & Conclusion Bookkeeping (RNS Link.py:1281-1330)
+
+    /// Window size (in parts) of the most recently concluded INBOUND resource,
+    /// or nil if none has concluded yet. Mirrors RNS `Link.get_last_resource_window`
+    /// (RNS/Link.py:1314-1315). A freshly-accepted inbound resource inherits this
+    /// value to skip slow-start on a link that already carried a transfer.
+    public func getLastResourceWindow() -> Int? {
+        lastResourceWindow
+    }
+
+    /// Number of inbound resources currently being received.
+    ///
+    /// Read-only observability over RNS's `incoming_resources` list, which RNS
+    /// exposes directly (RNS/Link.py:246). Port-deviation: getter rather than a
+    /// public mutable list (see port-deviations.md).
+    public var incomingResourceCount: Int { inboundResources.count }
+
+    /// Number of outbound resources currently in flight (advertised, not yet
+    /// concluded). Observability over RNS's `outgoing_resources` (RNS/Link.py:245).
+    public var outgoingResourceCount: Int { outboundResources.count }
+
+    /// Whether the link can begin a new outgoing resource. RNS serves exactly one
+    /// outgoing resource at a time. Mirrors `ready_for_new_resource`
+    /// (RNS/Link.py:1328-1330): true only when no outbound resource is in flight.
+    public func readyForNewResource() -> Bool { outboundResources.isEmpty && !outgoingReservationActive }
+
+    /// Track an outbound resource as in flight. Mirrors RNS
+    /// `register_outgoing_resource` (RNS/Link.py:1302-1303). Per RNS
+    /// `Resource.__advertise_job` ordering (RNS/Resource.py:527→534) this MUST run
+    /// AFTER the advertisement is sent so `readyForNewResource()` reports the link
+    /// empty until the first advertisement has gone out.
+    public func registerOutgoingResource(_ resource: Resource) async {
+        let hash = await resource.hash ?? Data()
+        outboundResources[hash] = resource
+    }
+
+    /// Stop tracking an outbound resource. Mirrors RNS `cancel_outgoing_resource`
+    /// (RNS/Link.py:1320-1322); warns if the resource was not tracked.
+    public func cancelOutgoingResource(_ resource: Resource) async {
+        let hash = await resource.hash ?? Data()
+        if outboundResources.removeValue(forKey: hash) == nil {
+            linkLogger.warning("Attempt to cancel a non-existing outgoing resource")
+        } else {
+            // Cancelling an in-flight outbound resource frees the one-at-a-time
+            // outgoing slot, so advance the pending-outgoing queue. Without this a
+            // remote-triggered cancel (e.g. an EXHAUSTED sequence error flowing
+            // through request() -> cancel()) on a callback-less Link.sendResource
+            // transfer stalls the queue permanently: Resource.cancel() removes the
+            // resource HERE, before its callback-gated resourceConcluded, so the
+            // drain inside resourceConcluded never sees it (outboundResources[hash]
+            // is already nil). RNS drains via the __advertise_job poll once
+            // ready_for_new_resource() turns true; this port is event-driven
+            // (see port-deviations.md).
+            await drainOutgoingQueue()
+        }
+    }
+
+    /// Track an inbound resource being received. Mirrors RNS
+    /// `register_incoming_resource` (RNS/Link.py:1305-1306).
+    public func registerIncomingResource(_ resource: Resource) async {
+        let hash = await resource.hash ?? Data()
+        inboundResources[hash] = resource
+    }
+
+    /// Whether an inbound resource with the same hash is already being received.
+    /// Mirrors RNS `has_incoming_resource` (matches by hash, RNS/Link.py:1308-1312).
+    /// Used to drop duplicate re-delivered advertisements.
+    public func hasIncomingResource(_ resource: Resource) async -> Bool {
+        let hash = await resource.hash ?? Data()
+        return inboundResources[hash] != nil
+    }
+
+    /// Stop tracking an inbound resource.
+    ///
+    /// For `corrupt == false` this mirrors RNS `cancel_incoming_resource`
+    /// (RNS/Link.py:1324-1326): plain registry removal, warns if absent.
+    ///
+    /// `corrupt == true` is a port addition that routes the receiver-side CORRUPT
+    /// teardown (RNS `Resource.cancel()` CORRUPT branch sending a reject and the
+    /// bz2-overflow path tearing the link down, RNS/Resource.py:688-692 /
+    /// :1079-1085) through the Link, so a corrupt inbound assembly never has the
+    /// Resource actor re-enter the Link mid-cancel: it emits a RESOURCE_RCL reject
+    /// for the resource hash and tears the link down. See port-deviations.md.
+    public func cancelIncomingResource(_ resource: Resource, corrupt: Bool = false) async {
+        let hash = await resource.hash ?? Data()
+        if corrupt {
+            // RESOURCE_RCL reject for the resource hash, then teardown (mirrors the
+            // RNS bz2-bomb overflow branch, RNS/Resource.py:688-692 → cancel()).
+            var rcl = Data([ResourcePacketContext.resourceReject])
+            rcl.append(hash)
+            try? await sendResourcePacket(rcl)
+            inboundResources.removeValue(forKey: hash)
+            close()
+            return
+        }
+        if inboundResources.removeValue(forKey: hash) == nil {
+            linkLogger.warning("Attempt to cancel a non-existing incoming resource")
+        }
+    }
+
+    /// Link-internal resource-conclusion bookkeeping. Mirrors RNS
+    /// `Link.resource_concluded` (RNS/Link.py:1281-1290): for an inbound resource,
+    /// record its final window BEFORE removal so the next inbound transfer can
+    /// inherit it; for an outbound resource, remove it and advertise the next
+    /// queued outbound resource (event-driven drain of the one-at-a-time gate).
+    ///
+    /// DISTINCT from the app-facing `resourceCallbacks?.resourceConcluded(_:)`
+    /// (different receiver — no Swift name collision). Every conclusion site keeps
+    /// firing the app callback and additionally calls this for registry / window /
+    /// queue upkeep, replacing the bare `removeValue` it used to do inline.
+    ///
+    /// Port-deviation: RNS also recomputes `expected_rate` here, which has no
+    /// consumer in this port — omitted (see port-deviations.md).
+    public func resourceConcluded(_ resource: Resource) async {
+        let hash = await resource.hash ?? Data()
+        if inboundResources[hash] != nil {
+            // Capture the receiver's final window BEFORE removal so the next
+            // inbound resource inherits it (RNS/Link.py:1284).
+            lastResourceWindow = await resource.windowSize
+            inboundResources.removeValue(forKey: hash)
+        }
+        if outboundResources[hash] != nil {
+            outboundResources.removeValue(forKey: hash)
+            await drainOutgoingQueue()
+        }
+    }
+
+    /// Fire the APP-facing resource-conclusion callback at most ONCE per resource.
+    ///
+    /// Several actor paths can conclude the same resource — the inbound handlers, the
+    /// outbound segment chain, and `finishClose`'s cancel-on-close — and the
+    /// `await resource.hash` suspension between matching a resource and firing its
+    /// callback lets two of them interleave, double-firing the app callback (which the
+    /// LXMF layer is not required to tolerate). This dedups on the resource hash
+    /// (`firedResourceConclusions`): the FIRST caller to insert wins and fires; later
+    /// callers no-op. `Set.insert` is synchronous, so even though both callers may pass
+    /// the `await resource.hash` above, exactly one observes `inserted == true`.
+    /// Preserves RNS's once-per-resource callback (RNS/Resource.py:738/792). See
+    /// port-deviations.md.
+    private func fireResourceConcludedOnce(_ resource: Resource) async {
+        let hash = await resource.hash ?? Data()
+        // No stable identity to dedup on — fire best-effort (does not happen for a
+        // real resource, whose hash is always set).
+        guard !hash.isEmpty else {
+            await resourceCallbacks?.resourceConcluded(resource)
+            return
+        }
+        guard firedResourceConclusions.insert(hash).inserted else { return }
+        await resourceCallbacks?.resourceConcluded(resource)
+    }
+
+    /// Advertise + register the next queued outbound resource, if any, now that
+    /// the link is free. Event-driven replacement for RNS
+    /// `Resource.__advertise_job`'s `while not link.ready_for_new_resource():
+    /// sleep(0.25)` poll (RNS/Resource.py:522-524) — see port-deviations.md.
+    private func drainOutgoingQueue() async {
+        guard readyForNewResource(), !pendingOutgoingQueue.isEmpty else { return }
+        let next = pendingOutgoingQueue.removeFirst()
+        // Reserve the one-at-a-time slot SYNCHRONOUSLY before the awaits below:
+        // until `next` lands in outboundResources, readyForNewResource() would
+        // otherwise read empty and let a concurrent send/drain advertise a second
+        // outbound resource. Cleared once registered (gate then held by
+        // outboundResources) or before any early-exit re-drain.
+        outgoingReservationActive = true
+        // A close/cancel mid-drain may already have terminated the queued resource.
+        let nextState = await next.state
+        guard !nextState.isTerminal else {
+            outgoingReservationActive = false
+            await drainOutgoingQueue()
+            return
+        }
+        do {
+            // Register BEFORE advertising. RNS advertises-then-registers
+            // (RNS/Resource.py:527→534), but those are consecutive SYNCHRONOUS
+            // statements — no RESOURCE_REQ can interleave between them. Here
+            // `sendAdvertisement` and `registerOutgoingResource` each suspend the
+            // Link actor (the latter via `await resource.hash`), so advertising
+            // first would leave a window where the advertisement is on the wire
+            // but the resource is untracked, and a fast peer's RESOURCE_REQ would
+            // not find it in `outboundResources`. Register first to preserve RNS's
+            // effective atomicity (advertiseNextSegment already does this,
+            // :2495-2501; see port-deviations.md).
+            await registerOutgoingResource(next)
+            // Registered — the gate is now held by outboundResources; release the
+            // synchronous reservation.
+            outgoingReservationActive = false
+            try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+        } catch {
+            linkLogger.error("Failed to advertise queued resource: \(error, privacy: .public)")
+            // Advertise failed after registration: undo it and conclude — but only
+            // if WE still own `next`. The link can close during the await above,
+            // and finishClose's cancel-on-close snapshots+concludes registered
+            // resources (:1295-1311); re-concluding would be a resourceConcluded
+            // double-fire. Actor isolation makes removeValue atomic vs finishClose.
+            let nextHash = await next.hash ?? Data()
+            if outboundResources.removeValue(forKey: nextHash) != nil {
+                await next.cleanup()
+                await fireResourceConcludedOnce(next)
+            }
+            // Move on to the next queued resource (the link is still free).
+            await drainOutgoingQueue()
+        }
     }
 
     /// Send a plaintext payload over the link as a single DATA packet.
@@ -1204,20 +1777,28 @@ public actor Link {
     ///   - isResponse: Whether this is a response resource
     /// - Returns: The created Resource actor
     /// - Throws: LinkError if link is not active
-    public func sendResource(data: Data, requestId: Data? = nil, isResponse: Bool = false) async throws -> Resource {
+    ///   - autoCompress: Whether to bz2-compress the payload before transfer.
+    ///     Defaults to `false` to preserve LXMF/Columba wire behaviour (BZ2 is
+    ///     disabled for interop, see the note below); only opt in when the peer
+    ///     is known to decode our BZ2 output. Mirrors RNS `auto_compress`
+    ///     (RNS/Resource.py:366-372).
+    public func sendResource(data: Data, requestId: Data? = nil, isResponse: Bool = false, autoCompress: Bool = false, metadata: Data? = nil) async throws -> Resource {
         guard state.isEstablished else {
             throw LinkError.notActive
         }
 
         linkLogger.info("Starting resource transfer: \(data.count, privacy: .public) bytes")
 
-        // Create outbound resource
+        // Create outbound resource. `metadata` (RNS/Resource.py:260-268) is packed
+        // into the segment-1 'x' field and advertised via flag bit 5; default nil
+        // leaves every existing call site (and its byte layout) unchanged.
         let resource = Resource(
             data: data,
             link: self,
+            metadata: metadata,
             requestId: requestId,
             isResponse: isResponse,
-            autoCompress: true
+            autoCompress: autoCompress
         )
 
         // Set send callback that creates proper link DATA packets
@@ -1236,37 +1817,97 @@ public actor Link {
         // BZ2 compression disabled: our BZ2 output may not decompress correctly on
         // the Python receiver. Disable until interop is verified with E2E tests.
         //
-        // partSize MUST equal the link's negotiated MDU. Python's
-        // Resource.accept computes `total_parts = ceil(transferSize / link.mdu)`
-        // using the receiver's own negotiated link.mdu (Resource.py:188).
-        // If the sender splits into parts sized by a different value (e.g.,
-        // the global Reticulum MDU of 464), the receiver will allocate a
-        // differently-sized hashmap slot array and then IndexError when
-        // hashmap_update tries to store the sender's actual hash count.
-        // Python swallows that exception and drops the resource silently
-        // ("Could not decode resource advertisement, dropping resource" at
-        // DEBUG level), stalling the transfer in `.advertised` state.
+        // partSize is the RESOURCE SDU, NOT the link MDU. RNS sizes resource
+        // parts at `self.sdu = link.mtu - Reticulum.HEADER_MAXSIZE - IFAC_MIN_SIZE`
+        // (RNS/Resource.py:338), and the receiver re-derives
+        // `total_parts = ceil(size / sdu)` from its OWN sdu (RNS/Resource.py:187),
+        // IGNORING the advertised part count. The sender splits at the same sdu
+        // (RNS/Resource.py:432 hashmap_entries=ceil(size/sdu), :454 data slice
+        // `self.data[i*self.sdu:(i+1)*self.sdu]`).
         //
-        // `self.mdu` is updated by MTU discovery in processProof, so by the
-        // time sendResource runs the link's MDU reflects whatever MTU the
-        // peers agreed on during link establishment.
-        let partSize = self.mdu
+        // This is DELIBERATELY larger than the link MDU (431 @ MTU 500): resource
+        // data parts (context 0x01) are sent UNENCRYPTED at the link layer — the
+        // Resource pre-encrypts the whole stream once — so they ride the larger
+        // Reticulum-level MDU, not the smaller link-encrypted MDU. Splitting at
+        // self.mdu (431) instead of the sdu (464) makes the swift sender's part
+        // count diverge from a python receiver's ceil(size/464) allocation; the
+        // python receiver's fixed-size hashmap then IndexErrors in hashmap_update
+        // for the extra parts ("Could not decode... dropping resource") and the
+        // transfer never completes. (swift<->swift only "worked" because both ends
+        // agreed on the wrong 431.)
+        //
+        // HEADER_MAXSIZE = 2 + 1 + (TRUNCATED_HASHLENGTH//8)*2 = 2+1+16*2 = 35
+        // (RNS/Reticulum.py:147); IFAC_MIN_SIZE = 1 (RNS/Reticulum.py:148).
+        // `self.mtu` is updated by MTU discovery in processProof, so by the time
+        // sendResource runs it reflects whatever MTU the peers negotiated.
+        // Clamp to >= 1: a pathological MTU below 37 would make partSize <= 0 and
+        // trap `resource.prepare`'s parts-count division. No real Reticulum transport
+        // negotiates an MTU that small, so for every realistic MTU this is a no-op.
+        let partSize = max(1, self.mtu - 35 - TransportConstants.IFAC_MIN_SIZE)
         try await resource.prepare(partSize: partSize, linkEncrypt: { plaintext in
             return try encryptToken.encrypt(plaintext)
-        }, autoCompress: false)
+        }, autoCompress: autoCompress)
         let numParts = await resource.numParts
         let transferSize = await resource.transferSize
         linkLogger.info("Resource prepared: \(numParts, privacy: .public) parts, partSize=\(partSize, privacy: .public), transferSize=\(transferSize, privacy: .public), compressed=false")
 
-        // Store resource (hash is available after prepare)
+        // Hash is available after prepare.
         let hash = await resource.hash ?? Data()
-        outboundResources[hash] = resource
         let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-        linkLogger.info("Stored resource hash=\(hashHex, privacy: .public), outboundResources count=\(self.outboundResources.count, privacy: .public)")
 
-        // Send advertisement to start transfer
-        try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
-        linkLogger.info("Advertisement sent for resource \(hashHex, privacy: .public)")
+        // One-outgoing-resource-at-a-time gate (RNS `Resource.__advertise_job`
+        // polls `link.ready_for_new_resource()` and stays QUEUED until the link
+        // is free, RNS/Resource.py:522-534; RNS/Link.py:1328-1330). Port-deviation:
+        // event-driven instead of a 0.25s poll — if the link is free we advertise
+        // now, otherwise the resource waits in pendingOutgoingQueue (its prepared,
+        // non-advertised state is the swift equivalent of RNS QUEUED) and
+        // resourceConcluded drains it on conclusion.
+        //
+        // Register BEFORE advertising: RNS advertises-then-registers (:527→534) but
+        // synchronously (no yield between), so a RESOURCE_REQ can't interleave. Here
+        // the two awaits release the Link actor, so advertising first would leave a
+        // window where the adv is on the wire but the resource is untracked and a
+        // fast peer's RESOURCE_REQ is dropped (see port-deviations.md;
+        // advertiseNextSegment/drainOutgoingQueue do the same).
+        if readyForNewResource() {
+            // Reserve the one-at-a-time slot SYNCHRONOUSLY before the register
+            // await: registerOutgoingResource suspends on `await resource.hash`
+            // while outboundResources is still empty, so without this a concurrent
+            // send/drain would see the link free and advertise a second resource.
+            // Cleared once registered (gate then held by outboundResources).
+            outgoingReservationActive = true
+            await registerOutgoingResource(resource)
+            outgoingReservationActive = false
+            do {
+                try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+            } catch {
+                // Advertise failed after registration. If WE still own the resource
+                // (finishClose didn't snapshot+cleanup it on a close race), unregister
+                // so the one-at-a-time gate isn't left stuck AND unlink the staging
+                // tempfile — prepare() may have created one for a multi-segment
+                // resource, and without cleanup it leaks (acute under the NE sandbox's
+                // limited temp space, compounding across retries). The throw is the
+                // caller's conclusion signal, so unlike the fire-and-forget drain
+                // paths we do NOT fire resourceConcluded here.
+                let h = await resource.hash ?? Data()
+                if outboundResources.removeValue(forKey: h) != nil {
+                    await resource.cleanup()
+                }
+                // Advance the pending-outgoing queue before rethrowing: a resource may
+                // have queued behind this one while it was (briefly) the in-flight
+                // outbound, and this failure is its only release point — without the
+                // drain it would stall until link close. (drainOutgoingQueue and
+                // advertiseNextSegment drain on their own advertise failures too.)
+                // Guarded internally by readyForNewResource(): a close race that already
+                // cleared the queue makes this a no-op.
+                await drainOutgoingQueue()
+                throw error
+            }
+            linkLogger.info("Advertisement sent for resource \(hashHex, privacy: .public), outboundResources count=\(self.outboundResources.count, privacy: .public)")
+        } else {
+            pendingOutgoingQueue.append(resource)
+            linkLogger.info("Link busy, queued resource \(hashHex, privacy: .public) (\(self.pendingOutgoingQueue.count, privacy: .public) waiting)")
+        }
 
         return resource
     }
@@ -1342,6 +1983,15 @@ public actor Link {
         resourceDebugLog("RESOURCE packet: ctx=0x\(String(format: "%02x", context)), data=\(data.count)B")
         linkLogger.debug("Received resource packet: context=0x\(String(format: "%02x", context), privacy: .public), data=\(data.count, privacy: .public) bytes")
 
+        // Inbound packet observation hook (additive; no-op when unset). Surface the
+        // RESOURCE_ADV (0x02) advertisement bytes so an instrument can observe the
+        // >MDU response-Resource fork (RNS/Link.py:901). Only the advertisement is
+        // surfaced (the capture consumer inspects the ADV fork, not the data/control
+        // sub-packets). Runs before dispatch and does not alter routing.
+        if context == ResourcePacketContext.resourceAdvertisement {
+            await inboundPacketObserver?(context, data)
+        }
+
         switch context {
         case ResourcePacketContext.resource:             // 0x01 - RESOURCE data part
             await handleResourceData(data)
@@ -1372,83 +2022,192 @@ public actor Link {
     private func handleResourceAdvertisement(_ data: Data) async {
         guard data.count > 0 else { return }
 
-        // Data is pure advertisement payload (context already handled by handleResourcePacket)
-        let advData = data
-
+        // Data is pure advertisement payload (context already handled by handleResourcePacket).
         do {
-            let advertisement = try ResourceAdvertisement.unpack(Data(advData))
+            let advertisement = try ResourceAdvertisement.unpack(Data(data))
             let advReqId = advertisement.requestId?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
             resourceDebugLog("ADV: size=\(advertisement.dataSize), parts=\(advertisement.numParts), reqId=\(advReqId), segments=\(advertisement.totalSegments)")
-
-            // Create inbound resource
-            let resource = Resource(advertisement: advertisement, link: self)
-
-            // Check acceptance strategy
-            // Auto-accept resources with requestId matching a pending request (response resources)
-            // This matches Python Link.py behavior where response resources bypass strategy
-            let shouldAccept: Bool
-            if let reqId = advertisement.requestId,
-               pendingRequests.contains(where: { $0.requestId == reqId }) {
-                resourceDebugLog("ADV: Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
-                linkLogger.info("Auto-accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public)")
-                shouldAccept = true
-            } else {
-                switch resourceStrategy {
-                case .acceptNone:
-                    shouldAccept = false
-                case .acceptAll:
-                    shouldAccept = true
-                case .acceptApp:
-                    if let callbacks = resourceCallbacks {
-                        shouldAccept = await callbacks.resourceAdvertised(resource)
-                    } else {
-                        shouldAccept = false
-                    }
-                }
-            }
-
-            if shouldAccept {
-                // Accept the resource
-                let hash = await resource.hash ?? Data()
-                inboundResources[hash] = resource
-                let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
-                resourceDebugLog("ACCEPT: resource \(hashHex), size=\(advertisement.dataSize), parts=\(advertisement.numParts)")
-                linkLogger.info("Accepted resource \(hashHex, privacy: .public), size=\(advertisement.dataSize, privacy: .public), parts=\(advertisement.numParts, privacy: .public)")
-
-                // Notify callback
-                if let callbacks = resourceCallbacks {
-                    await callbacks.resourceStarted(resource)
-                }
-
-                // Set send callback for requests/proof (creates proper link DATA packets)
-                await resource.setSendCallback { [weak self] (packetData: Data) in
-                    guard let self = self else {
-                        throw LinkError.notActive
-                    }
-                    try await self.sendResourcePacket(packetData)
-                }
-
-                // Set decrypt callback for assembled resource data
-                // Capture the token directly to avoid actor isolation issues
-                let linkToken = self.token
-                await resource.setDecryptCallback { (ciphertext: Data) in
-                    guard let token = linkToken else {
-                        throw LinkError.encryptionNotReady
-                    }
-                    return try token.decrypt(ciphertext)
-                }
-
-                // Accept the resource (starts requesting parts)
-                try await resource.accept()
-            } else {
-                resourceDebugLog("REJECT: resource rejected (strategy=\(resourceStrategy))")
-                linkLogger.warning("Rejected resource (strategy=\(String(describing: self.resourceStrategy), privacy: .public))")
-                // Reject the resource
-                try await resource.reject()
-            }
+            _ = await receiveResourceAdvertisement(advertisement)
         } catch {
             resourceDebugLog("ADV ERROR: Failed to parse: \(error)")
             linkLogger.error("Failed to parse advertisement: \(error, privacy: .public)")
+        }
+    }
+
+    /// Decide whether to accept an inbound resource advertisement and, if so,
+    /// begin receiving it. Typed entry point (the conformance bridge feeds a
+    /// pre-unpacked advertisement here).
+    ///
+    /// Faithful port of the RESOURCE_ADV dispatch in RNS `Link.receive`
+    /// (RNS/Link.py:1065-1098). The advertisement's `q`/`u`/`p` fields select the
+    /// path:
+    ///   - request   (`q != None and u`, RNS/Resource.py:1242-1247): accepted
+    ///     UNCONDITIONALLY, ignoring `resourceStrategy` (RNS/Link.py:1070-1071).
+    ///   - response  (`q != None and p`, RNS/Resource.py:1251-1257): accepted ONLY
+    ///     if it matches a pending request (RNS/Link.py:1072-1085).
+    ///   - otherwise: gated by `resourceStrategy` (RNS/Link.py:1087-1098):
+    ///     `.acceptNone` → ignore (no reject sent), `.acceptApp` → app callback
+    ///     decides (reject sent on decline), `.acceptAll` → accept.
+    ///
+    /// - Returns: true if the advertisement was accepted (an inbound resource was
+    ///   started), false otherwise.
+    public func receiveResourceAdvertisement(_ advertisement: ResourceAdvertisement) async -> Bool {
+        // Drop a malformed advertisement BEFORE allocating anything: numParts is a
+        // peer-controlled msgpack field that feeds Array(repeating:count:) in the
+        // Resource init (Resource.swift:519/525). A negative count is an UNCATCHABLE
+        // fatalError ("Can't construct Array with count < 0") and a multi-billion count
+        // is an allocation trap — a single crafted RESOURCE_ADV could abort the process,
+        // even on a resourceStrategy=.acceptNone node (this runs first). A real
+        // per-segment part count is far below MAX_EFFICIENT_SIZE (a segment is at most
+        // that many BYTES, hence far fewer parts), so reject anything outside
+        // [0, MAX_EFFICIENT_SIZE] as nonsensical — mirroring RNS's graceful decode-drop.
+        guard advertisement.numParts >= 0,
+              advertisement.numParts <= ResourceConstants.MAX_EFFICIENT_SIZE else {
+            linkLogger.warning("Dropping resource advertisement: out-of-range numParts=\(advertisement.numParts, privacy: .public)")
+            return false
+        }
+
+        // Inbound resource scaffold (RNS Resource.accept builds it from the adv).
+        let resource = Resource(advertisement: advertisement, link: self)
+
+        let hasReqId = advertisement.requestId != nil
+        let isRequest = hasReqId && advertisement.flags.isRequestFlag    // adv.q != None and adv.u
+        let isResponse = hasReqId && advertisement.flags.isResponseFlag  // adv.q != None and adv.p
+
+        // Request resources bypass the strategy gate (RNS/Link.py:1070-1071).
+        if isRequest {
+            await acceptInboundAdvertisement(advertisement, resource: resource)
+            return true
+        }
+
+        // Response resources are accepted only when they answer a pending request
+        // (RNS/Link.py:1072-1085).
+        if isResponse {
+            if let reqId = advertisement.requestId,
+               pendingRequests.contains(where: { $0.requestId == reqId }) {
+                resourceDebugLog("ADV: Accepting response resource for pending request \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
+                await acceptInboundAdvertisement(advertisement, resource: resource)
+                return true
+            }
+            return false
+        }
+
+        // Fallback: advertisements carrying a request_id that matches a pending
+        // request but WITHOUT the `p` flag. RNS proper keys response detection on
+        // the `p` flag, but this port has historically matched live LXMF/Columba
+        // response advertisements by request_id alone — keep accepting them so the
+        // live request/response path does not regress (open risk: verify real
+        // senders set `p`, see port-deviations.md).
+        if let reqId = advertisement.requestId,
+           pendingRequests.contains(where: { $0.requestId == reqId }) {
+            resourceDebugLog("ADV: Accepting request_id-matched resource (no p flag) for \(reqId.prefix(8).map { String(format: "%02x", $0) }.joined())")
+            await acceptInboundAdvertisement(advertisement, resource: resource)
+            return true
+        }
+
+        // Strategy gate for ordinary resources (RNS/Link.py:1087-1098).
+        switch resourceStrategy {
+        case .acceptNone:
+            // RNS: `pass` — silently ignore, no reject is sent (RNS/Link.py:1087).
+            resourceDebugLog("ADV: ignored under acceptNone")
+            return false
+        case .acceptAll:
+            await acceptInboundAdvertisement(advertisement, resource: resource)
+            return true
+        case .acceptApp:
+            let accept = await resourceCallbacks?.resourceAdvertised(resource) ?? false
+            if accept {
+                await acceptInboundAdvertisement(advertisement, resource: resource)
+                return true
+            } else {
+                // Declined ACCEPT_APP advertisement: send a RESOURCE_RCL reject
+                // (RNS/Link.py:1094 → static RNS.Resource.reject(packet),
+                // RNS/Resource.py:155-160). The throwaway inbound `resource` built
+                // above was never accept()ed, so it has no send callback wired —
+                // emit the reject through the Link directly, carrying the advertised
+                // resource hash, exactly as RNS's static reject builds the packet
+                // straight from the advertisement (rather than resource.reject(),
+                // which needs an accepted resource's send callback and would throw).
+                resourceDebugLog("ADV: declined by app callback, rejecting (RESOURCE_RCL)")
+                var rcl = Data([ResourcePacketContext.resourceReject])
+                rcl.append(advertisement.hash)
+                try? await sendResourcePacket(rcl)
+                return false
+            }
+        }
+    }
+
+    /// Begin receiving an accepted inbound resource: dedup, register, fire the
+    /// started callback, wire the send/decrypt callbacks, and accept.
+    ///
+    /// Mirrors the accept body of RNS `Resource.accept` (RNS/Resource.py:216-235):
+    /// inherit the link's last receiver window, dedup via `has_incoming_resource`,
+    /// `register_incoming_resource`, fire `resource_started`, then load the initial
+    /// hashmap and start the watchdog.
+    private func acceptInboundAdvertisement(_ advertisement: ResourceAdvertisement, resource: Resource) async {
+        // Drop duplicate re-delivered advertisements (RNS Resource.accept :223-239:
+        // `if not link.has_incoming_resource(resource)` ... else ignore).
+        if await hasIncomingResource(resource) {
+            let h = (await resource.hash ?? Data()).prefix(8).map { String(format: "%02x", $0) }.joined()
+            resourceDebugLog("ADV: duplicate, ignoring resource \(h) (already transferring)")
+            return
+        }
+
+        // Register the inbound resource (RNS Resource.accept :224).
+        await registerIncomingResource(resource)
+
+        let hash = await resource.hash ?? Data()
+        let hashHex = hash.prefix(8).map { String(format: "%02x", $0) }.joined()
+        resourceDebugLog("ACCEPT: resource \(hashHex), size=\(advertisement.dataSize), parts=\(advertisement.numParts)")
+        linkLogger.info("Accepted resource \(hashHex, privacy: .public), size=\(advertisement.dataSize, privacy: .public), parts=\(advertisement.numParts, privacy: .public)")
+
+        // resource_started callback (RNS Resource.accept :227-231).
+        if let callbacks = resourceCallbacks {
+            await callbacks.resourceStarted(resource)
+        }
+
+        // Send callback (creates link DATA packets for requests / proof).
+        await resource.setSendCallback { [weak self] (packetData: Data) in
+            guard let self = self else { throw LinkError.notActive }
+            try await self.sendResourcePacket(packetData)
+        }
+
+        // Decrypt callback for assembled resource data (capture token directly to
+        // avoid actor-isolation issues).
+        let linkToken = self.token
+        await resource.setDecryptCallback { (ciphertext: Data) in
+            guard let token = linkToken else { throw LinkError.encryptionNotReady }
+            return try token.decrypt(ciphertext)
+        }
+
+        // Starting-window inheritance (RNS Resource.accept :216-219):
+        //   previous_window = link.get_last_resource_window()
+        //   if previous_window: resource.window = previous_window
+        // A second inbound transfer on a link that already carried one skips
+        // slow-start by inheriting the prior receiver window. MUST run BEFORE
+        // accept() requests the first batch (accept() -> requestNextParts()
+        // sizes the request from the window). getLastResourceWindow() returns
+        // nil until an inbound resource has concluded (RNS get_last_resource_window,
+        // RNS/Link.py:1314-1315), so the first transfer slow-starts as in RNS.
+        if let inherited = getLastResourceWindow() {
+            await resource.applyInheritedWindow(inherited)
+        }
+
+        // NOTE (Plan A integration, still deferred): receiver part-count derivation
+        // from this link's own SDU (`deriveReceiverPartCount(self.mdu)`, RNS
+        // Resource.accept :187), explicit initial hashmap routing
+        // (`hashmapUpdate(0, adv.m)`, RNS :233), and per-instance
+        // `maxDecompressedSize` are wired here once Plan A lands. The current
+        // `Resource.accept()` already derives the part count from the
+        // advertisement and loads the initial hashmap internally, so the existing
+        // receive behavior is preserved until then. (Window inheritance above is
+        // no longer deferred — applyInheritedWindow / getLastResourceWindow exist.)
+        do {
+            try await resource.accept()
+        } catch {
+            resourceDebugLog("ACCEPT ERROR: \(error)")
+            linkLogger.error("Resource accept failed: \(error, privacy: .public)")
+            await cancelIncomingResource(resource)
         }
     }
 
@@ -1569,39 +2328,175 @@ public actor Link {
         guard data.count > 0 else { return }
 
         // Find the inbound resource that's currently transferring
-        // (there should typically be only one active at a time per link)
-        for (hash, resource) in inboundResources {
+        // (there should typically be only one active at a time per link).
+        // Conclusion now flows through resourceConcluded(_:), which re-derives the
+        // hash, so the loop no longer needs the dictionary key.
+        for (_, resource) in inboundResources {
             let resourceState = await resource.state
             guard resourceState == .transferring else { continue }
 
+            let complete: Bool
             do {
-                let complete = try await resource.handlePartPacket(data)
-                let total = await resource.numParts
-                let received = await resource.receivedCount
-                resourceDebugLog("PART: \(received)/\(total), complete=\(complete), data=\(data.count)B")
-                linkLogger.debug("Part received (\(received, privacy: .public)/\(total, privacy: .public)), complete=\(complete, privacy: .public)")
+                complete = try await resource.handlePartPacket(data)
+            } catch {
+                // A bad / duplicate part is not fatal — the window + request machinery
+                // re-requests missing parts, so log and let a later packet retry.
+                linkLogger.error("Part handling error: \(error, privacy: .public)")
+                continue
+            }
 
-                if complete {
-                    // Resource transfer complete - assemble and send proof
-                    let assembledData = try await resource.assemble()
-                    resourceDebugLog("COMPLETE: assembled \(assembledData.count)B, sending proof")
-                    linkLogger.info("Resource assembled \(assembledData.count, privacy: .public) bytes, sending proof")
+            let total = await resource.numParts
+            let received = await resource.receivedCount
+            resourceDebugLog("PART: \(received)/\(total), complete=\(complete), data=\(data.count)B")
+            linkLogger.debug("Part received (\(received, privacy: .public)/\(total, privacy: .public)), complete=\(complete, privacy: .public)")
+
+            if complete {
+                // All parts received. Assemble; on failure, fail the inbound resource
+                // (rather than leak it in .assembling) and tell the sender to stop.
+                let assembledData: Data
+                do {
+                    assembledData = try await resource.assemble()
+                } catch {
+                    // python Resource.assemble() has TWO distinct CORRUPT exits, and
+                    // the swift port surfaces them via `resource.corruptReason`:
+                    //
+                    //   • .decompressionOverflow — the bz2 stream decompressed past
+                    //     max_decompressed_size (RNS/Resource.py:688-692). python sets
+                    //     status=CORRUPT and calls cancel(), whose CORRUPT branch sends
+                    //     a RESOURCE_RCL reject AND tears the link down, returning early
+                    //     WITHOUT running resource_concluded (RNS/Resource.py:1081-1084).
+                    //
+                    //   • everything else (per-segment hash mismatch / decrypt / size,
+                    //     RNS/Resource.py:715/721) — leaves the resource non-COMPLETE and
+                    //     falls through to `link.resource_concluded(self)`
+                    //     (RNS/Resource.py:723) with NO packet and NO teardown; conclude
+                    //     quietly (the LXMF handler ignores a non-.complete resource).
+                    if await resource.corruptReason == .decompressionOverflow {
+                        // bz2 over-size: reject (RESOURCE_RCL) + teardown via the
+                        // CORRUPT-branch helper (RNS/Resource.py:688-692 → cancel()
+                        // :1081-1084). The resource stays .corrupt (set by assemble's
+                        // markCorrupt); do NOT call resource_concluded — python returns
+                        // before :723, so no last-window is recorded for the next
+                        // inbound transfer. cleanup() frees the partial storagepath.
+                        linkLogger.error("Resource decompression exceeded max size — rejecting (RESOURCE_RCL) and tearing down link (RNS/Resource.py:688-692 → :1081-1084)")
+                        await resource.cleanup(abandonChain: true)
+                        await cancelIncomingResource(resource, corrupt: true)
+                        return
+                    }
+                    linkLogger.error("Resource assembly failed (corrupt): \(error, privacy: .public) — concluding without delivery")
+                    try? await resource.transitionState(to: .failed)
+                    // Abandon the whole chain: unlink the partial storagepath
+                    // even though this may be a non-final segment.
+                    await resource.cleanup(abandonChain: true)
+                    // App-facing conclusion callback, then Link-internal bookkeeping
+                    // (registry removal + last-window record; RNS resource_concluded,
+                    // RNS/Link.py:1281-1290).
+                    await fireResourceConcludedOnce(resource)
+                    await resourceConcluded(resource)
+                    return
+                }
+
+                // Segment bookkeeping: python assemble() runs proof for EVERY
+                // segment and calls resource_concluded(self) unconditionally
+                // (Resource.py:713/723), freeing the inbound slot so the next
+                // segment's advertisement can be accepted. Delivery + callback
+                // happen ONLY on the final segment (Resource.py:725-747); a
+                // non-final segment just logs "waiting for next segment"
+                // (Resource.py:748-749).
+                let segIndex = await resource.segmentIndex
+                let segTotal = await resource.totalSegments
+                let isFinalSegment = segIndex >= segTotal
+
+                resourceDebugLog("COMPLETE: segment \(segIndex)/\(segTotal), assembled \(assembledData.count)B, sending proof")
+                linkLogger.info("Resource segment \(segIndex, privacy: .public)/\(segTotal, privacy: .public) assembled \(assembledData.count, privacy: .public) bytes, sending proof")
+                // Proof is best-effort: the data is fully received, so deliver it even
+                // if the proof send fails (the sender re-requests / times out its proof).
+                do {
                     try await resource.sendProof()
+                } catch {
+                    linkLogger.error("Resource proof send failed (delivering anyway): \(error, privacy: .public)")
+                }
 
-                    // If this resource is a response to a pending request,
-                    // deliver the assembled data as the request response.
-                    // Python: packed_response = umsgpack.packb([request_id, response])
-                    // The assembled data IS this msgpack blob.
-                    if let reqId = resource.requestId {
+                if !isFinalSegment {
+                    // python Resource.py:748-749: more segments to come. Free the
+                    // slot (resource_concluded), but DO NOT deliver, run the
+                    // app callback, or unlink the storagepath — the next
+                    // segment's fresh Resource appends to the same on-disk file
+                    // (keyed by original_hash). Conclude so a fresh advertisement
+                    // for the next segment is accepted.
+                    await fireResourceConcludedOnce(resource)
+                    await resourceConcluded(resource)
+                    linkLogger.debug("Segment \(segIndex, privacy: .public)/\(segTotal, privacy: .public) received, awaiting next segment advertisement")
+                    return
+                }
+
+                // Final segment — deliver the fully assembled resource.
+                // If this resource is a response to a pending request,
+                // deliver the assembled data as the request response.
+                // Python: packed_response = umsgpack.packb([request_id, response])
+                // The assembled data IS this msgpack blob.
+                if let reqId = resource.requestId {
+                    // Fork an inbound REQUEST resource from a RESPONSE resource
+                    // (RNS request_resource_concluded vs response_resource_concluded,
+                    // Link.py:927-954). A concluded inbound resource is a RESPONSE iff
+                    // it carries the response flag (`p`) OR it answers one of our
+                    // pending requests; otherwise (request_id set, no pending match) it
+                    // is a server-side inbound REQUEST resource and forks to
+                    // handleRequest. Forking PRECISELY here keeps a >MDU request out of
+                    // the response-delivery branch (where it would be silently dropped),
+                    // and is not shadowed by the request_id-match fallback at
+                    // receiveResourceAdvertisement (that path only fires when a pending
+                    // request matches, i.e. for genuine responses).
+                    let isResponseResource = resource.isResponse
+                        || pendingRequests.contains(where: { $0.requestId == reqId })
+
+                    if !isResponseResource {
+                        // Inbound REQUEST resource (RNS request_resource_concluded,
+                        // Link.py:927-937): request_id = truncated_hash(packed_request),
+                        // unpacked_request is the [requested_at, path_hash, data] array,
+                        // then dispatch to handle_request.
+                        let requestId = Hashing.truncatedHash(assembledData)
+                        let reqResHex = requestId.prefix(8).map { String(format: "%02x", $0) }.joined()
+                        resourceDebugLog("DELIVER: request resource concluded, request_id=\(reqResHex), data=\(assembledData.count)B")
+                        linkLogger.info("Request resource complete \(reqResHex, privacy: .public), data=\(assembledData.count, privacy: .public) bytes")
+                        if let unpacked = try? unpackMsgPack(assembledData) {
+                            await handleRequest(requestId: requestId, unpackedRequest: unpacked)
+                        } else {
+                            resourceDebugLog("DELIVER: FAILED to unpack request resource")
+                            linkLogger.error("Failed to unpack inbound request resource as msgpack array")
+                        }
+                    } else {
                         let reqHex = reqId.prefix(8).map { String(format: "%02x", $0) }.joined()
                         resourceDebugLog("DELIVER: response resource for request \(reqHex), data=\(assembledData.count)B")
                         linkLogger.info("Response resource complete for request \(reqHex, privacy: .public), data=\(assembledData.count, privacy: .public) bytes")
-                        // Unpack msgpack([requestId, responseData]) and deliver
-                        if let value = try? unpackMsgPack(assembledData),
+                        // RNS response_resource_concluded forks on has_metadata
+                        // (Link.py:939-954): a metadata-bearing response is a FILE
+                        // response — the assembled bytes are the raw payload (NOT
+                        // umsgpack([request_id, response])), and request_id comes from
+                        // the resource itself, with metadata passed alongside.
+                        if let md = await resource.receivedMetadata {
+                            resourceDebugLog("DELIVER: file response with metadata=\(md.count)B")
+                            await handleRequestResponse(requestId: reqId, data: assembledData, metadata: md)
+                        } else if let value = try? unpackMsgPack(assembledData),
+                           // Non-file response: unpack msgpack([requestId, responseData])
+                           // (Link.py:950-954).
                            case .array(let elements) = value,
                            elements.count >= 2,
                            case .binary(let responseRequestId) = elements[0] {
-                            let responseData = packMsgPack(elements[1])
+                            // DOUBLE-FRAME FIX (site #2): extract the RAW response
+                            // payload from elements[1] — the send side single-frames
+                            // [.binary(request_id), .binary(data)], so element 1 is
+                            // already the raw bytes. The previous packMsgPack(elements[1])
+                            // re-added a bin frame, so a >MDU response disagreed on the
+                            // wire-observable bytes with the sub-MDU RESPONSE packet path
+                            // (handleResponsePacket). Both sites must agree, hence the
+                            // identical extraction here.
+                            let responseData: Data
+                            if case .binary(let raw) = elements[1] {
+                                responseData = raw
+                            } else {
+                                responseData = packMsgPack(elements[1])
+                            }
                             resourceDebugLog("DELIVER: unpacked OK, responseData=\(responseData.count)B")
                             await handleRequestResponse(requestId: responseRequestId, data: responseData)
                         } else {
@@ -1609,17 +2504,21 @@ public actor Link {
                             linkLogger.error("Failed to unpack assembled data as msgpack([requestId, response])")
                         }
                     }
-
-                    // Notify callback
-                    await resourceCallbacks?.resourceConcluded(resource)
-
-                    // Remove from tracking
-                    inboundResources.removeValue(forKey: hash)
                 }
-                return
-            } catch {
-                linkLogger.error("Part handling error: \(error, privacy: .public)")
+
+                // Notify callback (python final-segment callback, Resource.py:738)
+                await fireResourceConcludedOnce(resource)
+
+                // Unlink the inbound storagepath now the data is surfaced
+                // (python os.unlink(storagepath), Resource.py:744) and close
+                // any handles.
+                await resource.cleanup()
+
+                // Link-internal conclusion: record final receiver window + remove
+                // from inboundResources (RNS resource_concluded, RNS/Link.py:1281-1290).
+                await resourceConcluded(resource)
             }
+            return
         }
     }
 
@@ -1641,23 +2540,177 @@ public actor Link {
 
         // Find matching outbound resource
         for (hash, resource) in outboundResources {
-            // Match by resource hash (first 32 bytes of proof)
-            if let resourceHash = await resource.hash, Data(proofHash) == resourceHash {
-                do {
-                    // Mark as complete
-                    try await resource.transitionState(to: .awaitingProof)
-                    try await resource.transitionState(to: .complete)
+            // Match by resource hash (first 32 bytes of proof) to locate the
+            // outgoing resource this proof answers (RNS/Link.py:1177-1180).
+            guard let resourceHash = await resource.hash, Data(proofHash) == resourceHash else {
+                continue
+            }
 
-                    // Notify callback
-                    await resourceCallbacks?.resourceConcluded(resource)
-
-                    // Remove from tracking
-                    outboundResources.removeValue(forKey: hash)
-                } catch {
-                    // State transition failed
-                }
+            // Validate the proof's INTEGRITY before concluding. Matching the
+            // 32-byte resource hash alone is NOT sufficient: RNS `validate_proof`
+            // additionally requires `proof_data[32:] == self.expected_proof`
+            // before marking COMPLETE (RNS/Resource.py:782-787). Route through the
+            // faithful port `Resource.validate_proof` (Resource.swift:1696), which
+            // computes/compares `expectedProof` and sets state=.complete ONLY on a
+            // byte-exact match; on a wrong/forged proof it leaves the resource
+            // untouched (RNS/Resource.py:822-823 `pass`).
+            await resource.validate_proof(data)
+            guard await resource.state == .complete else {
+                // Forged / wrong proof bytes: RNS does NOT conclude — the resource
+                // stays AWAITING_PROOF and the sender's watchdog re-drives the proof
+                // exchange (RNS/Resource.py:783-787 fall-through). Do not fire the
+                // conclusion callback or advance segments.
+                linkLogger.warning("Resource proof validation failed for \(resourceHash.prefix(8).map { String(format: "%02x", $0) }.joined(), privacy: .public) — staying awaiting_proof")
                 return
             }
+
+            // Proof valid → COMPLETE. RNS `validate_proof` runs the Link-internal
+            // `link.resource_concluded(self)` bookkeeping here for EVERY segment
+            // (RNS/Resource.py:787) but fires the app-facing `self.callback(self)`
+            // conclusion ONLY on the FINAL segment (RNS/Resource.py:788-792). The
+            // app callback is therefore deferred to the final-segment branch below;
+            // firing it per-segment (as this port previously did) signalled an
+            // outbound multi-segment transfer "concluded" after segment 1, before
+            // the later segments had even been advertised.
+
+            // Segment chaining (python validate_proof :788-821):
+            // if segment_index == total_segments → done (fire the app callback,
+            // close input file via cleanup). Otherwise prepare (if not already)
+            // and advertise the next segment, re-keying outboundResources by the
+            // next segment's hash.
+            let hasMore = await resource.hasMoreSegments
+            if hasMore {
+                // Non-final segment (RNS/Resource.py:804-821): drop the current
+                // segment and advertise the next segment of the SAME logical
+                // transfer. Do NOT fire the app-facing conclusion callback (RNS
+                // gates it on `segment_index == total_segments`, :788) and do NOT
+                // run the Link-internal `resourceConcluded` here — the link is
+                // still busy with this multi-segment resource, so the
+                // pending-outgoing queue must not advance until the FINAL segment
+                // concludes.
+                //
+                // Gate the advance on actually OWNING the segment (removeValue != nil),
+                // mirroring this file's other defended conclusion sites. RESOURCE_PRF is
+                // in skipDedup, so a duplicate/retransmitted proof on a lossy BLE/mesh
+                // link can drive two concurrent handleResourceProof calls for the same
+                // segment; without the gate both would advanceNextSegment and double-
+                // advertise the next segment. Actor isolation makes removeValue atomic,
+                // so exactly one caller advances.
+                if outboundResources.removeValue(forKey: hash) != nil {
+                    await advertiseNextSegment(after: resource)
+                }
+            } else {
+                // Final segment concluded (RNS/Resource.py:788-792): fire the
+                // app-facing conclusion callback ONCE for the whole transfer, then
+                // close + unlink the staging input file (python input_file close,
+                // Resource.py:796-797) and run the Link-internal conclusion
+                // (registry removal + drain the next queued outbound resource; RNS
+                // resource_concluded, RNS/Link.py:1281-1290).
+                await fireResourceConcludedOnce(resource)
+                await resource.cleanup()
+                await resourceConcluded(resource)
+            }
+            return
+        }
+    }
+
+    /// Prepare (if needed) and advertise the next segment of a split outbound
+    /// resource, after the current segment's proof validated.
+    ///
+    /// Faithful port of python `validate_proof` segment-continuation branch
+    /// (Resource.py:804-821): ensure the next segment is prepared (python
+    /// eagerly prepares it on `advertise()`, Resource.py:516-518; this port
+    /// prepares lazily here if it wasn't), hand off the shared input file
+    /// (python nulls the current segment's `input_file`, Resource.py:816), then
+    /// `next_segment.advertise()` (Resource.py:821).
+    private func advertiseNextSegment(after current: Resource) async {
+        // Hold the one-at-a-time reservation across the whole segment transition.
+        // The caller removed `current` from outboundResources just before this call
+        // (synchronously, no await between), so without this the gate would read free
+        // during the awaits below (prepareNextSegment, hash, register) and a concurrent
+        // send/drain could advertise a competing resource. Set here as the first
+        // statement (runs synchronously after the caller's removeValue); cleared once
+        // `next` is registered or on every early-exit/failure path.
+        outgoingReservationActive = true
+        do {
+            // Ensure the next segment exists & is prepared (python :807-811).
+            guard let next = try await current.prepareNextSegment() else {
+                linkLogger.warning("No next segment to advertise despite hasMoreSegments")
+                outgoingReservationActive = false
+                return
+            }
+
+            // Hand off the staging input file so it survives until the final
+            // segment concludes (python input_file sharing + null-out :816).
+            await current.transferInputFileOwnership(to: next)
+
+            // Wire the next segment's send callback (creates link DATA packets),
+            // exactly as sendResource() does for the first segment.
+            await next.setSendCallback { [weak self] packetData in
+                guard let self = self else { throw LinkError.notActive }
+                try await self.sendResourcePacket(packetData)
+            }
+
+            // Track and advertise the next segment (python next_segment.advertise()
+            // :821). Re-key outboundResources by the next segment's own hash via
+            // the registry helper (RNS register_outgoing_resource, RNS/Link.py:1302).
+            let nextHash = await next.hash ?? Data()
+            await registerOutgoingResource(next)
+            // Registered — gate now held by outboundResources; release the reservation.
+            outgoingReservationActive = false
+            let nextIdx = await next.segmentIndex
+            let nextTotal = await next.totalSegments
+            let nextHashHex = nextHash.prefix(8).map { String(format: "%02x", $0) }.joined()
+            linkLogger.info("Advertising segment \(nextIdx, privacy: .public)/\(nextTotal, privacy: .public) hash=\(nextHashHex, privacy: .public)")
+            do {
+                try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
+            } catch {
+                // Python __advertise_job calls self.cancel() on an advertise failure
+                // (RNS/Resource.py:536-538). `next` is already in outboundResources and
+                // owns the staging tempfile (transferInputFileOwnership ran), and the
+                // receiver never saw the advertisement — so just logging would stall the
+                // whole multi-segment transfer permanently (no retry/self-timeout) and
+                // leak the tempfile. Mirror cancel(): drop tracking, unlink the staging
+                // file, conclude so the caller observes the failure, and — since this
+                // aborted transfer was holding the pending-outgoing queue (released only
+                // on the FINAL segment's conclusion, :2438-2445) — drain the queue so
+                // resources queued behind it are not stalled until link close.
+                //
+                // Gate all of that on WE still owning `next`: the link can close during
+                // the `await sendAdvertisement` suspension above, and finishClose's
+                // cancel-on-close snapshots `next` from outboundResources, clears the
+                // dict, and schedules its conclusion in a detached Task (:1295-1311).
+                // If that already happened, `removeValue` returns nil — re-cleaning /
+                // re-concluding would be a resourceConcluded double-fire. Actor isolation
+                // makes this removeValue check atomic with finishClose's removeAll, so
+                // exactly one path tears `next` down.
+                linkLogger.error("Failed to advertise next segment: \(error, privacy: .public)")
+                if outboundResources.removeValue(forKey: nextHash) != nil {
+                    await next.cleanup()
+                    await fireResourceConcludedOnce(next)
+                    await drainOutgoingQueue()
+                }
+            }
+        } catch {
+            // A prepareNextSegment failure leaves `current` owning the shared staging
+            // tempfile (transferInputFileOwnership never ran), so without this the file
+            // leaks. Unlink it (python closes/unlinks input_file on resource failure,
+            // RNS/Resource.py). Unlike the sendAdvertisement path above we do NOT fire
+            // resourceConcluded here: `current` already concluded `.complete` at the
+            // proof-validation site, so re-firing would be a callback double-fire. The
+            // remaining-chain-failure signal is a separate per-segment-model gap (no
+            // per-resource watchdog yet) — to be addressed by a timeout, not by
+            // double-concluding a completed segment.
+            linkLogger.error("Failed to prepare next segment: \(error, privacy: .public)")
+            // Reservation was set at entry and never cleared (we failed before
+            // registering `next`); release it before the drain below so the queue
+            // can actually advance.
+            outgoingReservationActive = false
+            await current.cleanup()
+            // The multi-segment transfer that was holding the pending-outgoing queue
+            // (released only on the FINAL segment, :2438-2445) has now aborted, so drain
+            // the queue — otherwise resources queued behind it stall until link close.
+            await drainOutgoingQueue()
         }
     }
 
@@ -1727,27 +2780,36 @@ public actor Link {
         // If data contains resource hash, find specific resource
         if data.count >= 32 {
             let rejectHash = data.prefix(32)
-            for (hash, resource) in outboundResources {
+            for (_, resource) in outboundResources {
                 if let resourceHash = await resource.hash, Data(rejectHash) == resourceHash {
-                    do {
-                        try await resource.transitionState(to: .rejected)
-                        await resourceCallbacks?.resourceConcluded(resource)
-                    } catch {}
-                    outboundResources.removeValue(forKey: hash)
+                    // RNS `_rejected()` sets status=REJECTED from ANY status <
+                    // COMPLETE (RNS/Resource.py:1106-1117), which for a
+                    // decompression-bomb sender is AWAITING_PROOF (all parts sent)
+                    // and for an ACCEPT_APP-declined sender is ADVERTISED. The
+                    // staged FSM only allows `.advertised → .rejected`, so route
+                    // through markRejected() (direct status assignment) rather than
+                    // transitionState, which would silently no-op the TRANSFERRING/
+                    // AWAITING_PROOF cases and leave the sender un-rejected.
+                    await resource.markRejected()
+                    await fireResourceConcludedOnce(resource)
+                    // Terminal path: close + unlink staging tempfile.
+                    await resource.cleanup()
+                    // Link-internal conclusion: remove + drain the next queued
+                    // outbound (RNS resource_concluded, RNS/Link.py:1281-1290).
+                    await resourceConcluded(resource)
                     return
                 }
             }
         }
 
-        // Fallback: reject most recently advertised resource
-        if let (hash, resource) = outboundResources.first {
+        // Fallback: reject most recently advertised resource (RCL carried no hash).
+        if let (_, resource) = outboundResources.first {
             let resourceState = await resource.state
             if resourceState == .advertised {
-                do {
-                    try await resource.transitionState(to: .rejected)
-                    await resourceCallbacks?.resourceConcluded(resource)
-                } catch {}
-                outboundResources.removeValue(forKey: hash)
+                await resource.markRejected()  // RNS _rejected() (RNS/Resource.py:1106-1117)
+                await fireResourceConcludedOnce(resource)
+                await resource.cleanup()
+                await resourceConcluded(resource)
             }
         }
     }
@@ -1764,25 +2826,31 @@ public actor Link {
             let cancelHash = data.prefix(32)
 
             // Check outbound resources
-            for (hash, resource) in outboundResources {
+            for (_, resource) in outboundResources {
                 if let resourceHash = await resource.hash, Data(cancelHash) == resourceHash {
                     do {
                         try await resource.transitionState(to: .cancelled)
-                        await resourceCallbacks?.resourceConcluded(resource)
+                        await fireResourceConcludedOnce(resource)
                     } catch {}
-                    outboundResources.removeValue(forKey: hash)
+                    await resource.cleanup()
+                    // Link-internal conclusion: remove + drain next queued outbound.
+                    await resourceConcluded(resource)
                     return
                 }
             }
 
             // Check inbound resources
-            for (hash, resource) in inboundResources {
+            for (_, resource) in inboundResources {
                 if let resourceHash = await resource.hash, Data(cancelHash) == resourceHash {
                     do {
                         try await resource.transitionState(to: .cancelled)
-                        await resourceCallbacks?.resourceConcluded(resource)
+                        await fireResourceConcludedOnce(resource)
                     } catch {}
-                    inboundResources.removeValue(forKey: hash)
+                    await resource.cleanup(abandonChain: true)
+                    // Link-internal conclusion: record final window + remove
+                    // (RNS resource_concluded records last_resource_window for any
+                    // incoming conclusion, RNS/Link.py:1283-1286).
+                    await resourceConcluded(resource)
                     return
                 }
             }
@@ -1800,20 +2868,154 @@ public actor Link {
         pendingRequests.append(receipt)
     }
 
+    /// Thin entry point for a sub-MDU inbound REQUEST(0x09) packet.
+    ///
+    /// Faithful port of the REQUEST branch of RNS `Link.receive`
+    /// (RNS/Link.py:1030-1040): unpack the decrypted payload as the
+    /// `[requested_at, path_hash, request_data]` msgpack array, then dispatch to
+    /// `handle_request`. The `request_id` is computed by the Transport from the WIRE
+    /// packet's truncated hash (RNS reads `packet.getTruncatedHash()` on the received
+    /// packet, not on the plaintext) and is passed in. The unpack + ALLOW gating +
+    /// generator fork live on the Link to keep the wire/RPC logic here, exactly as RNS
+    /// does (a daemon thread in RNS; an `await` hop in the actor port — category (a)).
+    ///
+    /// - Parameters:
+    ///   - plaintext: The decrypted REQUEST payload (`umsgpack([requested_at, path_hash, data])`).
+    ///   - requestId: `packet.getTruncatedHash()` of the inbound REQUEST packet.
+    public func handleRequestPacket(_ plaintext: Data, requestId: Data) async {
+        guard let unpacked = try? unpackMsgPack(plaintext) else {
+            linkLogger.error("Failed to unpack REQUEST payload as msgpack")
+            return
+        }
+        await handleRequest(requestId: requestId, unpackedRequest: unpacked)
+    }
+
+    /// Server-side handler for an inbound request: gate, run the generator, fork the
+    /// response onto the existing send paths.
+    ///
+    /// Faithful port of RNS `Link.handle_request` (RNS/Link.py:853-901). Reached from
+    /// two sites: `handleRequestPacket` (sub-MDU REQUEST packet) and the inbound
+    /// request-Resource conclude fork (>MDU, `request_id = truncated_hash(packed)`).
+    ///
+    /// - Parameters:
+    ///   - requestId: The request id (packet truncated-hash, or
+    ///     `truncated_hash(packed_request)` for a request Resource).
+    ///   - unpackedRequest: The unpacked `[requested_at, path_hash, request_data]`
+    ///     msgpack array.
+    public func handleRequest(requestId: Data, unpackedRequest: MessagePackValue) async {
+        // RNS gates the whole handler on `status == Link.ACTIVE` (Link.py:854).
+        guard state == .active else {
+            linkLogger.debug("Ignoring request on non-active link (state=\(String(describing: self.state), privacy: .public))")
+            return
+        }
+
+        // unpacked_request = [requested_at, path_hash, request_data] (Link.py:855-857).
+        guard case .array(let fields) = unpackedRequest, fields.count >= 3 else {
+            linkLogger.error("Malformed request: expected [requested_at, path_hash, data]")
+            return
+        }
+
+        // requested_at is a unix timestamp; accept any numeric msgpack encoding.
+        let requestedAt: Double
+        switch fields[0] {
+        case .double(let d): requestedAt = d
+        case .float(let f): requestedAt = Double(f)
+        case .int(let i): requestedAt = Double(i)
+        case .uint(let u): requestedAt = Double(u)
+        default: requestedAt = 0
+        }
+
+        guard case .binary(let pathHash) = fields[1] else {
+            linkLogger.error("Malformed request: path_hash is not binary")
+            return
+        }
+
+        // request_data: RNS passes the raw unpacked value to the generator; the swift
+        // ResponseGenerator takes Data, so a binary payload is forwarded as-is and any
+        // other msgpack type yields empty Data (ResponseGenerator cross-file contract).
+        let requestData: Data
+        if case .binary(let b) = fields[2] { requestData = b } else { requestData = Data() }
+
+        // Look up the registered handler by path_hash (Link.py:859). No handler -> the
+        // path goes silent (RNS only acts `if path_hash in request_handlers`).
+        guard let handler = destination.requestHandler(forPathHash: pathHash) else {
+            return
+        }
+
+        // ALLOW gating (Link.py:867-877). remoteIdentity is read at INVOCATION time
+        // (identify arrives as an async LINKIDENTIFY packet — do not capture an early
+        // nil): ALLOW_NONE denies; ALLOW_LIST allows iff remoteIdentity is set and its
+        // hash is in allowedList; ALLOW_ALL allows unconditionally.
+        var allowed = false
+        if handler.allow != Destination.ALLOW_NONE {
+            if handler.allow == Destination.ALLOW_LIST {
+                if let rid = remoteIdentity, handler.allowedList?.contains(rid.hash) == true {
+                    allowed = true
+                }
+            } else if handler.allow == Destination.ALLOW_ALL {
+                allowed = true
+            }
+        }
+
+        let reqHex = requestId.prefix(8).map { String(format: "%02x", $0) }.joined()
+        guard allowed else {
+            // RNS logs the request as not-allowed and sends NOTHING (Link.py:898-900).
+            let idString = remoteIdentity.map { $0.hash.prefix(8).map { String(format: "%02x", $0) }.joined() } ?? "<Unknown>"
+            linkLogger.debug("Request \(reqHex, privacy: .public) from \(idString, privacy: .public) not allowed for path \(handler.path, privacy: .public)")
+            return
+        }
+
+        linkLogger.debug("Handling request \(reqHex, privacy: .public) for path \(handler.path, privacy: .public)")
+
+        // Run the response generator (Link.py:879-884). The swift port fixes a single
+        // 6-argument form (no python runtime arity inspection — category (a)).
+        let response = await handler.generator(handler.path, requestData, requestId, linkId, remoteIdentity, requestedAt)
+
+        // Fork on the response (Link.py:886-901):
+        //   .none        -> send NOTHING (RNS `if response != None:` guard, Link.py:893).
+        //   .bytes       -> respond(to:with:): packs umsgpack([request_id, response]) and
+        //                   picks a sub-MDU RESPONSE packet vs a >MDU response Resource.
+        //   .file        -> respond(to:file:metadata:): a metadata-bearing Resource,
+        //                   never umsgpack-wrapped (Link.py:889-890).
+        switch response {
+        case .none:
+            return
+        case .bytes(let data):
+            do {
+                try await respond(to: requestId, with: data)
+            } catch {
+                linkLogger.error("Failed to send response for request \(reqHex, privacy: .public): \(error, privacy: .public)")
+            }
+        case .file(let content, let metadata):
+            do {
+                try await respond(to: requestId, file: content, metadata: metadata)
+            } catch {
+                linkLogger.error("Failed to send file response for request \(reqHex, privacy: .public): \(error, privacy: .public)")
+            }
+        }
+    }
+
     /// Handle response for a pending request.
     ///
     /// Called when a response packet is received for one of our pending requests.
+    /// Mirrors RNS `handle_response` (Link.py:906-925): matches the receipt by
+    /// request_id, delivers the response (with optional metadata for file
+    /// responses), and removes it from the pending list.
     ///
     /// - Parameters:
     ///   - requestId: Request ID from response packet
     ///   - data: Response data
-    public func handleRequestResponse(requestId: Data, data: Data) async {
+    ///   - metadata: Optional response metadata (set only for (file, metadata)
+    ///     responses; nil for plain bytes/structured responses). RNS passes
+    ///     `resource.metadata` to `pending_request.response_received(..., metadata)`
+    ///     (Link.py:918/:945).
+    public func handleRequestResponse(requestId: Data, data: Data, metadata: Data? = nil) async {
         if let index = pendingRequests.firstIndex(where: { receipt in
             // Compare request IDs (both should be 16-byte truncated hashes)
             receipt.requestId == requestId
         }) {
             let receipt = pendingRequests.remove(at: index)
-            await receipt.receiveResponse(data)
+            await receipt.receiveResponse(data, metadata: metadata)
         }
     }
 
@@ -1830,17 +3032,50 @@ public actor Link {
         }
     }
 
-    /// Handle incoming request response packet.
+    /// Handle an incoming sub-MDU RESPONSE(0x0A) packet.
     ///
-    /// Parses the response and delivers to the appropriate receipt.
+    /// Faithful port of the RESPONSE branch of RNS `Link.receive` /
+    /// `handle_response` (RNS/Link.py:1042-1054, :906-925): the decrypted payload is
+    /// `umsgpack.packb([request_id, response])`, so unpack it, take `request_id` from
+    /// element 0 and the RAW response value from element 1, and deliver it.
     ///
-    /// - Parameter data: Decrypted response packet (context byte stripped)
+    /// DOUBLE-FRAME FIX (site #1): the send side `respond(to:with:)` single-frames
+    /// `[.binary(request_id), .binary(data)]`, so `elements[1]` is ALREADY the raw
+    /// response bytes. The previous inline Transport path re-packed it
+    /// (`packMsgPack(elements[1])`), re-adding an msgpack bin frame so the receipt
+    /// held `[0xc4, len, …payload]` instead of the raw payload. We extract the
+    /// `.binary` payload directly here (and only re-pack a NON-bytes structured value,
+    /// which has no raw byte form), keeping this path byte-for-byte consistent with
+    /// the >MDU response-Resource conclude path.
+    ///
+    /// - Parameter data: Decrypted RESPONSE payload (context byte stripped).
     public func handleResponsePacket(_ data: Data) async {
-        guard data.count > 16 else { return }
+        // Inbound packet observation hook (additive; no-op when unset). Surface the
+        // decrypted RESPONSE (0x0A) plaintext (msgpack [request_id, response]) so an
+        // instrument can observe the sub-MDU response path (RNS/Link.py:897-899).
+        // Runs before unpack so a malformed payload is still observable.
+        await inboundPacketObserver?(RequestPacketContext.response, data)
 
-        // Parse: requestId (16 bytes) + response data
-        let requestId = Data(data[data.startIndex..<data.startIndex.advanced(by: 16)])
-        let responseData = Data(data[data.startIndex.advanced(by: 16)...])
+        guard let value = try? unpackMsgPack(data),
+              case .array(let elements) = value,
+              elements.count >= 2,
+              case .binary(let requestId) = elements[0] else {
+            linkLogger.error("Failed to unpack RESPONSE payload as msgpack([request_id, response])")
+            return
+        }
+
+        let responseData: Data
+        if case .binary(let raw) = elements[1] {
+            // Raw bytes payload (the wire form produced by respond(to:with:)) — do
+            // NOT re-pack (that is the double-frame bug).
+            responseData = raw
+        } else {
+            // Structured (non-bytes) response value: re-pack so the receipt carries a
+            // self-describing msgpack blob. RNS hands the unpacked value straight to
+            // response_received; the swift receipt stores Data, so a non-bytes value
+            // has no raw form and must be re-encoded.
+            responseData = packMsgPack(elements[1])
+        }
 
         await handleRequestResponse(requestId: requestId, data: responseData)
     }

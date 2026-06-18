@@ -54,10 +54,22 @@ public enum ResourceHashmap {
     ///   - hashmap: Complete or partial hashmap data
     ///   - index: Part index (0-based)
     /// - Returns: 4-byte expected hash from hashmap
-    public static func getPartHash(from hashmap: Data, at index: Int) -> Data {
+    /// Returns the 4-byte part hash for `index`, or `nil` when `index` lies beyond the
+    /// hashmap bytes currently loaded (e.g. a part whose hashmap chunk hasn't been
+    /// delivered via HMU yet, or an out-of-order/malformed peer part). Mirrors python's
+    /// unfilled-hashmap-entry behavior (`self.hashmap[i]` is `None` until filled) — callers
+    /// treat `nil` as "can't validate, reject" rather than crashing. Previously this did an
+    /// unguarded slice and trapped (SIGTRAP) on an out-of-range index.
+    public static func getPartHash(from hashmap: Data, at index: Int) -> Data? {
+        guard index >= 0 else { return nil }
         let startByte = index * ResourceConstants.MAPHASH_LEN
         let endByte = startByte + ResourceConstants.MAPHASH_LEN
-        return hashmap[startByte..<endByte]
+        guard endByte <= hashmap.count else { return nil }
+        // Re-base to the Data's startIndex so a sliced hashmap is indexed correctly,
+        // and return a fresh 0-based Data for byte-wise comparison by callers.
+        let lo = hashmap.startIndex + startByte
+        let hi = hashmap.startIndex + endByte
+        return Data(hashmap[lo..<hi])
     }
 
     // MARK: - Hashmap Generation

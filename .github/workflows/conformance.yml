@@ -17,7 +17,11 @@ jobs:
   conformance:
     name: Conformance (Swift)
     runs-on: macos-15
-    timeout-minutes: 30
+    # The expanded conformance suite no longer finishes serially inside 30 min
+    # (it was reaching ~70% then being timeout-cancelled). It is run with
+    # `-n auto` below; 45 min is generous headroom so a slow runner can't
+    # re-trigger a cancel and mask the real result.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -53,7 +57,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: pip install pytest pytest-timeout
+      # Install the conformance suite's own declared deps (pytest, msgpack,
+      # u-msgpack-python, pytest-xdist, …) so new harness-side imports don't break
+      # collection, plus pytest-timeout for the --timeout cap below. pytest-xdist
+      # powers the `-n auto` parallelism the test step relies on to finish in time.
+      - run: pip install -r reticulum-conformance/requirements.txt pytest-timeout
 
       - name: Run conformance tests
         working-directory: reticulum-conformance
@@ -68,6 +76,17 @@ jobs:
         # it rides the same bridge but has its own CI target. Keep the
         # reticulum-swift CI focused on RNS-layer parity.
         #
+        # -n auto runs the suite across all runner cores (pytest-xdist). The
+        # expanded suite no longer finishes serially within the job timeout
+        # (it was reaching ~70% then being cancelled); the suite is designed for
+        # `-n auto` (see reticulum-conformance/requirements.txt) and completes in
+        # a few minutes parallel. NOTE: ~148 cases are EXPECTED to fail today —
+        # the deferred transport-NODE/BLE-relay roadmap plus the approved
+        # Channel/Buffer/GROUP/INI skips (swift is a leaf endpoint). This step is
+        # therefore expected-red until those land or are xfail-marked upstream;
+        # parallelism only ensures the run COMPLETES and reports the real result
+        # instead of a misleading 30-min timeout-cancel.
+        #
         # --timeout=180 caps any individual test that wedges (resource-multihop
         # can hang indefinitely on a failed transfer) so a single hung case
         # doesn't consume the entire workflow budget and timeout-kill the
@@ -77,7 +96,7 @@ jobs:
         # variants pass reliably at this cap. Previous 60 s cap was too
         # tight and caused 4 of those 8 to fail as "Timeout" instead of
         # completing.
-        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -v --tb=short --timeout=180
+        run: python3 -m pytest tests/ --ignore=tests/lxmf --impl=swift -n auto -v --tb=short --timeout=180
 
       - name: Run integration tests (IFAC pipe)
         working-directory: reticulum-conformance

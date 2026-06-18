@@ -60,33 +60,29 @@ extension Link {
     ///
     /// Total proof size: 128 bytes
     ///
-    /// - Parameter identity: Identity to reveal (must be the link's local identity)
-    /// - Throws: LinkError if not initiator, not active, identity mismatch, or send fails
+    /// - Parameter identity: An arbitrary Identity to reveal to the remote peer
+    ///   (NOT required to match the link's local identity — RNS reveals any
+    ///   presented identity; initiator anonymity is preserved until this call).
+    /// - Throws: LinkError only on a genuine crypto/send failure. A guard
+    ///   failure (non-initiator or non-ACTIVE link) is a SILENT no-op, NOT a
+    ///   throw — see below.
     public func identify(identity: Identity) async throws {
-        guard initiator else {
-            throw LinkError.invalidState(
-                expected: "initiator",
-                actual: "responder (only initiator can identify)"
-            )
-        }
+        // RNS guard (Link.py:468): `if self.initiator and self.status ==
+        // Link.ACTIVE`. Any other state — responder, PENDING/HANDSHAKE, STALE,
+        // CLOSED — is a SILENT no-op (no throw, no packet emitted), NOT an error.
+        // Backs test_link_identify_on_pending_link_is_noop and makes identify on
+        // a non-initiator link harmless. (Use strict `.active`, matching
+        // status == ACTIVE, rather than the broader isEstablished which also
+        // covers STALE.)
+        guard initiator, state == .active else { return }
 
-        guard state.isEstablished else {
-            throw LinkError.notActive
-        }
+        guard let send = sendCallback else { return }
 
-        guard let send = sendCallback else {
-            throw LinkError.notActive
-        }
-
-        // Verify this is the link's local identity
-        // (prevents sending wrong identity proof)
-        guard identity.hash == localIdentity.hash else {
-            throw LinkError.invalidState(
-                expected: "link identity",
-                actual: "different identity provided"
-            )
-        }
-
+        // RNS signs link_id + identity.get_public_key() with the PRESENTED
+        // identity (Link.py:469-471). There is intentionally NO check that the
+        // identity equals the link's own local identity — identify() may reveal
+        // an arbitrary identity. (The former `identity.hash == localIdentity.hash`
+        // rejection was a Swift-only restriction; removed — see port-deviations.md.)
         // Build proof: sign(link_id + public_keys)
         let publicKeys = identity.publicKeys // 64 bytes (enc + sig)
         var signedData = linkId

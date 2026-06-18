@@ -154,6 +154,27 @@ public enum LinkState: Sendable, Equatable, CustomStringConvertible {
         }
     }
 
+    /// Whether a LINKCLOSE teardown packet should be emitted when closing a link
+    /// in this state.
+    ///
+    /// Mirrors RNS `Link.teardown()`, which sends the teardown packet for any
+    /// status that is not `PENDING` and not `CLOSED`
+    /// (`RNS/Link.py:704` — `if self.status != Link.PENDING and self.status !=
+    /// Link.CLOSED`). That includes `.handshake`: a responder link sits in
+    /// `.handshake` until it receives the initiator's RTT packet (`rtt_packet`,
+    /// `RNS/Link.py:534-541`), yet RNS still emits the teardown from there, so a
+    /// peer records `DESTINATION_CLOSED` rather than a watchdog `TIMEOUT`.
+    /// Distinct from `isEstablished` (`.active`/`.stale` only), which is the
+    /// can-transmit-app-data predicate, NOT the can-teardown predicate.
+    public var canEmitTeardown: Bool {
+        switch self {
+        case .handshake, .active, .stale:
+            return true
+        case .pending, .closed:
+            return false
+        }
+    }
+
     // MARK: - CustomStringConvertible
 
     public var description: String {

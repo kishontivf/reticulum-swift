@@ -67,6 +67,15 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     private var centralReady = false
     private var peripheralReady = false
     private var _isRunning = false
+    /// Whether the mesh scan should be running. A central connect pauses the
+    /// (allowDuplicates) scan — it saturates the radio and `didConnect` never
+    /// fires otherwise — and resumes it afterwards iff this is still set.
+    private var scanRequested = false
+    /// In-flight central connects. The scan is paused on the first and resumed
+    /// only when this drops back to zero — a per-call snapshot would let the
+    /// first connect to resolve restart the scan while another is still waiting
+    /// for `didConnect`, re-saturating the radio.
+    private var activeConnectCount = 0
     private var pendingConnect: [String: CheckedContinuation<any BLEPeerConnection, Error>] = [:]
     private var pendingRssi: [String: CheckedContinuation<Int, Error>] = [:]
 
@@ -179,6 +188,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
             throw InterfaceError.connectionFailed(underlying: "Bluetooth central not ready")
         }
 
+        lock.withLock { scanRequested = true }
         centralManager.scanForPeripherals(
             withServices: [BLEMeshConstants.serviceUUID],
             options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
@@ -188,6 +198,7 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
     }
 
     public func stopScanning() async {
+        lock.withLock { scanRequested = false }
         centralManager.stopScan()
         logger.info("BLE scanning stopped")
     }
@@ -199,6 +210,45 @@ public final class CoreBluetoothBLEDriver: NSObject, BLEDriver, @unchecked Senda
         let peripheral: CBPeripheral? = bleQueue.sync { discoveredPeripherals[address] }
         guard let peripheral else {
             throw InterfaceError.connectionFailed(underlying: "Peripheral not found: \(address)")
+        }
+
+        // CoreBluetooth: an active `allowDuplicates` scan saturates the radio so the
+        // central connect never establishes — `didConnect` never fires and the
+        // attempt dies on `connectionTimeout`. Pause the scan for the duration of the
+        // connect and resume it (iff still wanted) once the connect resolves.
+        //
+        // Reference-count concurrent connects: pause on the first, resume only once
+        // the last finishes. A per-call snapshot would let the first connect to
+        // resolve restart the scan while another is still waiting for `didConnect`,
+        // re-saturating the radio. The increment is paired with the `defer` below
+        // (both after the not-found guard above), so the counter stays balanced.
+        let pauseScan = lock.withLock { () -> Bool in
+            activeConnectCount += 1
+            return activeConnectCount == 1 && scanRequested
+        }
+        if pauseScan {
+            // Route CB scan control through bleQueue (like disconnect()/shutdown()):
+            // the manager's queue serializes it against the didDiscover/didConnect
+            // callbacks. connect() runs on the BLEInterface actor's executor, so a
+            // direct call here would touch CoreBluetooth from the wrong thread.
+            bleQueue.sync { centralManager.stopScan() }
+            bleDiag("connect: paused scan for \(address.prefix(8))")
+        }
+        defer {
+            let resumeScan = lock.withLock { () -> Bool in
+                activeConnectCount -= 1
+                return activeConnectCount == 0 && scanRequested
+            }
+            if resumeScan {
+                // Same threading domain as the pause above — resume on bleQueue.
+                bleQueue.sync {
+                    centralManager.scanForPeripherals(
+                        withServices: [BLEMeshConstants.serviceUUID],
+                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+                    )
+                }
+                bleDiag("connect: resumed scan after \(address.prefix(8))")
+            }
         }
 
         return try await withCheckedThrowingContinuation { [weak self] continuation in

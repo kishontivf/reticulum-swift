@@ -207,8 +207,20 @@ extension ResourceAdvertisement {
                 throw MessagePackError.decodingFailed("Missing key: \(key)")
             }
             switch val {
-            case .int(let i): return Int(i)
-            case .uint(let u): return Int(u)
+            // Use exactly: so a hostile peer msgpack int outside Int's range (e.g. a
+            // uint64 > Int64.max) becomes a clean decode FAILURE the caller's do/catch
+            // handles, not an uncatchable narrowing trap. RNS/umsgpack keep these as
+            // unbounded python ints; this is the swift-safe equivalent.
+            case .int(let i):
+                guard let v = Int(exactly: i) else {
+                    throw MessagePackError.decodingFailed("Int out of range for \(key)")
+                }
+                return v
+            case .uint(let u):
+                guard let v = Int(exactly: u) else {
+                    throw MessagePackError.decodingFailed("UInt out of range for \(key)")
+                }
+                return v
             default: throw MessagePackError.decodingFailed("Expected int for \(key)")
             }
         }
@@ -229,6 +241,12 @@ extension ResourceAdvertisement {
             return d
         }
 
+        // exactly: so a flags value outside a byte (the field is a single byte in RNS,
+        // Resource.py:1307) throws a clean decode failure instead of trapping.
+        guard let flagsRaw = UInt8(exactly: try getInt("f")) else {
+            throw MessagePackError.decodingFailed("flags out of byte range for f")
+        }
+
         return ResourceAdvertisement(
             transferSize: try getInt("t"),
             dataSize: try getInt("d"),
@@ -239,7 +257,7 @@ extension ResourceAdvertisement {
             segmentIndex: try getInt("i"),
             totalSegments: try getInt("l"),
             requestId: getOptionalBinary("q"),
-            flags: ResourceFlags(rawValue: UInt8(try getInt("f"))),
+            flags: ResourceFlags(rawValue: flagsRaw),
             hashmapChunk: try getBinary("m")
         )
     }
@@ -257,6 +275,9 @@ extension ResourceAdvertisement {
     ///   - resourceHash: SHA256 hash of resource data (32 bytes)
     ///   - randomHash: Random collision-detection hash (4 bytes)
     ///   - hashmap: Full hashmap data (will be segmented)
+    ///   - originalHash: First-segment hash (python `o`). For single-segment or
+    ///     the first segment this equals `resourceHash`; later segments inherit
+    ///     the chain's first-segment hash (Resource.py:1286).
     ///   - segment: Current segment index (1-based)
     ///   - totalSegments: Total number of segments
     ///   - requestId: Associated request ID (16 bytes) or nil
@@ -270,6 +291,7 @@ extension ResourceAdvertisement {
         resourceHash: Data,
         randomHash: Data,
         hashmap: Data,
+        originalHash: Data? = nil,
         segment: Int,
         totalSegments: Int,
         requestId: Data?,
@@ -279,16 +301,19 @@ extension ResourceAdvertisement {
         // Calculate max hashmap length from link MDU
         let maxLength = ResourceHashmap.hashmapMaxLength(linkMDU: linkMDU)
 
-        // Get hashmap segment for this advertisement (0-based segment index)
+        // The advertisement carries only THIS resource segment's hashmap (which
+        // is itself the FIRST HMU chunk). python `ResourceAdvertisement.pack`
+        // (Resource.py:1333-1339) packs only the first HMU chunk (segment=0)
+        // into the advertisement; later HMU chunks ride RESOURCE_HMU packets.
         let hashmapChunk = ResourceHashmap.getHashmapSegment(
             hashmap: hashmap,
-            segment: segment - 1,  // Convert 1-based to 0-based
+            segment: 0,  // First HMU chunk only — matches python pack(segment=0)
             maxLength: maxLength
         ) ?? Data()  // Default to empty if out of range
 
-        // First segment uses resource hash as original hash
-        // Subsequent segments would use first segment's hash (not implemented yet)
-        let originalHash = resourceHash
+        // First/single segment uses its own hash as original_hash; later
+        // segments pass the inherited first-segment hash explicitly.
+        let resolvedOriginalHash = originalHash ?? resourceHash
 
         return ResourceAdvertisement(
             transferSize: transferSize,
@@ -296,7 +321,7 @@ extension ResourceAdvertisement {
             numParts: numParts,
             hash: resourceHash,
             randomHash: randomHash,
-            originalHash: originalHash,
+            originalHash: resolvedOriginalHash,
             segmentIndex: segment,
             totalSegments: totalSegments,
             requestId: requestId,

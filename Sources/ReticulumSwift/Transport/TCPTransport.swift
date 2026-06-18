@@ -18,6 +18,30 @@ import OSLog
 /// TCP transport using Network.framework NWConnection.
 /// Handles connection lifecycle, state changes, data receive loop, and send operations.
 public final class TCPTransport: Transport {
+
+    /// Optional iOS Network Extension egress pin (default `false`). When a
+    /// `NEPacketTunnelProvider` host sets this `true`, outbound TCP connections
+    /// set `prohibitedInterfaceTypes = [.other]`, forcing a *physical* interface
+    /// (wifi/cellular) instead of the provider's own packet-tunnel virtual
+    /// interface (utun, which Network.framework types as `.other`).
+    ///
+    /// DEFENSIVE / REVERT-CANDIDATE — not a proven fix. This was added while
+    /// chasing an on-device "announces not propagating" symptom on iPhone 14.
+    /// The root cause turned out to be a *wedged relay daemon* on the LAN host,
+    /// NOT egress: a stock `NWParameters.tcp` connection created inside the
+    /// extension egresses fine (the "no SYN on the relay" observation that
+    /// pointed here was a packet-capture filtered on the wrong device IP). It is
+    /// retained only as cheap insurance in case a future iOS routing change ever
+    /// did bind an NE-created connection to our own utun. `false` preserves
+    /// stock behavior. Process-global; iOS-NE-specific, no Python-reference
+    /// equivalent (see port-deviations.md).
+    ///
+    /// `nonisolated(unsafe)`: deliberately a set-once-before-any-transport global (the
+    /// host flips it at startup); reads in `init` are safe by that contract. The
+    /// annotation makes the unguarded-shared intent explicit and satisfies strict
+    /// concurrency without a lock for a flag that is never mutated after init.
+    nonisolated(unsafe) public static var bypassTunnelEgress = false
+
     // MARK: - Properties
 
     /// The underlying NWConnection instance.
@@ -81,7 +105,15 @@ public final class TCPTransport: Transport {
             port: NWEndpoint.Port(integerLiteral: port)
         )
 
-        connection = NWConnection(to: endpoint, using: .tcp)
+        let params = NWParameters.tcp
+        if TCPTransport.bypassTunnelEgress {
+            // iOS NE egress fix — see port-deviations.md. Prohibit the virtual
+            // (.other = our own utun packet tunnel) interface so the connection
+            // uses a physical interface (wifi/cellular) and actually egresses to
+            // the LAN, instead of black-holing in our own tunnel.
+            params.prohibitedInterfaceTypes = [.other]
+        }
+        connection = NWConnection(to: endpoint, using: params)
 
         connection?.stateUpdateHandler = { [weak self] nwState in
             guard let self = self else { return }

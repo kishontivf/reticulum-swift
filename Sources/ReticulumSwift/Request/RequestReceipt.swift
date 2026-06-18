@@ -90,6 +90,11 @@ public actor RequestReceipt {
     /// Response data (after responseReceived)
     public private(set) var responseData: Data?
 
+    /// Response metadata. Set only for a (file, metadata) response, where RNS
+    /// passes `resource.metadata` to `response_received(response, metadata)`
+    /// (RNS Link.py:1369/:1461). nil for plain bytes / structured responses.
+    public private(set) var metadata: Data?
+
     /// Response resource (for large responses)
     public private(set) var responseResource: Resource?
 
@@ -100,6 +105,13 @@ public actor RequestReceipt {
 
     /// Timeout duration
     private let timeout: TimeInterval
+
+    /// Public read-back of the request's computed timeout (seconds). Mirrors
+    /// RNS `RequestReceipt.timeout` (Link.py:1377), which is a plain attribute;
+    /// Swift's actor encapsulation needs an explicit accessor so the bridge can
+    /// observe the real `rtt * TRAFFIC_TIMEOUT_FACTOR + RESPONSE_MAX_GRACE_TIME *
+    /// 1.125` value instead of reconstructing it.
+    public var timeoutInterval: TimeInterval { timeout }
 
     /// Timeout task
     private var timeoutTask: Task<Void, Never>?
@@ -179,8 +191,13 @@ public actor RequestReceipt {
     /// Called when a response packet is received for this request.
     /// Updates status to responseReceived and invokes the response callback.
     ///
-    /// - Parameter data: Response data
-    public func receiveResponse(_ data: Data) async {
+    /// - Parameters:
+    ///   - data: Response data
+    ///   - metadata: Optional response metadata. RNS `response_received(response,
+    ///     metadata=None)` stores `self.metadata = metadata` (Link.py:1457-1461);
+    ///     it is non-nil only for a (file, metadata) response. Defaults to nil so
+    ///     existing call sites (plain bytes / structured responses) are unchanged.
+    public func receiveResponse(_ data: Data, metadata: Data? = nil) async {
         // Allow receiving response in pending or delivered state
         switch status {
         case .pending, .delivered:
@@ -191,6 +208,7 @@ public actor RequestReceipt {
 
         cancelTimeout()
         responseData = data
+        self.metadata = metadata
         status = .responseReceived
         statusContinuation?.yield(status)
         statusContinuation?.finish()
@@ -254,15 +272,10 @@ public actor RequestReceipt {
 
             guard !Task.isCancelled else { return }
 
-            // Check current status - timeout only if still waiting
-            let currentStatus = await self.status
-            switch currentStatus {
-            case .pending, .delivered:
-                await self.handleTimeout()
-            default:
-                // Already completed, no timeout needed
-                break
-            }
+            // handleTimeout re-checks status atomically inside the actor — the response
+            // can arrive between this point and handleTimeout running, so the gate must
+            // be there, not here (this pre-read would already be stale).
+            await self.handleTimeout()
         }
     }
 
@@ -270,6 +283,19 @@ public actor RequestReceipt {
     ///
     /// Updates status to timeout and invokes the failure callback.
     private func handleTimeout() async {
+        // Re-check status atomically here (no await before this guard, so no actor
+        // message can interleave between the read and the transition). Between the
+        // timeout monitor firing and this call, the RESPONSE may have arrived —
+        // response_received transitions status to .ready and cancels the timeout — so
+        // only time out if still waiting. Otherwise overwriting to .timeout would clobber
+        // a delivered/ready request AND double-fire its callback. Mirrors RNS
+        // request_timed_out's status gate.
+        switch status {
+        case .pending, .delivered:
+            break
+        default:
+            return
+        }
         status = .timeout
         statusContinuation?.yield(status)
         statusContinuation?.finish()

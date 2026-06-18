@@ -218,6 +218,14 @@ func num(_ i: Int) -> JSONValue { .int(i) }
 func num(_ d: Double) -> JSONValue { .double(d) }
 func boolean(_ b: Bool) -> JSONValue { .bool(b) }
 
+/// Minimal `RatchetIdReceiver` for the bridge ratchet_decrypt handler — surfaces
+/// the id of the ratchet that decrypted, which RNS writes onto the caller-supplied
+/// `ratchet_id_receiver` (Identity.py:889-890). Nil when the static key was used
+/// or no ratchet matched.
+final class SimpleRatchetIdReceiver: RatchetIdReceiver {
+    var latestRatchetId: Data?
+}
+
 // MARK: - Command Handlers
 
 func handleCommand(_ req: Request) throws -> Result {
@@ -259,8 +267,19 @@ func handleCommand(_ req: Request) throws -> Result {
     case "ed25519_sign":
         let privBytes = try getHex(p, "private_key")
         let message = try getHex(p, "message")
+        // RNS accepts a 32-byte Ed25519 seed OR a 64-byte private key
+        // (seed‖public_key); in the 64-byte form only the first 32 bytes (the
+        // seed) drive signing. Any other length is invalid. (RNS.Cryptography
+        // .Ed25519: the private key is the seed; Identity stores seed‖pub.)
+        let seed: Data
+        switch privBytes.count {
+        case 32: seed = privBytes
+        case 64: seed = privBytes.prefix(32)
+        default:
+            throw BridgeError.invalidData("Ed25519 private key must be 32 or 64 bytes, got \(privBytes.count)")
+        }
         // Use Ed25519Pure for deterministic signatures matching Python
-        guard let sig = Ed25519Pure.sign(message: message, seed: privBytes) else {
+        guard let sig = Ed25519Pure.sign(message: message, seed: seed) else {
             throw BridgeError.invalidData("Ed25519 signing failed")
         }
         return ["signature": hex(sig)]
@@ -269,7 +288,14 @@ func handleCommand(_ req: Request) throws -> Result {
         let pubBytes = try getHex(p, "public_key")
         let message = try getHex(p, "message")
         let signature = try getHex(p, "signature")
-        let pubKey = try Curve25519.Signing.PublicKey(rawRepresentation: pubBytes)
+        // Ed25519 verify is a TOTAL predicate: a wrong-length public key must
+        // return valid=false, never raise (cmd_ed25519_verify, bridge_server.py:281-286
+        // wraps VerifyingKey(...).verify in try/except -> {'valid': False}). The
+        // PublicKey initializer throws on a 31/33-byte key, so swallow it here.
+        // (x25519 length-validation handlers stay raising — those tests want it.)
+        guard let pubKey = try? Curve25519.Signing.PublicKey(rawRepresentation: pubBytes) else {
+            return ["valid": boolean(false)]
+        }
         let valid = pubKey.isValidSignature(signature, for: message)
         return ["valid": boolean(valid)]
 
@@ -298,6 +324,13 @@ func handleCommand(_ req: Request) throws -> Result {
 
     case "hkdf":
         let length = try getInt(p, "length")
+        // RNS HKDF.hkdf raises ValueError when length is None or < 1 (HKDF.py:41-42).
+        // This guard MUST run before KeyDerivation.deriveKey — a negative length
+        // otherwise crashes the entire bridge process (precondition trap), killing
+        // the session, instead of returning a clean error response.
+        guard length >= 1 else {
+            throw BridgeError.invalidData("HKDF length must be >= 1, got \(length)")
+        }
         let ikm = try getHex(p, "ikm")
         let salt = getHexOptional(p, "salt")
         let info = getHexOptional(p, "info")
@@ -334,6 +367,15 @@ func handleCommand(_ req: Request) throws -> Result {
 
     case "pkcs7_unpad":
         let data = try getHex(p, "data")
+        // RNS PKCS7.unpad (PKCS7.py:38-44) is intentionally lax about pad CONTENT
+        // (it does not verify the stripped bytes equal the pad value) but DOES
+        // reject an oversized pad length: `if l > bs: raise ValueError`. CryptoSwift's
+        // remover does not enforce this (it returns the data unchanged), so gate on
+        // the trailing byte vs the 16-byte block. n==0 (last byte 0x00) still strips
+        // nothing and returns all 16 bytes — preserved by the `> 16` threshold.
+        if let last = data.last, Int(last) > 16 {
+            throw BridgeError.invalidData("PKCS7 padding length \(Int(last)) exceeds block size 16")
+        }
         let unpadded = try Padding.pkcs7.remove(from: Array(data), blockSize: 16)
         return ["unpadded": hex(Data(unpadded))]
 
@@ -361,10 +403,18 @@ func handleCommand(_ req: Request) throws -> Result {
     case "token_verify_hmac":
         let key = try getHex(p, "key")
         let tokenData = try getHex(p, "token")
-        guard tokenData.count >= 64 else {
-            return ["valid": boolean(false)]
+        // RNS Token rejects any token of 32 bytes or fewer BEFORE verifying — there
+        // is no room for both a 32-byte HMAC tag and a body (Token.py:78,
+        // `if len(token) <= 32: raise ValueError`). This is a raise, not valid=false.
+        guard tokenData.count > 32 else {
+            throw BridgeError.invalidData("Token must be longer than 32 bytes, got \(tokenData.count)")
         }
-        let signingKey = key.prefix(32)
+        // The signing key is the FIRST HALF of the derived key (key[:16] for a
+        // 32-byte AES-128 key, key[:32] for a 64-byte AES-256 key — RNS Token splits
+        // key[:len//2]). HMAC covers token[:-32]; compare to the trailing 32 bytes.
+        // Do NOT require a 64-byte token: a 58-byte forged token with a 10-byte
+        // ciphertext and a genuine HMAC must still verify true.
+        let signingKey = key.prefix(key.count / 2)
         let signedParts = tokenData.prefix(tokenData.count - 32)
         let receivedHMAC = tokenData.suffix(32)
         let expectedHMAC = HMAC<SHA256>.authenticationCode(
@@ -388,7 +438,13 @@ func handleCommand(_ req: Request) throws -> Result {
     case "identity_encrypt":
         let pubBytes = try getHex(p, "public_key")
         let plaintext = try getHex(p, "plaintext")
-        let identityHash = try getHex(p, "identity_hash")
+        // identity_hash is OPTIONAL: RNS derives the HKDF salt from the loaded
+        // identity's OWN hash (get_salt() -> self.hash, Identity.py:814). The python
+        // cmd_identity_encrypt passes only {public_key, plaintext} (bridge_server.py:595).
+        // Keep honoring an explicitly-supplied identity_hash and the deterministic
+        // ephemeral_private/iv path used elsewhere.
+        let loadedIdentity = try Identity(publicKeyBytes: pubBytes)
+        let identityHash = getHexOptional(p, "identity_hash") ?? loadedIdentity.hash
         let encPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: pubBytes.prefix(32))
 
         if let ephPrivBytes = getHexOptional(p, "ephemeral_private"), let iv = getHexOptional(p, "iv") {
@@ -422,14 +478,21 @@ func handleCommand(_ req: Request) throws -> Result {
     case "identity_decrypt":
         let privBytes = try getHex(p, "private_key")
         let ciphertext = try getHex(p, "ciphertext")
-        let identityHash = try getHex(p, "identity_hash")
         let identity = try Identity(privateKeyBytes: privBytes)
-        let plaintext = try identity.decrypt(ciphertext, identityHash: identityHash)
-        return [
-            "plaintext": hex(plaintext),
-            "shared_key": str(""),
-            "derived_key": str("")
-        ]
+        // identity_hash OPTIONAL: derive the salt from the identity's own hash
+        // (RNS get_salt -> self.hash). Use the nil-returning decrypt overload so a
+        // forged / undersized token yields plaintext=null instead of raising —
+        // cmd_identity_decrypt (bridge_server.py:612) returns None when Identity.decrypt
+        // returns None (short/forged tokens, HMAC-fail), never a BridgeError.
+        let identityHash = getHexOptional(p, "identity_hash") ?? identity.hash
+        let plaintext = identity.decrypt(
+            ciphertext,
+            identityHash: identityHash,
+            ratchets: nil,
+            enforceRatchets: false,
+            ratchetIdReceiver: nil
+        )
+        return ["plaintext": plaintext != nil ? hex(plaintext!) : .null]
 
     case "identity_sign":
         let privBytes = try getHex(p, "private_key")
@@ -472,6 +535,26 @@ func handleCommand(_ req: Request) throws -> Result {
         let identityHash = try getHex(p, "identity_hash")
         let appName = try getString(p, "app_name")
         let aspects = getStringArray(p, "aspects")
+        // RNS.Destination.expand_name forbids '.' in app_name and in every aspect —
+        // '.' is the reserved name-component separator (Destination.py:102,106). The
+        // bare hash command bypasses the Destination/expand_name guards (which the
+        // Ext+Destination.swift create path applies at :124,:153), so re-check here
+        // or a dotted name would silently hash a structurally different address.
+        if appName.contains(".") {
+            throw BridgeError.invalidData("Dots can't be used in app names")
+        }
+        for aspect in aspects where aspect.contains(".") {
+            throw BridgeError.invalidData("Dots can't be used in aspects")
+        }
+        // RNS.Destination.hash accepts identity material ONLY as an Identity instance
+        // or exactly TRUNCATED_HASHLENGTH//8 == 16 bytes, else TypeError
+        // (Destination.py:122-128). The command supplies raw identity bytes, so gate
+        // the length here — otherwise 15/17/0-byte material is silently truncated/padded.
+        guard identityHash.count == 16 else {
+            throw BridgeError.invalidData(
+                "Invalid material supplied for destination hash calculation"
+            )
+        }
         let nameHash = Hashing.destinationNameHash(appName: appName, aspects: aspects)
         var combined = Data()
         combined.append(nameHash)
@@ -484,8 +567,30 @@ func handleCommand(_ req: Request) throws -> Result {
 
     case "packet_hash":
         let raw = try getHex(p, "raw")
-        let packet = try Packet(from: raw)
-        let hashablePart = packet.getHashablePart()
+        // Compute the hashable part DIRECTLY from the raw bytes, mirroring
+        // RNS.Packet.get_hashable_part (Packet.py:355-362) WITHOUT a full
+        // PacketHeader parse. A `Packet(from: raw)` parse rejects the IFAC bit
+        // (bit 7, PacketHeader.swift:74-76), but get_hashable_part masks raw[0] to
+        // its low nibble (raw[0] & 0x0f), so flipping bits 7/6/5/4 must leave the
+        // hash UNCHANGED. Header type is read from bit 6 (0x40): a HEADER_2 packet
+        // skips the 16-byte transport_id at raw[2:18]; HEADER_1 skips only the hop
+        // byte at raw[1]. Byte-for-byte identical to Packet.getHashablePart for any
+        // non-IFAC HEADER_1/HEADER_2 frame (so the cross-impl + header2 masking
+        // tests do not regress); only the IFAC-bit path changes behaviour.
+        let rawBytes = [UInt8](raw)
+        var hashablePart = Data()
+        if rawBytes.count >= 2 {
+            hashablePart.append(rawBytes[0] & 0x0F)
+            let isHeader2 = (rawBytes[0] & 0x40) != 0
+            if isHeader2 {
+                let skipTo = 18  // TRUNCATED_HASHLENGTH//8 (16) + 2
+                if rawBytes.count > skipTo {
+                    hashablePart.append(contentsOf: rawBytes[skipTo...])
+                }
+            } else if rawBytes.count > 2 {
+                hashablePart.append(contentsOf: rawBytes[2...])
+            }
+        }
         let fullHash = Hashing.fullHash(hashablePart)
         let truncHash = Data(fullHash.prefix(16))
         return [
@@ -556,23 +661,36 @@ func handleCommand(_ req: Request) throws -> Result {
         ]
 
     case "packet_unpack":
+        // Mirror cmd_packet_unpack (bridge_server.py): RNS.Packet.unpack returns
+        // a bool — failure yields {'unpacked': False}; success returns every wire
+        // field plus the raw flags byte and the full packet hash. Swift's
+        // Packet(from:) throws on a malformed frame, so a parse failure maps to
+        // {'unpacked': False} (not an error). transport_id is explicitly null on
+        // HEADER_1 (no transport id), matching python's None.
         let raw = try getHex(p, "raw")
-        let packet = try Packet(from: raw)
-        var result: Result = [
+        let packet: Packet
+        do {
+            packet = try Packet(from: raw)
+        } catch {
+            return ["unpacked": boolean(false)]
+        }
+        let transportField: JSONValue = packet.transportAddress != nil
+            ? hex(packet.transportAddress!) : .null
+        return [
+            "unpacked": boolean(true),
+            "flags": num(Int(raw[raw.startIndex])),
+            "hops": num(Int(packet.header.hopCount)),
             "header_type": num(Int(packet.header.headerType.rawValue)),
             "context_flag": num(packet.header.hasContext ? 1 : 0),
             "transport_type": num(Int(packet.header.transportType.rawValue)),
             "destination_type": num(Int(packet.header.destinationType.rawValue)),
             "packet_type": num(Int(packet.header.packetType.rawValue)),
-            "hops": num(Int(packet.header.hopCount)),
             "destination_hash": hex(packet.destination),
+            "transport_id": transportField,
             "context": num(Int(packet.context)),
-            "data": hex(packet.data)
+            "data": hex(packet.data),
+            "hash": hex(Hashing.fullHash(packet.getHashablePart()))
         ]
-        if let transport = packet.transportAddress {
-            result["transport_id"] = hex(transport)
-        }
-        return result
 
     case "packet_parse_header":
         let raw = try getHex(p, "raw")
@@ -1110,27 +1228,49 @@ func handleCommand(_ req: Request) throws -> Result {
         ]
 
     case "ratchet_encrypt":
+        // cmd_ratchet_encrypt (bridge_server.py:1247): params {public_key,
+        // ratchet_public, plaintext}; derive the HKDF salt from the loaded
+        // identity's own hash (get_salt -> self.hash), NOT an injected identity_hash,
+        // then Identity.encrypt(plaintext, ratchet=ratchet_public).
+        let publicKey = try getHex(p, "public_key")
         let ratchetPub = try getHex(p, "ratchet_public")
-        let identityHash = try getHex(p, "identity_hash")
         let plaintext = try getHex(p, "plaintext")
+        let identity = try Identity(publicKeyBytes: publicKey)
+        let identityHash = getHexOptional(p, "identity_hash") ?? identity.hash
         let ciphertext = try Identity.encrypt(plaintext, toRatchetKey: ratchetPub, identityHash: identityHash)
         return ["ciphertext": hex(ciphertext)]
 
     case "ratchet_decrypt":
-        let ratchetPriv = try getHex(p, "ratchet_private")
-        let identityHash = try getHex(p, "identity_hash")
+        // cmd_ratchet_decrypt (bridge_server.py:1268): params {private_key,
+        // ciphertext, ratchet_private|ratchet_privates, enforce_ratchets}; derive
+        // salt from the identity's own hash and use the nil-returning decrypt
+        // overload so cross-epoch / forged ciphertext yields plaintext=null +
+        // latest_ratchet_id=null (Identity.decrypt returns None) rather than raising.
+        let privBytes = try getHex(p, "private_key")
         let ciphertext = try getHex(p, "ciphertext")
-        // Decrypt using ratchet private key
-        let ephPubBytes = ciphertext.prefix(32)
-        let tokenData = Data(ciphertext.dropFirst(32))
-        let ratchetKey = try Curve25519.KeyAgreement.PrivateKey(rawRepresentation: ratchetPriv)
-        let ephPub = try Curve25519.KeyAgreement.PublicKey(rawRepresentation: ephPubBytes)
-        let shared = try ratchetKey.sharedSecretFromKeyAgreement(with: ephPub)
-        let sharedData = shared.withUnsafeBytes { Data($0) }
-        let derived = KeyDerivation.deriveKey(length: 64, inputKeyMaterial: sharedData, salt: identityHash, context: nil)
-        let token = try Token(derivedKey: derived)
-        let plaintext = try token.decrypt(tokenData)
-        return ["plaintext": hex(plaintext)]
+        let enforce = getBoolOptional(p, "enforce_ratchets") ?? false
+        // Accept an ordered ratchet_privates list (preferred) or a single
+        // ratchet_private shorthand; absent -> nil (static-key fallback only).
+        var ratchets: [Data]? = nil
+        if let list = p["ratchet_privates"]?.arrayValue {
+            ratchets = list.compactMap { $0.stringValue.flatMap(hexToBytes) }
+        } else if let single = getHexOptional(p, "ratchet_private") {
+            ratchets = [single]
+        }
+        let identity = try Identity(privateKeyBytes: privBytes)
+        let identityHash = getHexOptional(p, "identity_hash") ?? identity.hash
+        let receiver = SimpleRatchetIdReceiver()
+        let plaintext = identity.decrypt(
+            ciphertext,
+            identityHash: identityHash,
+            ratchets: ratchets,
+            enforceRatchets: enforce,
+            ratchetIdReceiver: receiver
+        )
+        return [
+            "plaintext": plaintext != nil ? hex(plaintext!) : .null,
+            "latest_ratchet_id": receiver.latestRatchetId != nil ? hex(receiver.latestRatchetId!) : .null,
+        ]
 
     case "ratchet_extract_from_announce":
         let data = try getHex(p, "announce_data")
@@ -1659,35 +1799,20 @@ func handleCommand(_ req: Request) throws -> Result {
             "value": num(valid ? zeros : 0)
         ]
 
-    case "behavioral_start",
-         "behavioral_stop",
-         "behavioral_attach_mock_interface",
-         "behavioral_inject",
-         "behavioral_drain_tx":
-        return try handleBehavioralCommand(req.command, p)
+    // Prefix-route the whole behavioral_* and wire_* namespaces to their
+    // handlers (each owns an internal dispatch chain), so adding a new wire /
+    // behavioral command never requires editing this switch.
+    case let c where c.hasPrefix("behavioral_"):
+        return try handleBehavioralCommand(c, p)
 
-    case "wire_start_tcp_server",
-         "wire_start_tcp_client",
-         "wire_stop",
-         "wire_announce",
-         "wire_poll_path",
-         "wire_read_path_entry",
-         "wire_has_discovery_path_request",
-         "wire_has_announce_table_entry",
-         "wire_read_announce_table_timestamp",
-         "wire_tx_bytes",
-         "wire_read_path_random_hash",
-         "wire_request_path",
-         "wire_set_interface_mode",
-         "wire_listen",
-         "wire_link_open",
-         "wire_link_send",
-         "wire_link_poll",
-         "wire_resource_send",
-         "wire_resource_poll":
-        return try handleWireCommand(req.command, p)
+    case let c where c.hasPrefix("wire_"):
+        return try handleWireCommand(c, p)
 
     default:
+        // Any non-wire/behavioral command not matched above is routed through
+        // the per-cluster main.swift extension sub-handlers (Ext+*.swift).
+        // Each returns nil for commands it doesn't own; chain in Ext+Dispatch.swift.
+        if let r = try handleExtensionCommand(req.command, p) { return r }
         throw BridgeError.unknownCommand(req.command)
     }
 }
@@ -1721,5 +1846,33 @@ while let line = readLine() {
             print(String(data: data, encoding: .utf8)!)
             fflush(stdout)
         }
+    }
+}
+
+// Graceful process-exit teardown. `readLine()` returns nil when the parent
+// closes our stdin (BridgeClient.bridge.close()), which models a clean peer
+// shutdown. RNS's Reticulum exit handler broadcasts a LINKCLOSE for every
+// active link on shutdown so peers observe DESTINATION_CLOSED immediately
+// instead of only discovering the close via a watchdog TIMEOUT
+// (tests/wire/test_link_lifecycle.py::test_clean_peer_disconnect_closes_destination_closed).
+//
+// Emit + flush a LINKCLOSE for each active link SYNCHRONOUSLY before the
+// process exits: Link.close schedules its LINKCLOSE on an async Task that would
+// NOT run before exit, so use Link.closeAndFlush (awaits the send onto the TCP
+// socket). The responder-side reason derives to DESTINATION_CLOSED, exactly
+// what the initiator records on receipt.
+do {
+    wireLock.lock()
+    let shutdownInstances = Array(wireInstances.values)
+    wireLock.unlock()
+    for inst in shutdownInstances {
+        // Mirror RNS Transport.detach_interfaces (RNS/Transport.py:3076-3088): flush a
+        // LINKCLOSE for every active + pending link, then hold a 150ms drain window so
+        // the teardown packets leave local transport before this process exits. (Plain
+        // Link.close schedules its LINKCLOSE on a detached Task that would not run
+        // before exit; detachInterfaces uses Link.closeAndFlush, which awaits the send,
+        // and adds the drain so NWConnection's accepted-but-not-yet-flushed bytes reach
+        // the wire.)
+        _ = try? blockingAsync { await inst.transport.detachInterfaces() }
     }
 }

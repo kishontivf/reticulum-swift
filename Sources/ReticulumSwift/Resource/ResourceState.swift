@@ -90,6 +90,16 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
     /// No further transitions are possible from this state.
     case failed
 
+    /// Receiver assembly produced corrupt data (terminal state).
+    ///
+    /// Mirrors python `Resource.CORRUPT = 0x08` (RNS/Resource.py:151). Set by
+    /// `assemble()` when the per-segment integrity hash does not match
+    /// (RNS/Resource.py:715) or the bz2 stream exceeds the max decompressed size
+    /// (RNS/Resource.py:688-692). Distinct from `.failed` (cancel/timeout): the
+    /// Link reads `corruptReason` to choose teardown (decompress overflow) vs a
+    /// quiet conclude (hash mismatch). No further transitions are possible.
+    case corrupt
+
     /// Advertisement rejected by receiver.
     ///
     /// This is a terminal state. The receiver declined to accept the
@@ -113,7 +123,7 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
     /// are possible and the resource cannot be reused.
     public var isTerminal: Bool {
         switch self {
-        case .complete, .failed, .rejected, .cancelled:
+        case .complete, .failed, .rejected, .cancelled, .corrupt:
             return true
         case .none, .queued, .advertised, .transferring, .awaitingProof, .assembling:
             return false
@@ -129,7 +139,7 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
         switch self {
         case .transferring, .awaitingProof, .assembling:
             return true
-        case .none, .queued, .advertised, .complete, .failed, .rejected, .cancelled:
+        case .none, .queued, .advertised, .complete, .failed, .rejected, .cancelled, .corrupt:
             return false
         }
     }
@@ -141,7 +151,7 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
         switch self {
         case .complete:
             return true
-        case .none, .queued, .advertised, .transferring, .awaitingProof, .assembling, .failed, .rejected, .cancelled:
+        case .none, .queued, .advertised, .transferring, .awaitingProof, .assembling, .failed, .rejected, .cancelled, .corrupt:
             return false
         }
     }
@@ -179,6 +189,24 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
         // Can always cancel from non-terminal states
         if to == .cancelled {
             return true
+        }
+
+        // Any non-terminal state may FAIL. Mirrors python `cancel()` setting
+        // `status = FAILED` for any `status < COMPLETE` (RNS/Resource.py:1086-1087),
+        // reached from NONE/QUEUED/ADVERTISED/TRANSFERRING alike.
+        if to == .failed {
+            return true
+        }
+
+        // The receiver-side CORRUPT outcome of assemble() (RNS/Resource.py:715,
+        // :689) is reached from the active receive states.
+        if to == .corrupt {
+            switch from {
+            case .transferring, .assembling:
+                return true
+            default:
+                return false
+            }
         }
 
         // Validate specific transitions
@@ -230,6 +258,8 @@ public enum ResourceState: Sendable, Equatable, CustomStringConvertible {
             return "complete"
         case .failed:
             return "failed"
+        case .corrupt:
+            return "corrupt"
         case .rejected:
             return "rejected"
         case .cancelled:

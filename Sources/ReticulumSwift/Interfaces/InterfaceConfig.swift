@@ -111,6 +111,21 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
     /// Reference: Python Interface.ifac_key
     public var ifacKey: Data?
 
+    /// Configured fixed hardware MTU (`fixed_mtu`) in bytes, or nil to
+    /// autoconfigure. When set, `FIXED_MTU` is true and `AUTOCONFIGURE_MTU`
+    /// is forced false (see `init`): the interface's live `hwMtu` is exactly
+    /// this value rather than the bitrate-autoconfigured one. Must be
+    /// `>= Reticulum.MTU` (500); a smaller value is rejected by the
+    /// constructing interface's throwing initializer.
+    /// Reference: Python TCPInterface.fixed_mtu / FIXED_MTU (TCPInterface.py:110-116).
+    public var fixedMtu: Int?
+
+    /// Whether this interface autoconfigures its hardware MTU from its bitrate
+    /// (`AUTOCONFIGURE_MTU`). Defaults true to match the TCP*Interface class
+    /// constant (TCPInterface.py:78, :455). Forced false when `fixedMtu` is set.
+    /// Reference: Python Interface.AUTOCONFIGURE_MTU (Interface.py:89).
+    public var autoconfigureMtu: Bool
+
     // MARK: - Initialization
 
     /// Create a new interface configuration.
@@ -141,7 +156,9 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         announceRatePenalty: TimeInterval = 0,
         bitrate: Int = 0,
         ifacSize: Int = 0,
-        ifacKey: Data? = nil
+        ifacKey: Data? = nil,
+        fixedMtu: Int? = nil,
+        autoconfigureMtu: Bool = true
     ) {
         self.id = id
         self.name = name
@@ -157,6 +174,11 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         self.bitrate = bitrate
         self.ifacSize = ifacSize
         self.ifacKey = ifacKey
+        self.fixedMtu = fixedMtu
+        // Mirror TCPInterface.py:112-114: a configured fixed_mtu forces
+        // FIXED_MTU=true / AUTOCONFIGURE_MTU=false regardless of the requested
+        // autoconfigure flag.
+        self.autoconfigureMtu = fixedMtu != nil ? false : autoconfigureMtu
     }
 
     // MARK: - Codable backward compatibility
@@ -178,12 +200,19 @@ public struct InterfaceConfig: Codable, Sendable, Equatable {
         bitrate = try container.decodeIfPresent(Int.self, forKey: .bitrate) ?? 0
         ifacSize = try container.decodeIfPresent(Int.self, forKey: .ifacSize) ?? 0
         ifacKey = try container.decodeIfPresent(Data.self, forKey: .ifacKey)
+        // Backward-compatible: old plists predate the MTU fields. Default
+        // fixedMtu=nil / autoconfigureMtu=true (the TCP class default), then
+        // re-apply the fixed-MTU invariant (TCPInterface.py:112-114).
+        fixedMtu = try container.decodeIfPresent(Int.self, forKey: .fixedMtu)
+        let decodedAutoconfigure = try container.decodeIfPresent(Bool.self, forKey: .autoconfigureMtu) ?? true
+        autoconfigureMtu = fixedMtu != nil ? false : decodedAutoconfigure
     }
 
     private enum CodingKeys: String, CodingKey {
         case id, name, type, enabled, mode, host, port, ifac
         case announceRateTarget, announceRateGrace, announceRatePenalty
         case bitrate, ifacSize, ifacKey
+        case fixedMtu, autoconfigureMtu
     }
 
     // MARK: - Persistence

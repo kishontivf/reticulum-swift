@@ -14,3 +14,13 @@ Package.resolved
 
 # macOS
 .DS_Store
+
+# Agent / local tooling (not part of the library)
+.claude/
+.claude-flow/
+.swarm/
+.mcp.json
+node_modules/
+package.json
+package-lock.json
+test-tools/

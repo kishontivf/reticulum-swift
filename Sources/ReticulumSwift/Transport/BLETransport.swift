@@ -139,7 +139,7 @@ public final class BLETransport: Transport {
             }
 
             // Check if Bluetooth is ready
-            guard let manager = self.centralManager, manager.state == .poweredOn else {
+            guard self.centralManager?.state == .poweredOn else {
                 // Bluetooth not ready yet — defer scan until poweredOn callback
                 self.logger.info("Bluetooth not ready yet, deferring scan until powered on")
                 self.pendingConnect = true
@@ -148,32 +148,67 @@ public final class BLETransport: Transport {
             }
 
             self.updateState(.connecting)
+            self.beginConnectionAttempt()
+        }
+    }
 
-            let isScanOnly = (self.targetDeviceName == nil)
+    /// Reuse an already-connected peripheral if present, otherwise scan.
+    ///
+    /// Precondition: runs on `bleQueue`, the central manager is `.poweredOn`, and
+    /// `state` is `.connecting`. Shared by `connect()` and the deferred poweredOn
+    /// path (`handleCentralStateChange`) so BOTH honor the already-connected reuse —
+    /// a restored, already-connected peripheral does NOT advertise, so a blind scan
+    /// for it never completes and just hits the connection timeout.
+    private func beginConnectionAttempt() {
+        guard let manager = self.centralManager else { return }
 
-            if isScanOnly {
-                // Scan-only mode (device picker): scan ALL devices so RNodes that
-                // don't advertise NUS service UUID still appear. User selects by name.
-                self.logger.error("[BLETRANS] Scanning all peripherals (discovery mode)")
-                manager.scanForPeripherals(
-                    withServices: nil,
-                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
-                )
-            } else {
-                // Targeted mode: scan without service filter because many RNodes
-                // don't advertise the NUS service UUID in BLE advertisement packets.
-                // We filter by peripheral name instead (in handleDiscoveredPeripheral).
-                self.logger.error("[BLETRANS] Scanning for peripheral named '\(self.targetDeviceName ?? "", privacy: .public)'")
-                manager.scanForPeripherals(
-                    withServices: nil,
-                    options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-                )
-            }
-
-            // Start connection timeout (only for targeted connections, not scan-only)
-            if self.targetDeviceName != nil {
+        // Reuse an already-connected peripheral instead of scanning. A peripheral
+        // that is already connected (CoreBluetooth restored it across an app/NE
+        // relaunch via state preservation, or it simply never dropped) does NOT
+        // advertise, so a scan for it never completes and hits the connection
+        // timeout — the Model-B failure mode where the restored subscription keeps
+        // delivering data while a fresh scan spins fruitlessly and the interface
+        // never reaches `.connected`. `connect()` on an already-connected peripheral
+        // re-fires didConnect, driving the normal discover → `.connected` flow.
+        if let target = self.targetDeviceName {
+            let nusUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
+            let alreadyConnected = manager.retrieveConnectedPeripherals(withServices: [nusUUID])
+                .first { $0.name == target }
+                ?? (self.peripheral?.state == .connected ? self.peripheral : nil)
+            if let existing = alreadyConnected {
+                self.logger.error("[BLETRANS] '\(target, privacy: .public)' already connected — reusing (no scan)")
+                self.peripheral = existing
+                existing.delegate = self.delegateWrapper
+                manager.connect(existing, options: nil)
                 self.startConnectionTimeout()
+                return
             }
+        }
+
+        let isScanOnly = (self.targetDeviceName == nil)
+
+        if isScanOnly {
+            // Scan-only mode (device picker): scan ALL devices so RNodes that
+            // don't advertise NUS service UUID still appear. User selects by name.
+            self.logger.error("[BLETRANS] Scanning all peripherals (discovery mode)")
+            manager.scanForPeripherals(
+                withServices: nil,
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
+            )
+        } else {
+            // Targeted mode: scan without service filter because many RNodes
+            // don't advertise the NUS service UUID in BLE advertisement packets.
+            // We filter by peripheral name instead (in handleDiscoveredPeripheral).
+            self.logger.error("[BLETRANS] Scanning for peripheral named '\(self.targetDeviceName ?? "", privacy: .public)'")
+            manager.scanForPeripherals(
+                withServices: nil,
+                options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
+            )
+        }
+
+        // Start connection timeout (only for targeted connections, not scan-only)
+        if self.targetDeviceName != nil {
+            self.startConnectionTimeout()
         }
     }
 
@@ -382,25 +417,16 @@ public final class BLETransport: Transport {
         switch cbState {
         case .poweredOn:
             logger.info("Bluetooth powered on")
-            // If connect() was called before Bluetooth was ready, start scanning now
+            // If connect() was called before Bluetooth was ready, run the deferred
+            // attempt now. `state` is already `.connecting` (set when we deferred);
+            // route through `beginConnectionAttempt()` so the deferred path honors
+            // the same already-connected-peripheral reuse as `connect()` — otherwise
+            // a restored, already-connected peripheral (which doesn't advertise) is
+            // scanned-for and the attempt just times out.
             if pendingConnect {
                 pendingConnect = false
-                logger.info("Starting deferred BLE scan")
-                let isScanOnly = (targetDeviceName == nil)
-                if isScanOnly {
-                    centralManager?.scanForPeripherals(
-                        withServices: nil,
-                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: true]
-                    )
-                } else {
-                    // Scan without service UUID filter — RNodes don't advertise NUS in their
-                    // advertisement packets. We filter by peripheral name in handleDiscoveredPeripheral.
-                    centralManager?.scanForPeripherals(
-                        withServices: nil,
-                        options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
-                    )
-                    startConnectionTimeout()
-                }
+                logger.info("Bluetooth ready — running deferred connection")
+                beginConnectionAttempt()
             }
 
         case .poweredOff:
@@ -674,6 +700,18 @@ public final class BLETransport: Transport {
 
     /// Update state and notify callback on main queue.
     private func updateState(_ newState: TransportState) {
+        // Suppress a duplicate transition INTO `.connected`. Two independent
+        // discovery chains can both reach `.connected` — e.g. CoreBluetooth
+        // state-restoration re-discovers the already-connected peripheral
+        // (`handleRestoredState`) while `connect()` reuses+reconnects that same
+        // peripheral — and each `onStateChange(.connected)` drives a fresh
+        // `configureDevice()` in `RNodeInterface`, interleaving KISS-detect /
+        // radio-init commands across two sessions (non-deterministic radio state).
+        // `updateState` always runs on `bleQueue`, so this guard is race-free.
+        if case .connected = newState, case .connected = state {
+            logger.info("Already connected — suppressing duplicate .connected notification")
+            return
+        }
         logger.error("[PROBE] state -> \(String(describing: newState), privacy: .public)")
         state = newState
         DispatchQueue.main.async { [weak self] in

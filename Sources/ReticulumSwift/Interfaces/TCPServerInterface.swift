@@ -40,7 +40,28 @@ private let tcpServerLogger = Logger(subsystem: "net.reticulum", category: "TCPS
 public final class TCPSpawnedPeerInterface: NetworkInterface, @unchecked Sendable {
     public let id: String
     public let config: InterfaceConfig
-    public var hwMtu: Int { 262144 }
+    /// Hardware MTU — derived from the inherited parent config. RNS spawns a
+    /// child interface, copies the parent bitrate + fixed/autoconfigure posture,
+    /// runs `optimise_mtu()`, then pins `spawned.HW_MTU = parent.HW_MTU`
+    /// (TCPInterface.py:599-600, :626). Because the spawned config copies the
+    /// parent's bitrate/fixedMtu/autoconfigureMtu, this derivation yields the
+    /// same value as the parent's `hwMtu`.
+    public var hwMtu: Int {
+        Interface.deriveHwMtu(
+            fixedMtu: config.fixedMtu,
+            autoconfigureMtu: config.autoconfigureMtu,
+            bitrate: config.bitrate,
+            bitrateGuess: Interface.tcpBitrateGuess,
+            classHwMtu: Interface.tcpClassHwMtu
+        )
+    }
+
+    /// `AUTOCONFIGURE_MTU` posture inherited from the parent.
+    public var autoconfigureMtu: Bool { config.autoconfigureMtu }
+    /// Inherited `fixed_mtu` (FIXED_MTU value) or nil.
+    public var fixedMtu: Int? { config.fixedMtu }
+    /// `TCPInterface.HW_MTU` class ceiling (262144).
+    public var classHwMtu: Int { Interface.tcpClassHwMtu }
 
     /// Name of the spawning parent, so tests that inspect interface names
     /// can tie a spawned child back to its server.
@@ -115,7 +136,11 @@ public final class TCPSpawnedPeerInterface: NetworkInterface, @unchecked Sendabl
             announceRatePenalty: parentConfig.announceRatePenalty,
             bitrate: parentConfig.bitrate,
             ifacSize: parentConfig.ifacSize,
-            ifacKey: parentConfig.ifacKey
+            ifacKey: parentConfig.ifacKey,
+            // Inherit the parent's MTU posture so spawned.hwMtu == parent.hwMtu
+            // (TCPInterface.py:599-600, :626).
+            fixedMtu: parentConfig.fixedMtu,
+            autoconfigureMtu: parentConfig.autoconfigureMtu
         )
     }
 
@@ -252,7 +277,27 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
 
     public let id: String
     public let config: InterfaceConfig
-    public var hwMtu: Int { 262144 }
+    /// Hardware MTU — derived from the config like the client side. RNS's
+    /// TCPServerInterface also runs through `optimise_mtu` during config
+    /// (Reticulum.py interface_post_init :860); a fixed_mtu (when configured via
+    /// the bridge) is honored uniformly so spawned children negotiate the same
+    /// value the dialing client signals. See `Interface.deriveHwMtu`.
+    public var hwMtu: Int {
+        Interface.deriveHwMtu(
+            fixedMtu: config.fixedMtu,
+            autoconfigureMtu: config.autoconfigureMtu,
+            bitrate: config.bitrate,
+            bitrateGuess: Interface.tcpBitrateGuess,
+            classHwMtu: Interface.tcpClassHwMtu
+        )
+    }
+
+    /// `AUTOCONFIGURE_MTU` posture for this listener (TCPInterface.py:455).
+    public var autoconfigureMtu: Bool { config.autoconfigureMtu }
+    /// Configured `fixed_mtu` (FIXED_MTU value) or nil.
+    public var fixedMtu: Int? { config.fixedMtu }
+    /// `TCPInterface.HW_MTU` class ceiling (262144).
+    public var classHwMtu: Int { Interface.tcpClassHwMtu }
 
     public var state: InterfaceState {
         lock.lock(); defer { lock.unlock() }
@@ -316,6 +361,10 @@ public final class TCPServerInterface: NetworkInterface, @unchecked Sendable {
     public init(config: InterfaceConfig) throws {
         guard config.type == .tcp else {
             throw InterfaceError.invalidConfig(reason: "TCPServerInterface requires config type .tcp, got \(config.type)")
+        }
+        // Mirror TCPInterface.py:113: reject a fixed_mtu below Reticulum.MTU (500).
+        if let fixedMtu = config.fixedMtu, fixedMtu < MTU {
+            throw InterfaceError.invalidConfig(reason: "Configured MTU of \(fixedMtu) bytes is too small")
         }
         self.id = config.id
         self.config = config

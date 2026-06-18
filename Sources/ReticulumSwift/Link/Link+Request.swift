@@ -146,7 +146,12 @@ extension Link {
     ///
     /// - Returns: Timeout duration in seconds
     private func calculateRequestTimeout() -> TimeInterval {
-        let trafficTimeoutFactor = 5.0
+        // RNS Link.TRAFFIC_TIMEOUT_FACTOR = 6 (Link.py:82); the request receipt
+        // timeout is rtt * TRAFFIC_TIMEOUT_FACTOR + RESPONSE_MAX_GRACE_TIME*1.125
+        // (Link.py:494-ish). Previously 5.0 here, which under-waited vs the
+        // reference and was surfaced by the wire_link_request_timeout conformance
+        // test (expects rtt*6 + 11.25).
+        let trafficTimeoutFactor = 6.0
         let graceTime = ResourceConstants.RESPONSE_MAX_GRACE_TIME
         return rtt * trafficTimeoutFactor + graceTime * 1.125
     }
@@ -247,5 +252,39 @@ extension Link {
                 isResponse: true
             )
         }
+    }
+
+    /// Send a (file, metadata) response to a request.
+    ///
+    /// Mirrors the file-response branch of RNS `Link.handle_request`
+    /// (Link.py:884-895): when a response generator returns an open file handle
+    /// (optionally with metadata), the file's bytes are streamed DIRECTLY as a
+    /// metadata-bearing response Resource — NOT wrapped in
+    /// `umsgpack([request_id, response])` the way a structured/bytes response is.
+    /// The metadata rides the segment-1 'x' field and is advertised via the
+    /// resource flag bit (Resource.swift metadata path), so the initiator
+    /// recovers it as `RequestReceipt.metadata` when the response Resource
+    /// concludes (see Link.swift response-resource delivery + handleRequestResponse).
+    ///
+    /// - Parameters:
+    ///   - requestId: Request ID being responded to (carried on the Resource).
+    ///   - file: Raw response file bytes.
+    ///   - metadata: Optional metadata to deliver alongside the file (nil for a
+    ///     bare file response).
+    /// - Throws: LinkError.notActive if the link is not established.
+    public func respond(to requestId: Data, file: Data, metadata: Data?) async throws {
+        guard state.isEstablished else {
+            throw LinkError.notActive
+        }
+
+        // File responses always travel as a Resource (RNS builds a Resource
+        // unconditionally for the file branch, Link.py:895), carrying the raw
+        // bytes + metadata with is_response = true.
+        _ = try await sendResource(
+            data: file,
+            requestId: requestId,
+            isResponse: true,
+            metadata: metadata
+        )
     }
 }

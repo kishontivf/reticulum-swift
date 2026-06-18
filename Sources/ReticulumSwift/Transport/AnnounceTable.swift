@@ -343,6 +343,19 @@ public actor AnnounceTable {
         return entries[destinationHash]?.timestamp
     }
 
+    /// Full packet hash of an announce table entry's stored packet, or nil if absent.
+    ///
+    /// Mirrors the RNS `announce_table[dest][IDX_AT_PACKET].packet_hash` field
+    /// (Transport.py:3559-3567). The stored packet is the rebroadcast packet
+    /// (hops+1), but `Packet.getHashablePart` excludes the hop byte, so its
+    /// `getFullHash()` equals the dispatched original announce's packet hash — the
+    /// invariant `test_callback_arity_packet_hash` cross-checks (a 4-param
+    /// handler's `announce_packet_hash` must equal this table value). Exposed for
+    /// conformance bridge observables, following the `entryTimestamp` precedent.
+    public func entryPacketHash(_ destinationHash: Data) -> Data? {
+        return entries[destinationHash]?.packet.getFullHash()
+    }
+
     /// Number of entries in the table.
     public var count: Int {
         entries.count
