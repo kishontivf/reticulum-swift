@@ -279,6 +279,19 @@ public actor Link {
     /// concludes (event-driven drain in `resourceConcluded(_:)`, never polled).
     private var pendingOutgoingQueue: [Resource] = []
 
+    /// Synchronous reservation closing the register-window in the one-at-a-time
+    /// outbound gate. `readyForNewResource()` reads `outboundResources.isEmpty`, but
+    /// committing a resource as the in-flight outbound requires awaits (the Resource
+    /// actor's `state` read, and `await resource.hash` inside registerOutgoingResource)
+    /// that release the Link actor while `outboundResources` is STILL empty — a window
+    /// where a concurrent `sendResource`/`drainOutgoingQueue` would wrongly see the
+    /// link free and advertise a SECOND resource, violating the one-at-a-time invariant
+    /// and confusing the receiver's request/hashmap machinery. This is set true
+    /// SYNCHRONOUSLY before those awaits and cleared once the resource is registered
+    /// (the gate is then held by `outboundResources`). RNS has no such window —
+    /// `register_outgoing_resource` runs synchronously. See port-deviations.md.
+    private var outgoingReservationActive = false
+
     // MARK: - Identity
 
     // MARK: - Close Callback
@@ -1463,7 +1476,7 @@ public actor Link {
     /// Whether the link can begin a new outgoing resource. RNS serves exactly one
     /// outgoing resource at a time. Mirrors `ready_for_new_resource`
     /// (RNS/Link.py:1328-1330): true only when no outbound resource is in flight.
-    public func readyForNewResource() -> Bool { outboundResources.isEmpty }
+    public func readyForNewResource() -> Bool { outboundResources.isEmpty && !outgoingReservationActive }
 
     /// Track an outbound resource as in flight. Mirrors RNS
     /// `register_outgoing_resource` (RNS/Link.py:1302-1303). Per RNS
@@ -1573,9 +1586,16 @@ public actor Link {
     private func drainOutgoingQueue() async {
         guard readyForNewResource(), !pendingOutgoingQueue.isEmpty else { return }
         let next = pendingOutgoingQueue.removeFirst()
+        // Reserve the one-at-a-time slot SYNCHRONOUSLY before the awaits below:
+        // until `next` lands in outboundResources, readyForNewResource() would
+        // otherwise read empty and let a concurrent send/drain advertise a second
+        // outbound resource. Cleared once registered (gate then held by
+        // outboundResources) or before any early-exit re-drain.
+        outgoingReservationActive = true
         // A close/cancel mid-drain may already have terminated the queued resource.
         let nextState = await next.state
         guard !nextState.isTerminal else {
+            outgoingReservationActive = false
             await drainOutgoingQueue()
             return
         }
@@ -1591,6 +1611,9 @@ public actor Link {
             // effective atomicity (advertiseNextSegment already does this,
             // :2495-2501; see port-deviations.md).
             await registerOutgoingResource(next)
+            // Registered — the gate is now held by outboundResources; release the
+            // synchronous reservation.
+            outgoingReservationActive = false
             try await next.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
         } catch {
             linkLogger.error("Failed to advertise queued resource: \(error, privacy: .public)")
@@ -1805,7 +1828,14 @@ public actor Link {
         // fast peer's RESOURCE_REQ is dropped (see port-deviations.md;
         // advertiseNextSegment/drainOutgoingQueue do the same).
         if readyForNewResource() {
+            // Reserve the one-at-a-time slot SYNCHRONOUSLY before the register
+            // await: registerOutgoingResource suspends on `await resource.hash`
+            // while outboundResources is still empty, so without this a concurrent
+            // send/drain would see the link free and advertise a second resource.
+            // Cleared once registered (gate then held by outboundResources).
+            outgoingReservationActive = true
             await registerOutgoingResource(resource)
+            outgoingReservationActive = false
             do {
                 try await resource.sendAdvertisement(linkMDU: LinkConstants.LINK_MDU)
             } catch {
@@ -2513,10 +2543,19 @@ public actor Link {
     /// (python nulls the current segment's `input_file`, Resource.py:816), then
     /// `next_segment.advertise()` (Resource.py:821).
     private func advertiseNextSegment(after current: Resource) async {
+        // Hold the one-at-a-time reservation across the whole segment transition.
+        // The caller removed `current` from outboundResources just before this call
+        // (synchronously, no await between), so without this the gate would read free
+        // during the awaits below (prepareNextSegment, hash, register) and a concurrent
+        // send/drain could advertise a competing resource. Set here as the first
+        // statement (runs synchronously after the caller's removeValue); cleared once
+        // `next` is registered or on every early-exit/failure path.
+        outgoingReservationActive = true
         do {
             // Ensure the next segment exists & is prepared (python :807-811).
             guard let next = try await current.prepareNextSegment() else {
                 linkLogger.warning("No next segment to advertise despite hasMoreSegments")
+                outgoingReservationActive = false
                 return
             }
 
@@ -2536,6 +2575,8 @@ public actor Link {
             // the registry helper (RNS register_outgoing_resource, RNS/Link.py:1302).
             let nextHash = await next.hash ?? Data()
             await registerOutgoingResource(next)
+            // Registered — gate now held by outboundResources; release the reservation.
+            outgoingReservationActive = false
             let nextIdx = await next.segmentIndex
             let nextTotal = await next.totalSegments
             let nextHashHex = nextHash.prefix(8).map { String(format: "%02x", $0) }.joined()
@@ -2580,6 +2621,10 @@ public actor Link {
             // per-resource watchdog yet) — to be addressed by a timeout, not by
             // double-concluding a completed segment.
             linkLogger.error("Failed to prepare next segment: \(error, privacy: .public)")
+            // Reservation was set at entry and never cleared (we failed before
+            // registering `next`); release it before the drain below so the queue
+            // can actually advance.
+            outgoingReservationActive = false
             await current.cleanup()
             // The multi-segment transfer that was holding the pending-outgoing queue
             // (released only on the FINAL segment, :2438-2445) has now aborted, so drain

@@ -356,7 +356,18 @@ has_incoming_resource / ready_for_new_resource / get_last_resource_window),
    and a fast peer's `RESOURCE_REQ` would be dropped. Registering first preserves RNS's
    effective atomicity. Category (a) — actor await points create an interleaving window
    RNS's synchronous code does not have. Each path unregisters the resource on an
-   advertise failure so the one-at-a-time gate is not left stuck.
+   advertise failure so the one-at-a-time gate is not left stuck. A synchronous
+   `outgoingReservationActive` flag (also checked by `readyForNewResource()`) closes
+   the remaining register WINDOW: `registerOutgoingResource` itself suspends on
+   `await resource.hash` while `outboundResources` is still empty, so the flag is set
+   SYNCHRONOUSLY before that await and cleared once registered — preventing a
+   concurrent `sendResource`/`drainOutgoingQueue`/`advertiseNextSegment` from seeing
+   the link as free and advertising a competing resource mid-commit (which would put
+   two resources in `outboundResources` and confuse the receiver's request/hashmap
+   machinery). RNS needs no such flag because `register_outgoing_resource` runs
+   synchronously with no yield. Every send path clears the reservation on all exit
+   paths (success-after-register, no-next-segment, and each failure branch) so the
+   link can never be permanently wedged.
 
 3. **`resourceConcluded(_:)` omits `expected_rate`.** RNS recomputes
    `self.expected_rate` here (`RNS/Link.py:1287/1290`); nothing in this port
