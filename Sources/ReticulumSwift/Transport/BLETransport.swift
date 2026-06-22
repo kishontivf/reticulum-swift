@@ -49,9 +49,18 @@ public final class BLETransport: Transport {
 
     /// Optional target device name for filtered connection.
     ///
-    /// If nil, connects to first RNode discovered with NUS service.
-    /// If set, only connects to peripherals matching this name.
+    /// If both this and `targetDeviceIdentifier` are nil, the transport runs in scan-only
+    /// discovery mode (device picker): it reports peripherals via `onPeripheralDiscovered`
+    /// but does NOT auto-connect and arms no connection timeout. If set, it connects to the
+    /// peripheral whose advertised name matches — but `targetDeviceIdentifier` is tried first.
     private let targetDeviceName: String?
+
+    /// Optional target CoreBluetooth peripheral identifier, preferred over the name. When set,
+    /// the transport retrieves the peripheral by UUID and connects directly (no scan — works
+    /// for a bonded device that isn't currently advertising), and matches discovered
+    /// peripherals by identifier before falling back to the name. Robust against duplicate or
+    /// changed advertised names.
+    private let targetDeviceIdentifier: UUID?
 
     /// Logger for BLE transport events.
     fileprivate let logger: Logger
@@ -97,11 +106,14 @@ public final class BLETransport: Transport {
     /// - Parameters:
     ///   - deviceName: Optional target device name for filtered connection.
     ///   - subsystem: Logger subsystem (default: "com.columba.core").
-    public init(deviceName: String? = nil, subsystem: String = "com.columba.core") {
+    public init(deviceName: String? = nil, deviceIdentifier: UUID? = nil, subsystem: String = "com.columba.core") {
         self.targetDeviceName = deviceName
+        self.targetDeviceIdentifier = deviceIdentifier
         self.logger = Logger(subsystem: subsystem, category: "BLETransport")
 
-        if let name = deviceName {
+        if let id = deviceIdentifier {
+            logger.info("BLETransport initialized for device id: \(id.uuidString, privacy: .public) (name: \(deviceName ?? "—", privacy: .public))")
+        } else if let name = deviceName {
             logger.info("BLETransport initialized for device: \(name, privacy: .public)")
         } else {
             logger.info("BLETransport initialized (no device filter)")
@@ -162,6 +174,19 @@ public final class BLETransport: Transport {
     private func beginConnectionAttempt() {
         guard let manager = self.centralManager else { return }
 
+        // Prefer connecting by CoreBluetooth identifier: a bonded RNode can be retrieved by
+        // UUID and connected directly without scanning — and it is immune to duplicate or
+        // changed advertised names. Falls through to the name path if the id isn't retrievable.
+        if let targetId = self.targetDeviceIdentifier,
+           let known = manager.retrievePeripherals(withIdentifiers: [targetId]).first {
+            self.logger.error("[BLETRANS] Retrieved peripheral by id \(targetId.uuidString, privacy: .public) — connecting (no scan)")
+            self.peripheral = known
+            known.delegate = self.delegateWrapper
+            manager.connect(known, options: nil)
+            self.startConnectionTimeout()
+            return
+        }
+
         // Reuse an already-connected peripheral instead of scanning. A peripheral
         // that is already connected (CoreBluetooth restored it across an app/NE
         // relaunch via state preservation, or it simply never dropped) does NOT
@@ -170,12 +195,16 @@ public final class BLETransport: Transport {
         // delivering data while a fresh scan spins fruitlessly and the interface
         // never reaches `.connected`. `connect()` on an already-connected peripheral
         // re-fires didConnect, driving the normal discover → `.connected` flow.
-        if let target = self.targetDeviceName {
+        if self.targetDeviceName != nil || self.targetDeviceIdentifier != nil {
             let nusUUID = CBUUID(string: BLEConstants.NUS_SERVICE_UUID)
             let alreadyConnected = manager.retrieveConnectedPeripherals(withServices: [nusUUID])
-                .first { $0.name == target }
+                .first { p in
+                    if let id = self.targetDeviceIdentifier { return p.identifier == id }
+                    return p.name == self.targetDeviceName
+                }
                 ?? (self.peripheral?.state == .connected ? self.peripheral : nil)
             if let existing = alreadyConnected {
+                let target = self.targetDeviceName ?? self.targetDeviceIdentifier?.uuidString ?? "?"
                 self.logger.error("[BLETRANS] '\(target, privacy: .public)' already connected — reusing (no scan)")
                 self.peripheral = existing
                 existing.delegate = self.delegateWrapper
@@ -185,7 +214,7 @@ public final class BLETransport: Transport {
             }
         }
 
-        let isScanOnly = (self.targetDeviceName == nil)
+        let isScanOnly = (self.targetDeviceName == nil && self.targetDeviceIdentifier == nil)
 
         if isScanOnly {
             // Scan-only mode (device picker): scan ALL devices so RNodes that
@@ -199,7 +228,8 @@ public final class BLETransport: Transport {
             // Targeted mode: scan without service filter because many RNodes
             // don't advertise the NUS service UUID in BLE advertisement packets.
             // We filter by peripheral name instead (in handleDiscoveredPeripheral).
-            self.logger.error("[BLETRANS] Scanning for peripheral named '\(self.targetDeviceName ?? "", privacy: .public)'")
+            let label = self.targetDeviceName ?? self.targetDeviceIdentifier?.uuidString ?? ""
+            self.logger.error("[BLETRANS] Scanning for peripheral '\(label, privacy: .public)'")
             manager.scanForPeripherals(
                 withServices: nil,
                 options: [CBCentralManagerScanOptionAllowDuplicatesKey: false]
@@ -207,7 +237,7 @@ public final class BLETransport: Transport {
         }
 
         // Start connection timeout (only for targeted connections, not scan-only)
-        if self.targetDeviceName != nil {
+        if !isScanOnly {
             self.startConnectionTimeout()
         }
     }
@@ -322,7 +352,7 @@ public final class BLETransport: Transport {
 
             manager.stopScan()
 
-            let isScanOnly = (self.targetDeviceName == nil)
+            let isScanOnly = (self.targetDeviceName == nil && self.targetDeviceIdentifier == nil)
             if isScanOnly {
                 manager.scanForPeripherals(
                     withServices: nil,
@@ -466,18 +496,22 @@ public final class BLETransport: Transport {
             self?.onPeripheralDiscovered?(peripheral, rssi)
         }
 
-        // If no target device name, we're in scan-only mode — don't auto-connect
-        guard let targetName = targetDeviceName else {
+        // If no target name AND no target identifier, we're in scan-only mode — don't auto-connect.
+        guard targetDeviceName != nil || targetDeviceIdentifier != nil else {
             return
         }
 
-        // Filter by device name
-        guard peripheral.name == targetName else {
-            return
+        // Match by identifier first (robust to duplicate / changed advertised names), then name.
+        let matches: Bool
+        if let targetId = targetDeviceIdentifier {
+            matches = peripheral.identifier == targetId
+        } else {
+            matches = peripheral.name == targetDeviceName
         }
+        guard matches else { return }
 
         // Stop scanning and connect
-        logger.error("[BLETRANS] Name match! Connecting to '\(name, privacy: .public)'")
+        logger.error("[BLETRANS] Match! Connecting to '\(name, privacy: .public)'")
         centralManager?.stopScan()
         self.peripheral = peripheral
         centralManager?.connect(peripheral, options: nil)

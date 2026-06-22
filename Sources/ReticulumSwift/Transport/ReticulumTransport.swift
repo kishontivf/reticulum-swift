@@ -705,10 +705,14 @@ public actor ReticulumTransport {
         for (_, iface) in interfaces {
             let state = iface.state
             let config = iface.config
-            // Get error description from TCPInterface if available
+            // Get error description from TCP / RNode interfaces if available, so the NE
+            // snapshot carries an actionable reason (e.g. "firmware too old", "Invalid
+            // configuration — TX power…") instead of a bare offline flag.
             let errorDesc: String?
             if let tcp = iface as? TCPInterface {
                 errorDesc = await tcp.lastErrorDescription
+            } else if let rnode = iface as? RNodeInterface {
+                errorDesc = await rnode.lastErrorDescription
             } else {
                 errorDesc = nil
             }

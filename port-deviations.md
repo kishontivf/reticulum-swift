@@ -45,6 +45,24 @@ fired from both kinds of trigger indistinguishably; the iOS app needs to
 gate them independently behind separate user-facing settings
 (`auto_announce_on_peer_spawned` vs `auto_announce_on_tcp_reconnect`).
 
+### `ReticulumTransport.getInterfaceSnapshots` — status introspection (new feature)
+
+**Sites:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`getInterfaceSnapshots()` returning `[InterfaceSnapshot]`; forwards
+`lastErrorDescription` from `TCPInterface` and (added) `RNodeInterface`.
+
+**Python reference:** No equivalent. Python `RNS.Transport` has no
+status-snapshot API and no per-interface `lastErrorDescription`; app code
+inspects `RNS.Transport.interfaces` and the interface objects directly.
+
+**Reason:** Category (b) — new feature for the swift app surface. The iOS app
+(Columba) reads interface status across the app↔NetworkExtension process
+boundary (IPC) to drive the Settings connection badges, and needs an actionable
+failure reason per interface. `lastErrorDescription` forwarding was already
+wired for `TCPInterface`; extended to `RNodeInterface` so a Model-B RNode
+surfaces reasons like "Invalid configuration — TX power may exceed device
+limits" instead of a bare offline flag.
+
 ### `TCPInterface.beginTunnelMode(send:)` / `endTunnelMode()` — VPN-extension hook (new feature)
 
 **Sites:** `Sources/ReticulumSwift/Interfaces/TCPInterface.swift` —
