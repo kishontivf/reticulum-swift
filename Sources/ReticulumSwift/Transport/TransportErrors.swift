@@ -62,6 +62,12 @@ public enum TransportError: Error, Sendable, Equatable {
     /// The reason describes what is wrong with the packet.
     case invalidPacket(reason: String)
 
+    /// A configuration value supplied to the transport is invalid.
+    ///
+    /// Used e.g. when a remote-management ACL entry is not a 16-byte
+    /// truncated identity hash. The reason describes what is wrong.
+    case invalidConfiguration(reason: String)
+
     /// TCP connection timed out before establishing.
     ///
     /// The remote host did not respond within the timeout period.
@@ -90,6 +96,8 @@ public enum TransportError: Error, Sendable, Equatable {
         case (.sendFailed(let lhsId, let lhsErr), .sendFailed(let rhsId, let rhsErr)):
             return lhsId == rhsId && lhsErr == rhsErr
         case (.invalidPacket(let lhsReason), .invalidPacket(let rhsReason)):
+            return lhsReason == rhsReason
+        case (.invalidConfiguration(let lhsReason), .invalidConfiguration(let rhsReason)):
             return lhsReason == rhsReason
         case (.connectionTimedOut(let lhsHost, let lhsPort), .connectionTimedOut(let rhsHost, let rhsPort)):
             return lhsHost == rhsHost && lhsPort == rhsPort
@@ -122,6 +130,8 @@ extension TransportError: LocalizedError {
             return "Send failed on interface \(interfaceId): \(underlying)"
         case .invalidPacket(let reason):
             return "Invalid packet: \(reason)"
+        case .invalidConfiguration(let reason):
+            return "Invalid transport configuration: \(reason)"
         case .connectionTimedOut(let host, let port):
             return "Connection timed out to \(host):\(port)"
         case .connectionWaiting(let host, let port, let reason):

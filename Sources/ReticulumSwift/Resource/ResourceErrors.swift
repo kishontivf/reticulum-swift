@@ -70,6 +70,15 @@ public enum ResourceError: Error, Sendable, Equatable {
     /// - Parameter partIndex: The index of the part that failed validation.
     case hashmapMismatch(partIndex: Int)
 
+    /// Assembled resource is corrupt.
+    ///
+    /// Thrown by `assemble()` when the per-segment integrity hash does not match
+    /// (RNS/Resource.py:715) or the decompressed bz2 stream exceeds the maximum
+    /// decompressed size (RNS/Resource.py:688-692). The Resource's `state` is set
+    /// to `.corrupt` and `corruptReason` records which case occurred; the Link
+    /// reads `corruptReason` to choose teardown vs. quiet conclusion.
+    case corruptResource
+
     /// Transfer window exhausted without progress.
     ///
     /// All outstanding parts in the window have timed out without
@@ -170,6 +179,8 @@ public enum ResourceError: Error, Sendable, Equatable {
             return lhsIndex == rhsIndex
         case (.hashmapMismatch(let lhsIndex), .hashmapMismatch(let rhsIndex)):
             return lhsIndex == rhsIndex
+        case (.corruptResource, .corruptResource):
+            return true
         case (.windowExhausted, .windowExhausted):
             return true
         case (.advertisementFailed(let lhsReason), .advertisementFailed(let rhsReason)):
@@ -221,6 +232,8 @@ extension ResourceError: LocalizedError {
             return "Resource error: part \(index) is missing"
         case .hashmapMismatch(let partIndex):
             return "Resource error: hashmap validation failed for part \(partIndex)"
+        case .corruptResource:
+            return "Resource error: assembled resource is corrupt (integrity or decompression failure)"
         case .windowExhausted:
             return "Resource error: transfer window exhausted"
         case .advertisementFailed(let reason):

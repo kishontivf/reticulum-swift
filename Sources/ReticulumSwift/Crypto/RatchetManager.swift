@@ -173,6 +173,128 @@ public actor RatchetManager {
         self.latestRatchetTime = time
     }
 
+    /// Timestamp of the most recent ratchet generation/rotation.
+    ///
+    /// Surfaces RNS `Destination.latest_ratchet_time` (Destination.py:166) for the
+    /// `wire_read_ratchets` snapshot. 0 until the first ratchet is created.
+    public func latestTime() -> TimeInterval {
+        return latestRatchetTime
+    }
+
+    /// Public key bytes of the previous (second-newest) ratchet.
+    ///
+    /// Used to surface `previous_ratchet_id` after a rotation makes the prior
+    /// current ratchet the previous one (RNS `rotate_ratchets`, Destination.py:233).
+    ///
+    /// - Returns: 32-byte X25519 public key of `ratchets[1]`, or nil if < 2 ratchets.
+    public func previousRatchetPublicBytes() -> Data? {
+        guard ratchets.count >= 2 else { return nil }
+        return try? RatchetManager.publicBytes(from: ratchets[1])
+    }
+
+    /// Gated rotation honoring a per-destination interval and retained cap.
+    ///
+    /// Mirrors RNS `Destination.rotate_ratchets` (Destination.py:227-241): a new
+    /// newest ratchet is inserted only when `now > latestRatchetTime + interval`;
+    /// the prior current becomes the previous; the list is cleaned to the retained
+    /// cap and persisted. Unlike `rotateIfNeeded()` (which gates on the static
+    /// `RATCHET_INTERVAL`), this honours the destination's configured interval.
+    ///
+    /// - Parameters:
+    ///   - interval: Per-destination minimum rotation interval in seconds
+    ///     (RNS `Destination.ratchet_interval`).
+    ///   - retained: Per-destination retained-ratchet cap (RNS
+    ///     `Destination.retained_ratchets`).
+    /// - Returns: true if a new ratchet was inserted (the rotation gate opened).
+    @discardableResult
+    public func rotate(interval: TimeInterval, retained: Int) -> Bool {
+        let now = Date().timeIntervalSince1970
+        // RNS Destination.py:229 — if now > self.latest_ratchet_time+self.ratchet_interval
+        guard now > latestRatchetTime + interval else {
+            return false
+        }
+        // RNS Destination.py:231-235
+        let newKey = RatchetManager.generateRatchet()   // _generate_ratchet()
+        ratchets.insert(newKey, at: 0)                   // self.ratchets.insert(0, new_ratchet)
+        latestRatchetTime = now                          // self.latest_ratchet_time = now
+        cleanRatchets(retained: retained)                // self._clean_ratchets()
+        do {
+            try persist()                                // self._persist_ratchets()
+        } catch {
+            // Log but don't fail — keys are in memory
+        }
+        return true
+    }
+
+    /// Truncate the retained ratchet list to the retained cap.
+    ///
+    /// Mirrors RNS `Destination._clean_ratchets` (Destination.py:205-208) EXACTLY,
+    /// including the RNS quirk that the gate compares against `retained_ratchets`
+    /// but the truncation is to the static `RATCHET_COUNT` (512), NOT to the
+    /// retained cap. Faithfully preserved for interop (HARD RULE 1).
+    ///
+    /// - Parameter retained: The retained-ratchet cap gate.
+    public func cleanRatchets(retained: Int) {
+        // RNS Destination.py:206-207 — if len(self.ratchets) > self.retained_ratchets:
+        //                                  self.ratchets = self.ratchets[:Destination.RATCHET_COUNT]
+        if ratchets.count > retained {
+            ratchets = Array(ratchets.prefix(RatchetManager.RATCHET_COUNT))
+        }
+    }
+
+    // MARK: - Public persistence / reload (conformance-observable)
+
+    /// Persist the current in-memory ratchets to the signed on-disk store.
+    ///
+    /// Public wrapper over the private `persist()` so a conformance/instrument
+    /// caller can drive a REAL signed write. Mirrors RNS
+    /// `Destination._persist_ratchets` (RNS/Destination.py:210-225): the file is
+    /// `msgpack({"signature": sign(packed_ratchets), "ratchets": packed_ratchets})`,
+    /// written atomically.
+    ///
+    /// - Throws: `RatchetError.persistenceFailed` on a signing/write failure.
+    public func persistRatchets() throws {
+        try persist()
+    }
+
+    /// Reload ratchets from the signed on-disk store, replacing the in-memory list.
+    ///
+    /// Public wrapper over the private `load()` so a conformance/instrument caller
+    /// can drive a REAL signature-validated reload. Mirrors RNS
+    /// `Destination._reload_ratchets` (RNS/Destination.py:426-464): the signature is
+    /// validated before the ratchets are adopted; an invalid signature or malformed
+    /// blob THROWS (`RatchetError.signatureInvalid` / `.loadFailed`) so the caller
+    /// observes the reload failure. On success the in-memory list is replaced
+    /// byte-for-byte with the persisted keys. `latestRatchetTime` is intentionally
+    /// left untouched (RNS `_reload_ratchets` does not modify `latest_ratchet_time`).
+    ///
+    /// - Returns: the number of ratchets loaded.
+    /// - Throws: `RatchetError` if the file is missing, malformed, or fails the
+    ///   signature check.
+    @discardableResult
+    public func reloadRatchets() throws -> Int {
+        let loaded = try load()
+        self.ratchets = loaded
+        return loaded.count
+    }
+
+    /// Instrument-only: grow the in-memory ratchet list to `target` entries by
+    /// appending freshly generated ratchets.
+    ///
+    /// Mirrors repeatedly calling RNS `Identity._generate_ratchet()` and appending
+    /// to `Destination.ratchets` so a test can inflate the list PAST the retained
+    /// cap and then observe `cleanRatchets` truncating it to `RATCHET_COUNT`
+    /// (RNS/Destination.py:205-208 / :504-517 pad path). Not part of RNS's runtime
+    /// path; appends at the END so the current (newest, index 0) ratchet is
+    /// preserved. No-op when the list already holds at least `target` entries.
+    ///
+    /// - Parameter target: Desired total ratchet count after padding.
+    public func _padRatchets(to target: Int) {
+        while ratchets.count < target {
+            ratchets.append(RatchetManager.generateRatchet())
+        }
+    }
+
     // MARK: - Key Generation
 
     /// Generate a new X25519 private key for ratcheting.

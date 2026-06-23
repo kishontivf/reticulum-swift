@@ -124,6 +124,27 @@ struct AnnounceQueueEntry {
     }
 }
 
+/// Bytes of a received PROOF packet surfaced to a delivery-receipt callback.
+///
+/// Mirrors RNS `PacketReceipt.proof_packet` (RNS/Packet.py:498-537): when a PROOF
+/// matching a tracked packet hash arrives, RNS stashes the proof packet so a caller
+/// can read its `data` (the proof payload — a 64-byte IMPLICIT signature, or a
+/// 96-byte EXPLICIT `packet_hash || signature`) and its `raw` (the full encoded
+/// proof packet bytes). The swift delivery-receipt callback is `() async -> Void`
+/// and discards these bytes; the proof-carrying overloads
+/// (`send(packet:proofReceiptCallback:)` / `registerReceipt(hash:proofCallback:)`)
+/// surface them additively without changing the existing call sites.
+public struct ReceivedProofPacket: Sendable {
+    /// Proof payload bytes (`Packet.data` of the received PROOF packet).
+    public let data: Data
+    /// Full encoded PROOF packet bytes (`Packet.raw` — `Packet.encode()`).
+    public let raw: Data
+    public init(data: Data, raw: Data) {
+        self.data = data
+        self.raw = raw
+    }
+}
+
 public actor ReticulumTransport {
 
     // MARK: - Properties
@@ -136,6 +157,13 @@ public actor ReticulumTransport {
 
     /// Announce handler for processing received announces
     private let announceHandler: AnnounceHandler
+
+    /// Externally-registered announce handlers (RNS `Transport.announce_handlers`,
+    /// Transport.py:2465-2477). Populated via `registerAnnounceHandler`; the inbound
+    /// dispatch loop (`dispatchAnnounceToHandlers`) iterates this list for EVERY
+    /// accepted announce — including on leaf nodes with transport disabled — so apps
+    /// like LXMF (lxmf.delivery / lxmf.propagation handlers) are notified.
+    private var announceHandlers: [AnnounceHandlerProtocol] = []
 
     /// Announce table for scheduled retransmissions (Python Transport.announce_table)
     private let announceTable = AnnounceTable()
@@ -150,6 +178,47 @@ public actor ReticulumTransport {
     /// Used as transport_id in HEADER_2 retransmissions.
     /// Set when transport mode is enabled.
     public var transportIdentityHash: Data?
+
+    /// Whether an interface error should crash the instance (panic) versus be
+    /// logged and survived. Defaults false, matching RNS
+    /// (`Reticulum.panic_on_interface_error`, Reticulum.py:280). reticulum-swift
+    /// keeps this as instance-level posture state only — it does NOT actually
+    /// abort the process on a real interface error (see port-deviations.md); it
+    /// is surfaced for config round-trip parity with the bridge's
+    /// `wire_instance_posture`.
+    public var panicOnInterfaceError: Bool = false
+
+    /// Probe-responder destination (`rnstransport.probe`), or nil when
+    /// `respond_to_probes` is off. Mirrors `Transport.probe_destination`
+    /// (Transport.py:396-403). Registered via `registerProbeDestination`.
+    public private(set) var probeDestination: Destination?
+
+    /// Remote-management destination (`rnstransport.remote.management`), or nil
+    /// when remote management is off. Mirrors
+    /// `Transport.remote_management_destination` (Transport.py:252-258).
+    public private(set) var remoteManagementDestination: Destination?
+
+    /// Management destinations registered under the transport identity.
+    /// Mirrors `Transport.mgmt_destinations` (Transport.py:254/:401).
+    public private(set) var mgmtDestinations: [Destination] = []
+
+    /// Hashes of management destinations gated for ACL/handler lookups.
+    /// Mirrors `Transport.mgmt_hashes` (Transport.py:255). Only the
+    /// remote-management destination is added to `mgmt_hashes` in RNS (the
+    /// probe destination is appended to `mgmt_destinations` only).
+    public private(set) var mgmtHashes: [Data] = []
+
+    /// Whether this instance responds to probe requests
+    /// (`Reticulum.respond_to_probes`, Reticulum.py:543-558). Default false.
+    public private(set) var respondToProbes: Bool = false
+
+    /// Whether remote management is enabled
+    /// (`Reticulum.remote_management_enabled`, Reticulum.py:528-541). Default false.
+    public private(set) var remoteManagementEnabled: Bool = false
+
+    /// ACL of identity hashes (each exactly 16 bytes) permitted to use the
+    /// remote-management destination (`Transport.remote_management_allowed`).
+    public private(set) var remoteManagementAllowed: [Data] = []
 
     /// Task handle for periodic announce retransmission
     private var retransmissionTask: Task<Void, Never>?
@@ -229,9 +298,27 @@ public actor ReticulumTransport {
     /// E12: Pending local path requests (dest hash → receiving interface ID)
     private var pendingLocalPathRequests: [Data: String] = [:]
 
-    /// E13: Receipt-based proof validation
-    private var receipts: [(hash: Data, callback: @Sendable () async -> Void, timeout: Date)] = []
+    /// E13: Receipt-based proof validation.
+    ///
+    /// The stored callback carries the received PROOF packet's bytes
+    /// (`ReceivedProofPacket?`) so the proof-carrying overloads can surface
+    /// `proof_data`/`proof_raw`. The legacy `() async -> Void` registrations are
+    /// wrapped to ignore the argument, keeping existing call sites
+    /// (Columba/LXMFSwift delivery receipts) byte-for-byte unchanged.
+    private var receipts: [(hash: Data, callback: @Sendable (ReceivedProofPacket?) async -> Void, timeout: Date)] = []
     private let maxReceipts = 1024
+
+    /// Whether single-packet PROOFs emitted by this transport use the IMPLICIT
+    /// (signature-only, 64 B) or EXPLICIT (`packet_hash || signature`, 96 B) form.
+    ///
+    /// Mirrors RNS `Reticulum.should_use_implicit_proof()` (RNS/Reticulum.py:1699-1705,
+    /// default True at :256). RNS stores this as a process-global class attribute
+    /// (`Reticulum.__use_implicit_proof`); the swift port scopes it PER-TRANSPORT so
+    /// concurrent in-process peers (e.g. the conformance bridge hosting multiple wire
+    /// peers in one process) cannot cross-contaminate each other's proof policy. See
+    /// port-deviations.md. Read via `shouldUseImplicitProof()`, set via
+    /// `setUseImplicitProof(_:)`.
+    private var _useImplicitProof: Bool = true
 
     /// E16: Radio stats caching
     private var radioRssiCache: [(packetHash: Data, value: Double)] = []
@@ -324,6 +411,23 @@ public actor ReticulumTransport {
     /// Set the diagnostic callback (actor-isolated setter for cross-actor access).
     public func setOnDiagnostic(_ callback: @escaping @Sendable (String) -> Void) {
         self.onDiagnostic = callback
+    }
+
+    /// Whether single-packet PROOFs emitted by this transport use the IMPLICIT
+    /// (signature-only, 64 B) form. Mirrors RNS `Reticulum.should_use_implicit_proof()`
+    /// (RNS/Reticulum.py:1699-1705). Defaults True (RNS/Reticulum.py:256).
+    public func shouldUseImplicitProof() -> Bool {
+        return _useImplicitProof
+    }
+
+    /// Set the implicit/explicit single-packet PROOF policy for THIS transport.
+    /// When `false`, the SINGLE-destination opportunistic prove path emits the
+    /// EXPLICIT form `packet.getFullHash() || identity.sign(getFullHash())` (96 B);
+    /// when `true` (default) it emits the IMPLICIT signature-only form (64 B).
+    /// Mirrors flipping `Reticulum.__use_implicit_proof` (RNS/Reticulum.py:555-558),
+    /// but scoped per-transport (see port-deviations.md).
+    public func setUseImplicitProof(_ value: Bool) {
+        self._useImplicitProof = value
     }
 
     // MARK: - Initialization
@@ -601,10 +705,14 @@ public actor ReticulumTransport {
         for (_, iface) in interfaces {
             let state = iface.state
             let config = iface.config
-            // Get error description from TCPInterface if available
+            // Get error description from TCP / RNode interfaces if available, so the NE
+            // snapshot carries an actionable reason (e.g. "firmware too old", "Invalid
+            // configuration — TX power…") instead of a bare offline flag.
             let errorDesc: String?
             if let tcp = iface as? TCPInterface {
                 errorDesc = await tcp.lastErrorDescription
+            } else if let rnode = iface as? RNodeInterface {
+                errorDesc = await rnode.lastErrorDescription
             } else {
                 errorDesc = nil
             }
@@ -678,6 +786,104 @@ public actor ReticulumTransport {
 
         let hexFull = hash.map { String(format: "%02x", $0) }.joined()
         logger.info("registerDestination: hash=\(hexFull), destinations count=\(self.destinations.count)")
+    }
+
+    // MARK: - Probe / Remote-management destinations (Transport.py:252-258, :396-403)
+
+    /// Register the transport probe-responder destination, mirroring
+    /// `Transport.probe_destination` (Transport.py:396-403): an `IN`/`SINGLE`
+    /// destination `rnstransport.probe` under the transport identity with proof
+    /// strategy `PROVE_ALL` (0x23) and `accepts_links(False)`, tracked in
+    /// `mgmt_destinations` (the probe destination is NOT added to `mgmt_hashes`).
+    /// Idempotent. Triggered by the `respond_to_probes` knob; default off leaves
+    /// `probeDestination == nil`.
+    ///
+    /// The resulting destination hash is
+    /// `full_hash(full_hash("rnstransport.probe")[:10] + identity.hash)[:16]`
+    /// (matches `Destination.hash(identity:appName:aspects:)`).
+    ///
+    /// - Parameter identity: The transport identity the destination is owned by.
+    public func registerProbeDestination(identity: Identity) {
+        respondToProbes = true
+        guard probeDestination == nil else { return }
+
+        let dest = Destination(
+            identity: identity,
+            appName: "rnstransport",
+            aspects: ["probe"],
+            type: .single,
+            direction: .in
+        )
+        // Transport.py:399 — probe destination always responds with proofs.
+        try? dest.setProofStrategy(Destination.PROVE_ALL)
+        // RNS appends only to mgmt_destinations here (Transport.py:400).
+        probeDestination = dest
+        mgmtDestinations.append(dest)
+        // Make it routable so real probe requests reach it (Transport.py registers
+        // it as a live Destination under the transport identity).
+        registerDestination(dest)
+
+        let hex = dest.hash.map { String(format: "%02x", $0) }.joined()
+        logger.info("Registered transport probe destination \(hex, privacy: .public)")
+    }
+
+    /// Register the transport remote-management destination, mirroring
+    /// `Transport.remote_management_destination` (Transport.py:252-258): an
+    /// `IN`/`SINGLE` destination `rnstransport.remote.management` under the
+    /// transport identity, with `/status` and `/path` request handlers each
+    /// `ALLOW_LIST` (0x02) bound to the `remote_management_allowed` ACL,
+    /// tracked in both `mgmt_destinations` and `mgmt_hashes`. Idempotent.
+    /// Triggered by the `enable_remote_management` knob; default off registers
+    /// nothing.
+    ///
+    /// - Parameters:
+    ///   - identity: The transport identity the destination is owned by.
+    ///   - allowed: ACL of identity hashes (each exactly 16 bytes) permitted to
+    ///     issue requests. RNS truncated-hash length is `TRUNCATED_HASHLENGTH//8`.
+    /// - Throws: `TransportError.invalidConfiguration` if any ACL entry is not
+    ///   exactly 16 bytes.
+    public func registerRemoteManagementDestination(identity: Identity, allowed: [Data]) throws {
+        // Validate ACL entries are 16-byte (TRUNCATED_HASHLENGTH//8) hashes.
+        for entry in allowed where entry.count != TRUNCATED_HASH_LENGTH {
+            throw TransportError.invalidConfiguration(
+                reason: "remote_management_allowed hash must be \(TRUNCATED_HASH_LENGTH) bytes, got \(entry.count)"
+            )
+        }
+
+        remoteManagementEnabled = true
+        remoteManagementAllowed = allowed
+        guard remoteManagementDestination == nil else { return }
+
+        let dest = Destination(
+            identity: identity,
+            appName: "rnstransport",
+            aspects: ["remote", "management"],
+            type: .single,
+            direction: .in
+        )
+        // Stub response generators: remote status/path responses are not modeled
+        // (out of scope — only registration + ACL binding round-trips). RNS:
+        // remote_status_handler / remote_path_handler (Transport.py:253-254).
+        let noResponse: ResponseGenerator = { _, _, _, _, _, _ in .none }
+        try dest.registerRequestHandler(
+            path: "/status",
+            responseGenerator: noResponse,
+            allow: Destination.ALLOW_LIST,
+            allowedList: allowed
+        )
+        try dest.registerRequestHandler(
+            path: "/path",
+            responseGenerator: noResponse,
+            allow: Destination.ALLOW_LIST,
+            allowedList: allowed
+        )
+        remoteManagementDestination = dest
+        mgmtDestinations.append(dest)
+        mgmtHashes.append(dest.hash)
+        registerDestination(dest)
+
+        let hex = dest.hash.map { String(format: "%02x", $0) }.joined()
+        logger.info("Enabled remote management on \(hex, privacy: .public)")
     }
 
     /// Register a callback for when a link is established to a destination.
@@ -860,9 +1066,67 @@ public actor ReticulumTransport {
         return activeLinks[linkId] ?? pendingLinks[linkId]
     }
 
+    /// Inbound (responder) Links accepted for a destination.
+    ///
+    /// Mirrors RNS `Destination.links` (Destination.py:172), which is populated by
+    /// `incoming_link_request` (Destination.py:420-424) — the same append we perform in
+    /// `handleLinkRequest`. The conformance bridge's `wire_listener_link_status` uses this to
+    /// find the receiver-side link by destination hash and report its status, count and
+    /// teardown reason.
+    ///
+    /// Preferred source is the registered `Destination.links`. As a safety net (e.g. a link
+    /// whose destination is not in the `destinations` map), we filter the active responder
+    /// links by destination hash. `link.initiator` and `link.destination` are immutable
+    /// `Sendable` lets, so this stays a synchronous, non-isolated read.
+    ///
+    /// - Parameter destinationHash: The destination hash to look up.
+    /// - Returns: The responder Links for that destination, or `[]` if none.
+    public func linksForDestination(_ destinationHash: Data) -> [Link] {
+        if let destination = destinations[destinationHash] {
+            return destination.links
+        }
+        return activeLinks.values.filter { !$0.initiator && $0.destination.hash == destinationHash }
+    }
+
     /// Number of active links.
     public var activeLinkCount: Int {
         activeLinks.count
+    }
+
+    /// Enumerate every currently-active link.
+    ///
+    /// RNS tracks established links in `Transport.active_links`; the swift port keeps
+    /// them in the private `activeLinks` map. This accessor exposes the values so a
+    /// graceful-shutdown / process-exit path can tear every active link down with a
+    /// flushed LINKCLOSE (`Link.closeAndFlush`) — mirroring RNS's exit handler closing
+    /// links so peers observe DESTINATION_CLOSED instead of only a watchdog TIMEOUT.
+    /// Category (a) accessor over otherwise-private state.
+    public func activeLinkList() -> [Link] {
+        Array(activeLinks.values)
+    }
+
+    /// Graceful-shutdown teardown mirroring RNS `Transport.detach_interfaces`
+    /// (RNS/Transport.py:3076-3088): tear every active AND pending link down with a
+    /// flushed LINKCLOSE (`Link.closeAndFlush`, role-derived reason), then hold a
+    /// 150ms drain window so those teardown packets actually leave local transport
+    /// before the interfaces / process go away.
+    ///
+    /// Without the drain, `NWConnection.send` reports `.contentProcessed` (bytes
+    /// accepted into the framework's send buffer) but the process can exit before
+    /// they are flushed to the kernel/wire, so the peer never receives the LINKCLOSE
+    /// and falls back to a watchdog TIMEOUT instead of DESTINATION_CLOSED. RNS avoids
+    /// this with `if closed_links: time.sleep(0.15)` (Transport.py:3088); we mirror it.
+    public func detachInterfaces() async {
+        // Active links first, then pending links (RNS/Transport.py:3078-3084).
+        let links = Array(activeLinks.values) + Array(pendingLinks.values)
+        for link in links {
+            await link.closeAndFlush()
+        }
+        // "Provide a 150ms window to allow link teardown packets to leave local
+        // transport" (RNS/Transport.py:3086-3088).
+        if !links.isEmpty {
+            try? await Task.sleep(for: .milliseconds(150))
+        }
     }
 
     /// Number of pending links.
@@ -1045,10 +1309,21 @@ public actor ReticulumTransport {
         }
 
         if successCount == 0 {
+            // RNS Transport.outbound is best-effort and NEVER raises: it iterates
+            // every OUT interface, calls Transport.transmit (which wraps
+            // process_outgoing in try/except and only logs on error,
+            // RNS/Transport.py:1050-1087), and returns a `sent` bool — sent=False
+            // when no interface accepted the frame (RNS/Transport.py:1090-1326).
+            // Mirror that: surface a genuine per-interface send error so callers
+            // are not silently blind to it, but do NOT throw merely because no
+            // interface is connected/eligible yet (e.g. a registered TCP peer that
+            // has not finished connecting). Throwing noInterfacesAvailable here was
+            // a production divergence — an announce/send before a peer connects must
+            // not fail.
             if let error = lastError {
                 throw TransportError.sendFailed(interfaceId: "all", underlying: error.localizedDescription)
             } else {
-                throw TransportError.noInterfacesAvailable
+                logger.debug("sendRawBytes: no eligible interface accepted the frame — best-effort no-op (RNS outbound returns sent=False)")
             }
         }
     }
@@ -1098,9 +1373,18 @@ public actor ReticulumTransport {
     /// - Parameter packet: Packet to send
     /// - Throws: TransportError if send fails
     public func send(packet: Packet) async throws {
-        // Check if we have any interfaces
+        // RNS Transport.outbound is best-effort: with no eligible interface it
+        // simply returns sent=False and NEVER raises (RNS/Transport.py:1090-1326,
+        // tail `return sent`). Mirror that here — do NOT throw merely because no
+        // interface is registered/connected yet. This is production-relevant:
+        // a TCP server (or any interface) with no peer connected at send time
+        // must not make announce/transmit fail. The previous
+        // `throw noInterfacesAvailable` here diverged from RNS and surfaced as
+        // spurious failures on the conformance bridge's server side (where the
+        // listening parent's interface map can be momentarily empty/racing).
         guard !interfaces.isEmpty else {
-            throw TransportError.noInterfacesAvailable
+            logger.debug("send(packet:): no interfaces registered — best-effort no-op (RNS outbound returns sent=False)")
+            return
         }
 
         let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
@@ -1241,6 +1525,34 @@ public actor ReticulumTransport {
         }
     }
 
+    /// Send a packet and auto-register a PROOF-CARRYING receipt for proof-of-delivery.
+    ///
+    /// Additive overload of `send(packet:receiptCallback:)` whose callback receives
+    /// the matched PROOF packet's bytes (`ReceivedProofPacket`) so the caller can
+    /// read `proof_data`/`proof_raw` and classify IMPLICIT (64 B) vs EXPLICIT (96 B).
+    /// Same receipt-creation gate as the no-arg overload (Transport.py:947-958).
+    ///
+    /// - Parameters:
+    ///   - packet: Packet to send
+    ///   - proofReceiptCallback: Callback invoked with the received PROOF bytes
+    ///   - receiptTimeout: Receipt expiry in seconds (default 300)
+    /// - Throws: TransportError if send fails
+    public func send(
+        packet: Packet,
+        proofReceiptCallback: @escaping @Sendable (ReceivedProofPacket?) async -> Void,
+        receiptTimeout: TimeInterval = 300
+    ) async throws {
+        try await send(packet: packet)
+
+        if packet.header.packetType == .data,
+           packet.header.destinationType != .plain,
+           !PacketContext.isLinkContext(packet.context),
+           !PacketContext.isResourceContext(packet.context) {
+            let packetHash = packet.getTruncatedHash()
+            registerReceipt(hash: packetHash, timeout: receiptTimeout, proofCallback: proofReceiptCallback)
+        }
+    }
+
     /// Send link data packet on the link's attached interface.
     ///
     /// Link DATA packets are ALWAYS sent as HEADER_1 to the link's
@@ -1368,14 +1680,21 @@ public actor ReticulumTransport {
             }
         }
 
-        // If no interfaces succeeded, throw error
+        // RNS Transport.outbound's broadcast loop is best-effort: it calls
+        // Transport.transmit on every eligible interface and returns sent=False
+        // if none accepted the frame — it NEVER raises (RNS/Transport.py:1118-1326,
+        // transmit try/except at :1050-1087). Mirror that: surface a genuine
+        // per-interface send error, but do NOT throw merely because no interface
+        // is connected/eligible (which previously produced a spurious
+        // noInterfacesAvailable for sends issued before a peer connected).
         if successCount == 0 {
-            logger.error("sendToAllInterfaces failed: no interfaces succeeded")
             if let error = lastError {
+                logger.error("sendToAllInterfaces failed: no interfaces succeeded")
                 throw TransportError.sendFailed(interfaceId: "all", underlying: error.localizedDescription)
             } else {
-                throw TransportError.noInterfacesAvailable
+                logger.debug("sendToAllInterfaces: no eligible/connected interface — best-effort no-op (RNS outbound returns sent=False)")
             }
+            return
         }
 
         logger.info("Broadcast complete: \(successCount) interface(s)")
@@ -1720,7 +2039,13 @@ public actor ReticulumTransport {
                 // E13: Check receipts — Python checks ALL receipts regardless of reverse table match
                 if let idx = receipts.firstIndex(where: { $0.hash == destHash }) {
                     let receipt = receipts.remove(at: idx)
-                    Task { await receipt.callback() }
+                    // Surface the received PROOF packet's bytes (RNS receipt.proof_packet,
+                    // RNS/Packet.py:498-537): `data` is the proof payload (64 B implicit
+                    // signature or 96 B explicit packet_hash||signature), `raw` is the full
+                    // encoded proof packet. Legacy `() async -> Void` receipts wrap to
+                    // ignore the argument, so this is non-breaking.
+                    let proofPacket = ReceivedProofPacket(data: packet.data, raw: packet.encode())
+                    Task { await receipt.callback(proofPacket) }
                     handled = true
                 }
 
@@ -1874,6 +2199,12 @@ public actor ReticulumTransport {
 
             // Store link as pending (waiting for LRRTT to complete establishment)
             activeLinks[incomingRequest.linkId] = link
+            // Mirror RNS Destination.incoming_link_request (Destination.py:420-424):
+            // self.links.append(link). This makes the inbound responder link visible through
+            // Destination.links / Transport.linksForDestination, which the conformance bridge's
+            // wire_listener_link_status uses to report the receiver-side link, its count and
+            // teardown reason (e.g. observing INITIATOR_CLOSED on the non-initiating side).
+            destination.appendLink(link)
             // H2: Track which interface the link was established on
             await link.setAttachedInterface(interfaceId)
             logger.debug("Link \(linkIdHex) stored in activeLinks, awaiting LRRTT")
@@ -1934,13 +2265,25 @@ public actor ReticulumTransport {
             logger.info("Link \(hexPrefix) moved to activeLinks, total=\(self.activeLinks.count)")
 
         } catch {
-            // PROOF validation failed - close link
-            logger.error("PROOF processing failed: \(error.localizedDescription)")
-            await link.close(reason: .proofInvalid)
-            pendingLinks.removeValue(forKey: packet.destination)
+            // Only tear the link down if it is NOT already established. A duplicate or
+            // late LRPROOF — the SAME proof arriving via two interfaces on a shared
+            // medium / BLE mesh, which is exactly why LRPROOF dedup exists but is only
+            // recorded AFTER processProof succeeds (above) — makes processProof throw an
+            // invalid-STATE error, because the first copy already promoted the link to
+            // .active. That is not a bad proof: closing here would flap a just-
+            // established link and emit a spurious LINKCLOSE to the peer. RNS gates proof
+            // validation on `status == PENDING` and silently ignores a proof otherwise.
+            if await link.state.isEstablished {
+                let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.warning("Ignoring duplicate/late LRPROOF on already-established link \(hexPrefix, privacy: .public)...: \(error.localizedDescription, privacy: .public)")
+            } else {
+                logger.error("PROOF processing failed: \(error.localizedDescription)")
+                await link.close(reason: .proofInvalid)
+                pendingLinks.removeValue(forKey: packet.destination)
 
-            let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
-            logger.warning("Link \(hexPrefix, privacy: .public)... PROOF validation failed: \(error.localizedDescription, privacy: .public)")
+                let hexPrefix = packet.destination.prefix(4).map { String(format: "%02x", $0) }.joined()
+                logger.warning("Link \(hexPrefix, privacy: .public)... PROOF validation failed: \(error.localizedDescription, privacy: .public)")
+            }
         }
     }
 
@@ -2041,14 +2384,22 @@ public actor ReticulumTransport {
         }
 
         // LINKCLOSE (0xFC) - peer closing the link (encrypted)
-        // Python sends encrypted(link_id) and validates plaintext == link_id on receive
+        // Python sends encrypted(link_id) and validates plaintext == link_id on receive.
+        // Delegate to Link.handleClose, which mirrors RNS teardown_packet (Link.py:710-722):
+        //   - re-validates plaintext == link_id,
+        //   - sets teardown_reason = initiator ? DESTINATION_CLOSED : INITIATOR_CLOSED
+        //     (role-correct; the old close(reason:.destinationClosed) HARDCODED the reason,
+        //      mislabeling a responder's received close as DESTINATION_CLOSED),
+        //   - runs link_closed cleanup but emits NO LINKCLOSE packet (the old close() path
+        //     re-emitted a redundant LINKCLOSE on every received close; RNS teardown_packet
+        //     sends nothing — only the locally-initiated teardown() emits a packet).
         if packet.context == LinkConstants.CONTEXT_LINKCLOSE {
             logger.debug("LINKCLOSE packet detected (context=0xFC)")
             do {
                 let plaintext = try await link.decrypt(packet.data)
                 let expectedLinkId = await link.linkId
                 if plaintext == expectedLinkId {
-                    await link.close(reason: .destinationClosed)
+                    await link.handleClose(plaintext)
                     activeLinks.removeValue(forKey: packet.destination)
                     let hexPrefix = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
                     logger.info("Link \(hexPrefix) closed by remote peer (verified)")
@@ -2099,14 +2450,24 @@ public actor ReticulumTransport {
         }
 
         // REQUEST (0x09) - incoming request from peer (encrypted)
-        // Python: link.decrypt(packet.data), unpack msgpack([timestamp, pathHash, data])
+        // Mirrors RNS Link.receive REQUEST branch (Link.py:1030-1040):
+        //   request_id      = packet.getTruncatedHash()   # computed on the WIRE packet, pre-decrypt
+        //   packed_request  = self.decrypt(packet.data)
+        //   unpacked_request= umsgpack.unpackb(packed_request)
+        //   handle_request(request_id, unpacked_request)
+        // The umsgpack unpack + ALLOW gating + generator fork live in Link.handleRequestPacket
+        // -> Link.handleRequest (Link.py:853-904) to keep the wire/RPC logic on the Link, exactly
+        // as RNS does. We compute request_id from the inbound packet's truncated hash before
+        // decrypting, then hand the plaintext to the Link.
         if packet.context == RequestPacketContext.request {
             logger.debug("REQUEST packet detected (context=0x09), dataLen=\(packet.data.count)")
+            // request_id is derived from the wire packet (RNS reads getTruncatedHash on the
+            // received packet, NOT on the plaintext), so capture it before decrypt.
+            let requestId = packet.getTruncatedHash()
             do {
                 let plaintext = try await link.decrypt(packet.data)
-                logger.debug("Decrypted REQUEST: \(plaintext.count) bytes")
-                // TODO: Route to request handler when we implement server-side request handling
-                // For now, log and ignore (we're typically the client, not the server)
+                logger.debug("Decrypted REQUEST: \(plaintext.count) bytes, requestId=\(requestId.prefix(8).map { String(format: "%02x", $0) }.joined())")
+                await link.handleRequestPacket(plaintext, requestId: requestId)
             } catch {
                 logger.error("Failed to decrypt REQUEST: \(error.localizedDescription)")
             }
@@ -2114,26 +2475,22 @@ public actor ReticulumTransport {
         }
 
         // RESPONSE (0x0A) - response to our request (encrypted)
-        // Python: link.decrypt(packet.data), unpack msgpack([requestId, responseData])
+        // Mirrors RNS Link.receive RESPONSE branch (Link.py:1042-1054):
+        //   packed_response   = self.decrypt(packet.data)
+        //   unpacked_response = umsgpack.unpackb(packed_response)   # [request_id, response_data]
+        //   handle_response(request_id, response_data, ...)
+        // The umsgpack unpack + RAW-payload extraction now live in Link.handleResponsePacket
+        // (Link.py:906-925). This is the double-frame fix: the previous inline path here
+        // re-packed the already-decoded response value (`packMsgPack(elements[1])`), which
+        // re-added an msgpack bin frame so the receipt held [0xc4,len,...] instead of the raw
+        // payload. Delegating to the Link keeps the sub-MDU packet path and the >MDU
+        // response-Resource conclude path agreeing on the exact wire-observable bytes.
         if packet.context == RequestPacketContext.response {
             logger.debug("RESPONSE packet detected (context=0x0A), dataLen=\(packet.data.count)")
             do {
                 let plaintext = try await link.decrypt(packet.data)
                 logger.debug("Decrypted RESPONSE: \(plaintext.count) bytes")
-
-                // Unpack msgpack([requestId, responseData])
-                // responseData can be ANY msgpack type (array, binary, map, etc.)
-                // Re-pack elements[1] back to bytes for the receipt handler
-                if let value = try? unpackMsgPack(plaintext),
-                   case .array(let elements) = value,
-                   elements.count >= 2,
-                   case .binary(let requestId) = elements[0] {
-                    let responseData = packMsgPack(elements[1])
-                    logger.debug("RESPONSE for request \(requestId.prefix(8).map { String(format: "%02x", $0) }.joined()), data=\(responseData.count) bytes")
-                    await link.handleRequestResponse(requestId: requestId, data: responseData)
-                } else {
-                    logger.warning("Failed to parse RESPONSE msgpack from plaintext \(plaintext.count) bytes")
-                }
+                await link.handleResponsePacket(plaintext)
             } catch {
                 logger.error("Failed to decrypt RESPONSE: \(error.localizedDescription)")
             }
@@ -2152,6 +2509,31 @@ public actor ReticulumTransport {
             // Try generic packet callback first (Python: link.set_packet_callback)
             // LXST and other protocols use this for raw per-link data delivery
             let delivered = await link.deliverToPacketCallback(data: plaintext, packet: packet)
+
+            // DATA auto-prove. Mirrors RNS Link.receive context==NONE branch (Link.py:998-1008):
+            // after delivering the plaintext to the packet callback, consult the destination's
+            // proof_strategy and prove the inbound packet accordingly.
+            //   PROVE_ALL -> always prove
+            //   PROVE_APP -> prove iff destination.proof_requested(packet) returns true
+            //   PROVE_NONE (default) -> do nothing
+            // This is purely ADDITIVE: every existing Columba/LXMF destination leaves
+            // proof_strategy at the PROVE_NONE default, so the regular link-DATA path is
+            // unchanged. RNS passes the still-encrypted wire packet to the proof_requested
+            // callback (the app decrypts it itself), so we pass `packet` here too. provePacket()
+            // guards against initiator-side proving internally, hence `try?`. Runs whether or not
+            // the packet callback consumed the data, matching RNS (proof is outside the
+            // callback branch). Note this is the LINK-DATA path; the opportunistic SINGLE-
+            // destination prove (handleRegularData, proof after local delivery) is a separate
+            // code path and is not double-fired here.
+            let proofStrategy = link.destination.proofStrategy
+            if proofStrategy == Destination.PROVE_ALL {
+                try? await link.provePacket(packet)
+            } else if proofStrategy == Destination.PROVE_APP {
+                if link.destination.proofRequestedCallback?(packet) ?? false {
+                    try? await link.provePacket(packet)
+                }
+            }
+
             if delivered {
                 logger.debug("Delivered to packet callback, dataLen=\(plaintext.count)")
                 return
@@ -2344,7 +2726,7 @@ public actor ReticulumTransport {
         // Python Transport calls packet.prove() after local delivery for SINGLE destinations.
         // Proof format: HEADER_1 / PROOF / BROADCAST / SINGLE
         //   destination = packet.getTruncatedHash() (16 bytes)
-        //   data        = identity.sign(packet.getFullHash()) (64 bytes)
+        //   data        = proof_data (see implicit/explicit branch below)
         //
         // Reference: Python RNS/Packet.py ProofDestination.type = RNS.Destination.SINGLE.
         // The destinationType MUST be .single (not .plain) — the wire-format flag is set
@@ -2353,8 +2735,42 @@ public actor ReticulumTransport {
         if packet.header.destinationType == .single,
            let identity = destination.identity,
            identity.hasPrivateKeys {
+            // RNS Transport.py:2156-2165: after local delivery, emit a proof for an
+            // opportunistic SINGLE packet ONLY as the destination's proof_strategy
+            // dictates — the default PROVE_NONE proves nothing, PROVE_ALL always
+            // proves, and PROVE_APP consults the proof_requested callback. This mirrors
+            // the link-DATA prove gate above (RNS Link.receive context==NONE branch).
+            //
+            // Previously this path proved unconditionally whenever the destination held
+            // private keys. That diverged from RNS (which never proves opportunistic
+            // SINGLE packets at PROVE_NONE) and double-proved LXMF opportunistic
+            // delivery: LXMF-swift's deliveryPacket callback already emits the delivery
+            // proof, exactly as python LXMF keeps its delivery destination at the
+            // PROVE_NONE default and calls packet.prove() inside delivery_packet
+            // (LXMF/LXMRouter.py:1823). Gating here restores RNS fidelity without
+            // dropping Columba/LXMF delivery proofs (those come from the callback).
+            let proofStrategy = destination.proofStrategy
+            let shouldProve: Bool
+            switch proofStrategy {
+            case Destination.PROVE_ALL:
+                shouldProve = true
+            case Destination.PROVE_APP:
+                shouldProve = destination.proofRequestedCallback?(packet) ?? false
+            default:                       // PROVE_NONE (default) — no opportunistic proof
+                shouldProve = false
+            }
+            guard shouldProve else { return }
             do {
-                let signature = try identity.sign(packet.getFullHash())
+                // RNS Identity.prove (RNS/Identity.py:959-970): sign the FULL packet hash,
+                // then select the proof payload by the implicit-proof policy:
+                //   implicit (default) -> proof_data = signature                  (64 B)
+                //   explicit           -> proof_data = packet_hash || signature    (96 B)
+                // `packet.getFullHash()` is RNS `packet.packet_hash`; the explicit form
+                // concatenates the full (NOT truncated) hash before the signature so the
+                // sender's PacketReceipt.validate_proof accepts it.
+                let fullHash = packet.getFullHash()
+                let signature = try identity.sign(fullHash)
+                let proofData: Data = _useImplicitProof ? signature : (fullHash + signature)
                 let proofHeader = PacketHeader(
                     headerType: .header1,
                     hasContext: false,
@@ -2369,7 +2785,7 @@ public actor ReticulumTransport {
                     destination: packet.getTruncatedHash(),
                     transportAddress: nil,
                     context: 0x00,
-                    data: signature
+                    data: proofData
                 )
                 let encoded = proofPacket.encode()
                 // Route through sendToInterface (NOT interface.send directly) so applyIFAC
@@ -2436,6 +2852,14 @@ public actor ReticulumTransport {
             logger.debug("Announce ignored (\(String(describing: reason), privacy: .public)) for \(hexPrefix, privacy: .public)...")
 
         case .recorded(let destHash):
+            // RNS Transport.py:2034-2086 — dispatch every accepted announce
+            // (should_add==True) to externally-registered announce handlers. This
+            // runs for EVERY accepted announce regardless of transport_enabled (it
+            // is NOT gated on the rebroadcast block below), so leaf nodes still
+            // deliver to app handlers (e.g. LXMF lxmf.delivery / lxmf.propagation).
+            // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
+            await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
+
             // C17: Check pending discovery path requests on announce arrival
             if transportEnabled, let prEntry = discoveryPathRequests.removeValue(forKey: destHash) {
                 if let prInterfaceId = prEntry.requestingInterfaceId {
@@ -2471,6 +2895,13 @@ public actor ReticulumTransport {
         case .recordedAndRebroadcast(let destHash, let rebroadcastPacket):
             let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
             let isLocal = isLocalDestination(destHash)
+
+            // RNS Transport.py:2034-2086 — dispatch every accepted announce to
+            // externally-registered handlers. MUST run here, OUTSIDE/BEFORE the
+            // `if transportEnabled || isLocal` rebroadcast block below, so it fires
+            // for every should_add==True announce regardless of transport_enabled.
+            // The ORIGINAL packet is passed so announce_packet_hash == packet hash.
+            await dispatchAnnounceToHandlers(packet: packet, destinationHash: destHash)
 
             // L2: Local rebroadcast detection (moved here, after validation)
             // For HEADER_2 announces, check if this is our own rebroadcast heard back
@@ -2785,6 +3216,11 @@ public actor ReticulumTransport {
     private func periodicTableCleanup() async {
         tableCullCounter += 1
         guard tableCullCounter % 5 == 0 else { return }
+        // Mirror python Transport.jobs() (Transport.py:778-785): cull paths that have
+        // expired OR whose attached interface is no longer present. Keeping the
+        // interface-absent cull is correct — the BLE boot/transient path-loss is fixed
+        // at the right layer (per-peer interface lifecycle: grace-period detach + reuse,
+        // matching ble-reticulum), not by weakening this sweep.
         let activeIds = Set(interfaces.keys)
         await pathTable.cleanup(activeInterfaceIds: activeIds)
         await cleanupLinks()
@@ -3030,8 +3466,26 @@ public actor ReticulumTransport {
     ///   - timeout: Expiry time in seconds (default 300)
     ///   - callback: Async callback to invoke when proof matches
     public func registerReceipt(hash: Data, timeout: TimeInterval = 300, callback: @escaping @Sendable () async -> Void) {
+        // Wrap the legacy no-arg callback into the proof-carrying storage form,
+        // discarding the proof bytes. Keeps existing call sites unchanged.
+        registerReceipt(hash: hash, timeout: timeout) { _ in await callback() }
+    }
+
+    /// E13 (proof-carrying): register a receipt whose callback receives the matched
+    /// PROOF packet's bytes (`ReceivedProofPacket`), or `nil` if unavailable.
+    ///
+    /// Additive overload of `registerReceipt(hash:timeout:callback:)` that surfaces
+    /// `proof_data`/`proof_raw` (RNS `receipt.proof_packet`, RNS/Packet.py:498-537)
+    /// for callers that need to classify the proof as IMPLICIT (64 B) vs EXPLICIT
+    /// (96 B). The no-arg overload above wraps onto this same storage.
+    ///
+    /// - Parameters:
+    ///   - hash: 16-byte truncated packet hash to match
+    ///   - timeout: Expiry time in seconds (default 300)
+    ///   - proofCallback: Async callback invoked with the received PROOF bytes
+    public func registerReceipt(hash: Data, timeout: TimeInterval = 300, proofCallback: @escaping @Sendable (ReceivedProofPacket?) async -> Void) {
         if receipts.count >= maxReceipts { receipts.removeFirst() }
-        receipts.append((hash: hash, callback: callback, timeout: Date().addingTimeInterval(timeout)))
+        receipts.append((hash: hash, callback: proofCallback, timeout: Date().addingTimeInterval(timeout)))
     }
 
     // MARK: - Path Table Access
@@ -3062,6 +3516,171 @@ public actor ReticulumTransport {
     /// Used for testing and advanced operations.
     public func getAnnounceHandler() -> AnnounceHandler {
         return announceHandler
+    }
+
+    // MARK: - External Announce Handlers (RNS register_announce_handler)
+
+    /// `Transport.register_announce_handler(handler)` (Transport.py:2465-2477).
+    ///
+    /// RNS only registers a handler that HAS an `aspect_filter` attribute
+    /// (`if hasattr(handler, "aspect_filter")`); the swift port models that guard
+    /// via `handler.hasAspectFilter`. A handler without an aspect filter is NOT
+    /// registered and the call returns `false` (no observer is wired). The handler
+    /// is retained for the dispatch loop until `deregisterAnnounceHandler`.
+    ///
+    /// - Returns: `true` if the handler was registered (had an aspect filter).
+    @discardableResult
+    public func registerAnnounceHandler(_ handler: AnnounceHandlerProtocol) -> Bool {
+        // RNS Transport.py:2476-2477 — guard on hasattr(handler, "aspect_filter").
+        guard handler.hasAspectFilter else { return false }
+        announceHandlers.append(handler)
+        return true
+    }
+
+    /// `Transport.deregister_announce_handler(handler)` (Transport.py:2481-2489):
+    /// remove every registration of `handler` by identity.
+    public func deregisterAnnounceHandler(_ handler: AnnounceHandlerProtocol) {
+        announceHandlers.removeAll { $0 === handler }
+    }
+
+    /// Number of currently-registered external announce handlers (observability).
+    public var announceHandlerCount: Int {
+        announceHandlers.count
+    }
+
+    /// Dispatch an accepted announce to every externally-registered handler,
+    /// faithfully porting the RNS inbound dispatch loop (Transport.py:2034-2086).
+    ///
+    /// For each handler:
+    ///   1. recall the announced identity / app_data from the process-global
+    ///      `known_destinations` populated by `AnnounceHandler.process`'s
+    ///      unconditional `Identity.remember` (Transport.py:2037,2058);
+    ///   2. evaluate the aspect filter — `aspectFilter == nil` matches all,
+    ///      otherwise `Destination.hash_from_name_and_identity(aspectFilter,
+    ///      announcedIdentity) == destinationHash` (Transport.py:2040-2047);
+    ///   3. apply the PATH_RESPONSE delivery gate — a PATH_RESPONSE-context
+    ///      announce is delivered only to handlers with `receivePathResponses`
+    ///      (Transport.py:2049-2053);
+    ///   4. select the callback arity (3/4/5) — 4+ additionally receive
+    ///      `announce_packet_hash = packet.packet_hash`, 5 additionally receive
+    ///      `is_path_response` (Transport.py:2055-2069);
+    ///   5. isolate exceptions per-handler so a raising handler cannot block a
+    ///      later one (Transport.py:2083-2086).
+    ///
+    /// RNS spawns a daemon thread per delivery; the swift port runs the recording
+    /// synchronously inside the actor (observably equivalent and race-free for the
+    /// poll-based conformance tests — see port-deviations.md).
+    private func dispatchAnnounceToHandlers(packet: Packet, destinationHash: Data) async {
+        guard !announceHandlers.isEmpty else { return }
+
+        // RNS Transport.py:2037 — announce_identity = Identity.recall(dest, _no_use=True)
+        let announcedIdentity = Identity.recall(destinationHash)
+        // RNS Transport.py:2058 — app_data = Identity.recall_app_data(dest, _no_use=True)
+        let appData = Identity.recallAppData(destinationHash)
+        // RNS Transport.py:2061 — announce_packet_hash = packet.packet_hash
+        let announcePacketHash = packet.getFullHash()
+        // RNS Transport.py:2050 — packet.context == RNS.Packet.PATH_RESPONSE
+        let isPathResponse = packet.context == PacketContext.PATH_RESPONSE
+
+        for handler in announceHandlers {
+            do {
+                // RNS Transport.py:2040-2047 — aspect_filter match.
+                var executeCallback = false
+                if handler.aspectFilter == nil {
+                    executeCallback = true
+                } else if let filter = handler.aspectFilter,
+                          let expectedHash = announceHandlerExpectedHash(
+                              aspectFilter: filter, identity: announcedIdentity
+                          ),
+                          expectedHash == destinationHash {
+                    executeCallback = true
+                }
+
+                // RNS Transport.py:2049-2053 — PATH_RESPONSE delivery gate.
+                if isPathResponse && !handler.receivePathResponses {
+                    executeCallback = false
+                }
+
+                guard executeCallback else { continue }
+
+                // RNS Transport.py:2055-2069 — arity-selected delivery.
+                switch handler.callbackParameterCount {
+                case 3:
+                    try handler.receivedAnnounce(
+                        destinationHash: destinationHash,
+                        announcedIdentity: announcedIdentity,
+                        appData: appData,
+                        announcePacketHash: nil,
+                        isPathResponse: nil
+                    )
+                case 4:
+                    try handler.receivedAnnounce(
+                        destinationHash: destinationHash,
+                        announcedIdentity: announcedIdentity,
+                        appData: appData,
+                        announcePacketHash: announcePacketHash,
+                        isPathResponse: nil
+                    )
+                case 5:
+                    try handler.receivedAnnounce(
+                        destinationHash: destinationHash,
+                        announcedIdentity: announcedIdentity,
+                        appData: appData,
+                        announcePacketHash: announcePacketHash,
+                        isPathResponse: isPathResponse
+                    )
+                default:
+                    // RNS Transport.py:2071 — raise TypeError("Invalid signature ...")
+                    logger.error("Announce handler has invalid callback arity \(handler.callbackParameterCount)")
+                }
+            } catch {
+                // RNS Transport.py:2083-2086 — per-handler exception isolation.
+                logger.error("Error while processing external announce callback: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// `Destination.hash_from_name_and_identity(full_name, identity)`
+    /// (Destination.py:139-148): split the dotted aspect filter into
+    /// `app_and_aspects_from_name` (`components[0]`, `components[1:]`) then
+    /// `Destination.hash(identity, app_name, *aspects)`. Returns nil only when
+    /// the announced identity is nil AND the filter targets an identity-bearing
+    /// destination (no plausible match), matching RNS where a SINGLE destination
+    /// hash never equals the identity-less plain hash.
+    private func announceHandlerExpectedHash(aspectFilter: String, identity: Identity?) -> Data? {
+        // RNS Destination.app_and_aspects_from_name (Destination.py:133-138):
+        // full_name.split(".") — first component is the app name, rest are aspects.
+        let components = aspectFilter
+            .split(separator: ".", omittingEmptySubsequences: false)
+            .map(String.init)
+        guard let appName = components.first else { return nil }
+        let aspects = Array(components.dropFirst())
+        if let identity = identity {
+            return Destination.hash(identity: identity, appName: appName, aspects: aspects)
+        }
+        // RNS hash_from_name_and_identity with identity==None yields the plain
+        // (identity-less) hash; it cannot match an identity-bearing destination,
+        // so an unrecalled identity simply won't satisfy a non-nil aspect filter.
+        return Destination.plainHash(appName: appName, aspects: aspects)
+    }
+
+    // MARK: - Packet hashlist observability (RNS Transport.packet_hashlist)
+
+    /// Number of packet hashes currently retained in the dedup hashlist.
+    ///
+    /// RNS exposes `Transport.packet_hashlist` as a plain attribute; the swift
+    /// `PacketHashlist` is an actor held privately here, so this is a category-(a)
+    /// observability accessor (the bridge reads the count delta to prove a frame
+    /// was accepted and recorded). RNS ref: Transport.py:1469-1480 add_packet_hash.
+    public func packetHashlistCount() async -> Int {
+        await packetHashlist.count
+    }
+
+    /// Whether a given full packet hash is already recorded in the dedup hashlist.
+    /// (`PacketHashlist.shouldAccept` returns true for a NEW hash, so membership is
+    /// its negation.) RNS ref: Transport.py:1469-1480 packet_hashlist membership.
+    public func packetHashlistContains(_ hash: Data) async -> Bool {
+        await !packetHashlist.shouldAccept(hash)
     }
 
     /// Get the announce table for direct access.
@@ -3636,6 +4255,64 @@ extension ReticulumTransport {
                 await self.onInterfaceConnected?(id)
             }
         }
+    }
+
+    /// Synchronous public inbound entry, mirroring RNS `Transport.inbound(raw, interface)`.
+    ///
+    /// `handleReceivedData` (the delegate sink) runs the same IFAC pre-unpack
+    /// guards and parse, but dispatches `receive` on a detached `Task` — making
+    /// it fire-and-forget, which forces observers (e.g. the conformance bridge's
+    /// raw-frame injector) to sleep-and-poll for a deterministic result. This
+    /// entry instead `await`s `receive` to completion before returning, so the
+    /// caller can immediately observe learned state (`hasPath`, path/announce
+    /// tables) without a timing race.
+    ///
+    /// The IFAC pre-unpack drop guards live in `validateIFAC`
+    /// (RNS/Transport.py:1398-1447): on an IFAC-less interface a frame carrying
+    /// the IFAC flag is dropped; on an IFAC interface a frame missing the flag,
+    /// or shorter than `2 + ifac_size + 1`, is dropped; and a frame that fails
+    /// the recomputed-IFAC check is dropped.
+    ///
+    /// - Parameters:
+    ///   - frame: Raw wire bytes as received off the interface (IFAC-masked or not).
+    ///   - interfaceId: ID of the receiving interface.
+    /// - Returns: `true` if the frame passed IFAC validation, parsed into a
+    ///   packet, and was handed to the inbound pipeline; `false` if it was
+    ///   dropped by an IFAC pre-unpack guard or failed to parse.
+    /// - Python reference: RNS/Transport.py:1387-1447 (inbound IFAC pre-unpack guards).
+    @discardableResult
+    public func inbound(frame: Data, interface interfaceId: String) async -> Bool {
+        // Short-packet pre-unpack guard. RNS gates the whole IFAC/parse block on
+        // `if len(raw) > 2: ... else: return` (RNS/Transport.py:1397), dropping any
+        // frame too short to carry a 2-byte header + payload before it ever reaches
+        // validateIFAC (which only enforces the >2+ifac_size min-length on the
+        // IFAC-configured path).
+        guard frame.count > 2 else {
+            logger.debug("inbound: short-packet guard dropped \(frame.count) bytes from \(interfaceId)")
+            return false
+        }
+
+        // IFAC pre-unpack drop guards (flag-on-open, flag-missing, min-length,
+        // IFAC-mismatch). validateIFAC returns nil for any dropped frame and the
+        // IFAC-stripped, unmasked bytes otherwise.
+        guard let validated = validateIFAC(raw: frame, interfaceId: interfaceId) else {
+            logger.debug("inbound: IFAC pre-unpack guard dropped \(frame.count) bytes from \(interfaceId)")
+            return false
+        }
+
+        let packet: Packet
+        do {
+            packet = try Packet(from: validated)
+        } catch {
+            logger.debug("inbound: failed to parse \(validated.count) bytes from \(interfaceId): \(error.localizedDescription)")
+            return false
+        }
+
+        // Run the full inbound pipeline to completion (announce learning,
+        // transport relay, local delivery) before returning — unlike
+        // handleReceivedData which spawns a detached Task.
+        await receive(packet: packet, from: interfaceId)
+        return true
     }
 
     /// Internal handler for received data (actor-isolated).

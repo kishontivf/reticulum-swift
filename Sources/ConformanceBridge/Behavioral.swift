@@ -36,7 +36,8 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
     nonisolated(unsafe) private var _delegate: InterfaceDelegate?
     private let lock = NSLock()
 
-    init(id: String, name: String, mode: InterfaceMode, mtu: Int) {
+    init(id: String, name: String, mode: InterfaceMode, mtu: Int,
+         ifacKey: Data? = nil, ifacSize: Int = 0) {
         self.id = id
         self.config = InterfaceConfig(
             id: id,
@@ -46,7 +47,14 @@ final class BehavioralMockInterface: NetworkInterface, @unchecked Sendable {
             mode: mode,
             host: "mock",
             port: 0,
-            bitrate: max(mtu * 8, 0)
+            bitrate: max(mtu * 8, 0),
+            // IFAC (Interface Access Codes): when ifac_netname/ifac_netkey were
+            // supplied to behavioral_attach_mock_interface the 64-byte HKDF key
+            // and access-code size ride on the config so transport.addInterface
+            // caches the IFAC signing seed (ReticulumTransport.swift:467-469) and
+            // the inbound IFAC gate / applyIFAC become live for this mock.
+            ifacSize: ifacSize,
+            ifacKey: ifacKey
         )
     }
 
@@ -133,8 +141,22 @@ final class BehavioralInstance: @unchecked Sendable {
 /// Serialized access to the instance map. Bridge commands arrive serially
 /// but behavioral_start spawns a background retransmission Task on the
 /// transport, so the dictionary itself still needs locking.
-private let behavioralLock = NSLock()
-nonisolated(unsafe) private var behavioralInstances: [String: BehavioralInstance] = [:]
+// internal (not private) so the per-cluster behavioral sub-handlers in
+// Behavioral+*.swift can share this registry. The dispatch chain in
+// handleBehavioralCommand's default case routes unmatched behavioral_*
+// commands into those sub-handlers (see Ext+Dispatch.swift).
+let behavioralLock = NSLock()
+nonisolated(unsafe) var behavioralInstances: [String: BehavioralInstance] = [:]
+
+/// Fetch a started behavioral instance by handle, or throw. Shared by the
+/// per-cluster behavioral sub-handlers.
+func requireBehavioralInstance(_ handle: String) throws -> BehavioralInstance {
+    behavioralLock.lock(); defer { behavioralLock.unlock() }
+    guard let inst = behavioralInstances[handle] else {
+        throw BridgeError.invalidData("Unknown behavioral handle: \(handle)")
+    }
+    return inst
+}
 
 // MARK: - Helpers
 
@@ -272,6 +294,26 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             throw BridgeError.invalidData("Unknown handle: \(handle)")
         }
 
+        // Optional IFAC (Interface Access Codes) configuration, mirroring
+        // RNS._add_interface (Reticulum.py:1060-1078): when ifac_netname and/or
+        // ifac_netkey are supplied, derive the 64-byte ifac_key from
+        // full_hash(netname)+full_hash(netkey) via HKDF(salt=IFAC_SALT) and use a
+        // byte-sized access code (ifac_size param as bytes, else DEFAULT_IFAC_SIZE=16,
+        // matching behavioral_transport.py:541-562 `int(ifac_size) if ... else 16`).
+        let ifacNetname = getStringOptional(p, "ifac_netname")
+        let ifacNetkey = getStringOptional(p, "ifac_netkey")
+        var ifacKey: Data? = nil
+        var ifacSize = 0
+        if ifacNetname != nil || ifacNetkey != nil {
+            ifacKey = deriveIfacKey(
+                networkName: ifacNetname ?? "",
+                passphrase: ifacNetkey ?? ""
+            )
+            if ifacKey != nil {
+                ifacSize = getIntOptional(p, "ifac_size") ?? TransportConstants.DEFAULT_IFAC_SIZE
+            }
+        }
+
         // Generate 6 random bytes, use them for both the hex id and the
         // 16-byte truncated-SHA256 interface hash. Hashing the raw bytes
         // keeps the hash stable across hex-decoding boundaries and avoids
@@ -282,17 +324,25 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
             id: ifaceId,
             name: name,
             mode: parseInterfaceMode(modeRaw),
-            mtu: mtu
+            mtu: mtu,
+            ifacKey: ifacKey,
+            ifacSize: ifacSize
         )
 
         try blockingAsync {
+            // addInterface caches the IFAC signing seed (ifacKey[32..64]) when the
+            // config carries a 64-byte ifacKey + non-zero ifacSize, arming the
+            // inbound IFAC gate and applyIFAC for this interface.
             try await inst.transport.addInterface(iface)
         }
         inst.setInterface(iface, forId: ifaceId)
 
         return [
             "iface_id": .string(ifaceId),
-            "interface_hash": hex(Data(SHA256.hash(data: idBytes)).prefix(16))
+            "interface_hash": hex(Data(SHA256.hash(data: idBytes)).prefix(16)),
+            // Reported so attach_ifac_interface can size the access-code field
+            // (behavioral_transport.py:570); 0 when no IFAC was configured.
+            "ifac_size": num(ifacSize)
         ]
 
     case "behavioral_inject":
@@ -303,11 +353,22 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         behavioralLock.lock()
         let inst = behavioralInstances[handle]
         behavioralLock.unlock()
-        guard let inst, let iface = inst.interface(forId: ifaceId) else {
+        guard let inst, inst.interface(forId: ifaceId) != nil else {
             throw BridgeError.invalidData("Unknown handle or iface_id")
         }
 
-        iface.inject(raw)
+        // SYNCHRONOUS inject, matching the reference (behavioral_transport.py:589
+        // MockInterface.inject -> RNS.Transport.inbound directly). The swift mock's
+        // fire-and-forget delegate path (BehavioralMockInterface.inject -> spawned
+        // Task) raced reads that follow inject with no sleep (random_blob cap,
+        // missing-interface eviction, announce-handler dispatch). inbound(frame:)
+        // runs the full pipeline — IFAC gate + parse + receive() to completion +
+        // external announce-handler dispatch — before returning, so table/handler
+        // state is observable on return. Rebroadcast egress still flows through the
+        // async retransmission loop, so drain_tx-based tests are unaffected.
+        try blockingAsync {
+            _ = await inst.transport.inbound(frame: raw, interface: ifaceId)
+        }
         return [:]
 
     case "behavioral_drain_tx":
@@ -325,6 +386,10 @@ func handleBehavioralCommand(_ command: String, _ p: [String: JSONValue]) throws
         return ["packets": .array(packets.map { .string(bytesToHex($0)) })]
 
     default:
+        // Route any behavioral_* command not matched above into the per-cluster
+        // behavioral sub-handlers (Behavioral+Announce/Path/Blackhole/Tables.swift).
+        // Each returns nil for commands it doesn't own; chain in Ext+Dispatch.swift.
+        if let r = try handleBehavioralExtensionCommand(command, p) { return r }
         throw BridgeError.unknownCommand(command)
     }
 }

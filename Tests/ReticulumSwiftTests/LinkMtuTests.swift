@@ -200,7 +200,13 @@ final class LinkMtuTests: XCTestCase {
 
         let hwMtu = await transport.nextHopInterfaceHwMtu(for: destHash)
         XCTAssertNotNil(hwMtu)
-        XCTAssertEqual(hwMtu, 262144)
+        // RNS-faithful live HW MTU for a default (autoconfigured, 10 Mbps) TCP
+        // interface is optimise_mtu(10_000_000) == 8192 (Interface.py:198-221),
+        // NOT the 262144 TCPInterface.HW_MTU class ceiling. The interface
+        // autoconfigures its MTU from BITRATE_GUESS; 262144 is only the
+        // pre-autoconfigure constant (exposed as `classHwMtu`). This previously
+        // asserted 262144, which encoded the un-optimised ceiling.
+        XCTAssertEqual(hwMtu, 8192)
     }
 
     func testNextHopInterfaceHwMtu_missingInterface() async throws {

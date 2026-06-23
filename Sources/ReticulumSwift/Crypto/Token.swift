@@ -53,14 +53,25 @@ public struct Token {
     /// - First 32 bytes: signing key (HMAC)
     /// - Last 32 bytes: encryption key (AES-256)
     ///
-    /// - Parameter derivedKey: 64 bytes - first 32 for signing, last 32 for encryption
-    /// - Throws: `TokenError.invalidKeyLength` if key is too short
+    /// Mode is selected by key length exactly as RNS (Token.py:62-72):
+    /// - 32-byte key → AES-128: signing = key[:16], encryption = key[16:32]
+    /// - 64-byte key → AES-256: signing = key[:32], encryption = key[32:64]
+    /// - any other length is rejected ("must be 128 or 256 bits"). The 16- vs
+    ///   32-byte encryption key makes CryptoSwift's AES pick AES-128 vs AES-256
+    ///   automatically. Columba uses the 64-byte identity path (unchanged); the
+    ///   32-byte AES-128 path is additive.
+    /// - Throws: `TokenError.invalidKeyLength` if the key is not 32 or 64 bytes.
     public init(derivedKey: Data) throws {
-        guard derivedKey.count >= 64 else {
+        switch derivedKey.count {
+        case 32:
+            self.signingKey = Data(derivedKey.prefix(16))
+            self.encryptionKey = Data(derivedKey.dropFirst(16).prefix(16))
+        case 64:
+            self.signingKey = Data(derivedKey.prefix(32))
+            self.encryptionKey = Data(derivedKey.dropFirst(32).prefix(32))
+        default:
             throw TokenError.invalidKeyLength
         }
-        self.signingKey = Data(derivedKey.prefix(32))
-        self.encryptionKey = Data(derivedKey.dropFirst(32).prefix(32))
     }
 
     /// Create token from separate keys

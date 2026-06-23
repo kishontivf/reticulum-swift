@@ -48,6 +48,14 @@ public enum ResourceConstants {
     /// can expand to this size for maximum throughput.
     public static let WINDOW_MAX_FAST: Int = 75
 
+    /// Global maximum window size, used for hashmap / collision-guard / scope math.
+    ///
+    /// Mirrors python `Resource.WINDOW_MAX = WINDOW_MAX_FAST` (RNS/Resource.py:74).
+    /// The sender's `request()` scope advance uses this exact value
+    /// (`receiver_min_consecutive_height = max(part_index-1-WINDOW_MAX, 0)`,
+    /// RNS/Resource.py:1038).
+    public static let WINDOW_MAX: Int = WINDOW_MAX_FAST
+
     /// Maximum window size for very slow connections.
     ///
     /// Extremely slow links are restricted to this smaller window
@@ -120,6 +128,13 @@ public enum ResourceConstants {
     /// as the compression operation would consume excessive memory and time.
     /// This is 64 MB.
     public static let AUTO_COMPRESS_MAX_SIZE: Int = 64 * 1024 * 1024
+
+    /// Maximum size of attached resource metadata (bytes).
+    ///
+    /// Mirrors python `Resource.METADATA_MAX_SIZE = 16 * 1024 * 1024 - 1`
+    /// (RNS/Resource.py:120). The packed metadata length is encoded in a 3-byte
+    /// big-endian prefix, so it cannot exceed 0xFFFFFF.
+    public static let METADATA_MAX_SIZE: Int = 16 * 1024 * 1024 - 1
 
     // MARK: - Timing Constants
 

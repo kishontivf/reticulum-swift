@@ -69,6 +69,18 @@ public class ResourceWindow {
         self.windowMax = ResourceConstants.WINDOW_MAX_SLOW
     }
 
+    /// Seed the starting window from an inherited value.
+    ///
+    /// Mirrors python `Resource.accept`'s window inheritance: `previous_window =
+    /// link.get_last_resource_window(); if previous_window: resource.window =
+    /// previous_window` (RNS/Resource.py:216-219). A link that already carried a
+    /// transfer hands its final window to the next inbound resource so it skips
+    /// slow-start. Clamped to at least 1 and re-derives `window_min`.
+    public func setInitialWindow(_ w: Int) {
+        window = max(1, w)
+        updateWindowMin()
+    }
+
     // MARK: - Window Adjustment
 
     /// Adjusts window size after all requested parts are received.
@@ -156,6 +168,18 @@ public class ResourceWindow {
     }
 
     // MARK: - Part Tracking
+
+    /// Reset the outstanding-parts counter to zero.
+    ///
+    /// Faithful port of python `request_next`'s first statement,
+    /// `self.outstanding_parts = 0` (RNS/Resource.py:937): every `request_next`
+    /// rebuilds the in-flight count from scratch for the batch it is about to
+    /// request, so `outstanding` always reflects ONLY the current request rather
+    /// than drifting across batches. Call this at the top of each request, then
+    /// `markRequested(count:)` for the parts actually sent.
+    public func resetOutstanding() {
+        outstandingParts = 0
+    }
 
     /// Marks parts as requested (outstanding).
     ///

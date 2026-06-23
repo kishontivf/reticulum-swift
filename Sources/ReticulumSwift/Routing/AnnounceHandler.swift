@@ -12,10 +12,11 @@
 //  Validates signatures, records paths, and determines rebroadcast behavior.
 //
 //  The AnnounceHandler implements:
-//  - Deduplication via announce hash tracking
 //  - Hop limit enforcement (128 max)
 //  - Signature validation using AnnounceValidator
-//  - Path recording with mode-specific expiration
+//  - Path recording with mode-specific expiration (replay protection is owned by
+//    PathTable.record's random_blob check, mirroring RNS — there is NO separate
+//    per-announce-hash dedup, Transport.py:1755-1823)
 //  - Mode-based rebroadcast decisions
 //
 
@@ -41,6 +42,12 @@ public enum AnnounceProcessResult: Sendable, Equatable {
 /// Reason why an announce was ignored.
 public enum AnnounceIgnoreReason: Sendable, Equatable {
     /// Announce was already seen (duplicate).
+    ///
+    /// Returned when `PathTable.record` rejects the announce — a replayed
+    /// random_blob, or a worse-hop announce that did not meet the
+    /// expired/fresher/unresponsive replacement criteria. RNS gates replay
+    /// purely on the random_blob check inside the path-table decision tree
+    /// (Transport.py:1755-1823); there is NO separate per-announce-hash dedup.
     case alreadySeen
 
     /// Hop count exceeds maximum limit.
@@ -53,16 +60,69 @@ public enum AnnounceIgnoreReason: Sendable, Equatable {
     case invalidFormat
 }
 
+// MARK: - Announce Handler Protocol (RNS register_announce_handler duck type)
+
+/// An externally-registered announce handler, modelling the RNS duck-typed
+/// handler accepted by `Transport.register_announce_handler` (Transport.py:
+/// 2465-2477) and invoked by the inbound dispatch loop (Transport.py:2034-2086).
+///
+/// RNS handlers are arbitrary objects with:
+///   - an `aspect_filter` attribute (`None` matches every announce, otherwise a
+///     dotted `"app.aspect1.aspect2"` name compared via
+///     `Destination.hash_from_name_and_identity`),
+///   - a `received_announce(...)` callable whose PARAMETER COUNT (3/4/5) selects
+///     how much is delivered (always `destination_hash, announced_identity,
+///     app_data`; 4 adds `announce_packet_hash`; 5 adds `is_path_response`),
+///   - an optional `receive_path_responses` flag (PATH_RESPONSE-context
+///     announces are delivered only to handlers that opt in).
+///
+/// Swift cannot introspect a closure's arity the way python's
+/// `inspect.signature` does, so `callbackParameterCount` is modelled explicitly
+/// (forced category-(a) deviation, see port-deviations.md). Likewise per-handler
+/// exception isolation (Transport.py:2083-2086) is modelled by the dispatch loop
+/// catching a `throw` from `receivedAnnounce` instead of python's try/except.
+public protocol AnnounceHandlerProtocol: AnyObject, Sendable {
+    /// `handler.aspect_filter` — `nil` matches every announce; otherwise the
+    /// dotted `"app.aspect…"` name the announced destination hash must equal.
+    var aspectFilter: String? { get }
+
+    /// Models `hasattr(handler, "aspect_filter")` — the registration guard
+    /// (Transport.py:2476-2477) only registers a handler that HAS the attribute.
+    /// A swift handler that semantically lacks an aspect filter returns `false`
+    /// here (distinct from `aspectFilter == nil`, which is "match all").
+    var hasAspectFilter: Bool { get }
+
+    /// `handler.receive_path_responses == True` — opt-in to PATH_RESPONSE-context
+    /// announces (Transport.py:2049-2053). Defaults to `false` semantics.
+    var receivePathResponses: Bool { get }
+
+    /// The `received_announce` parameter count (3, 4, or 5) selecting the dispatch
+    /// arity (Transport.py:2055-2069). Any other value is an invalid signature.
+    var callbackParameterCount: Int { get }
+
+    /// Deliver an announce. `announcePacketHash` is non-nil only for a 4/5-param
+    /// handler; `isPathResponse` is non-nil only for a 5-param handler. Throwing
+    /// is isolated per-handler by the dispatch loop (a raising handler must not
+    /// prevent a later well-behaved handler from running).
+    func receivedAnnounce(
+        destinationHash: Data,
+        announcedIdentity: Identity?,
+        appData: Data?,
+        announcePacketHash: Data?,
+        isPathResponse: Bool?
+    ) throws
+}
+
 // MARK: - Announce Handler
 
 /// Actor that processes received announce packets.
 ///
 /// AnnounceHandler implements the Reticulum announce processing protocol:
-/// 1. Deduplication: Tracks seen announce hashes to ignore duplicates
-/// 2. Hop limit: Enforces maximum 128 hops
-/// 3. Validation: Verifies signatures for SINGLE/GROUP/LINK destinations
-/// 4. Path recording: Updates path table with learned routes
-/// 5. Rebroadcast: Determines whether to propagate based on interface mode
+/// 1. Hop limit: Enforces maximum 128 hops
+/// 2. Validation: Verifies signatures for SINGLE/GROUP/LINK destinations
+/// 3. Path recording: Updates path table with learned routes (the path-table
+///    random_blob check is the sole replay gate, mirroring RNS)
+/// 4. Rebroadcast: Determines whether to propagate based on interface mode
 ///
 /// Example usage:
 /// ```swift
@@ -89,14 +149,8 @@ public actor AnnounceHandler {
     /// Path table for recording learned routes.
     private let pathTable: PathTable
 
-    /// Set of seen announce hashes for deduplication.
-    private var seenAnnounces: Set<Data> = []
-
     /// Maximum hop count allowed (Reticulum standard is 128).
     public let maxHops: UInt8 = TransportConstants.PATHFINDER_M
-
-    /// Maximum size of seenAnnounces set before pruning.
-    public let seenAnnouncesMaxSize: Int = 10000
 
     // MARK: - Initialization
 
@@ -112,13 +166,12 @@ public actor AnnounceHandler {
     /// Process a received announce packet.
     ///
     /// Processing steps:
-    /// 1. Compute announce hash for deduplication
-    /// 2. Check if already seen (return .ignored if so)
-    /// 3. Check hop limit (return .ignored if exceeded)
-    /// 4. Parse and validate announce (signature verification)
-    /// 5. Record path in path table with mode-specific expiration
-    /// 6. Add to seen announces
-    /// 7. Determine rebroadcast based on interface mode
+    /// 1. Check hop limit (return .ignored if exceeded)
+    /// 2. Parse and validate announce (signature verification)
+    /// 3. Remember identity + app_data + ratchet (unconditional, RNS validate_announce)
+    /// 4. Record path in path table with mode-specific expiration (random_blob
+    ///    replay gate lives here — no separate per-announce-hash dedup)
+    /// 5. Determine rebroadcast based on interface mode
     ///
     /// - Parameters:
     ///   - packet: The announce packet to process
@@ -133,22 +186,21 @@ public actor AnnounceHandler {
     ) async -> AnnounceProcessResult {
         logger.debug("Processing announce from \(interfaceId), hops=\(packet.header.hopCount), data=\(packet.data.count) bytes")
 
-        // 1. Compute announce hash for deduplication
-        let announceHash = computeAnnounceHash(packet)
+        // RNS performs NO per-announce-hash deduplication on the inbound path
+        // (Transport.py:1687-1823). Replay protection is owned entirely by the
+        // random_blob check inside PathTable.record (`if not random_blob in
+        // random_blobs`, Transport.py:1763/1796/1808). Re-evaluating every
+        // signature-valid announce is required so that a re-heard announce whose
+        // stored path has since EXPIRED or been marked UNRESPONSIVE can take the
+        // replacement branches (Transport.py:1790-1823).
 
-        // 2. Check deduplication
-        if seenAnnounces.contains(announceHash) {
-            logger.debug("Ignored: already seen")
-            return .ignored(reason: .alreadySeen)
-        }
-
-        // 3. Check hop limit
+        // 1. Check hop limit
         if packet.header.hopCount >= maxHops {
             logger.warning("Ignored: hop limit exceeded (\(packet.header.hopCount) >= \(self.maxHops))")
             return .ignored(reason: .hopLimitExceeded)
         }
 
-        // 4. Parse and validate announce
+        // 2. Parse and validate announce
         let parsed: ParsedAnnounce
         let isPlain = packet.header.destinationType == .plain
         logger.debug("Parsing announce, isPlain=\(isPlain)")
@@ -168,7 +220,41 @@ public actor AnnounceHandler {
             return .ignored(reason: .invalidFormat)
         }
 
-        // 5. Record path in path table
+        // 3. Refresh known_destinations + adopted ratchet UNCONDITIONALLY on every
+        // validated announce, mirroring RNS.Identity.validate_announce. RNS calls
+        // Identity.remember (Identity.py:591) and Identity._remember_ratchet
+        // (Identity.py:612) here, independent of any path-table acceptance/freshness
+        // gate. Doing it before the PathTable.record below (which may reject a
+        // same/near-second re-announce as not fresher) is what lets recall/get_ratchet
+        // see the newest app_data / ratchet — RNS overwrites known_destinations
+        // in place (Identity.py:108-113) and adopts the newest ratchet unconditionally.
+        if let publicKeys = parsed.publicKeys, publicKeys.count == PUBLIC_KEYS_LENGTH {
+            // RNS Identity.py:591 — Identity.remember(packet.get_hash(), destination_hash, public_key, app_data)
+            //
+            // app_data must honour the RNS validate_announce None-vs-empty rule
+            // (Identity.py:542,560-561): app_data initialises to b"" and is nulled
+            // ONLY when len(packet.data) <= KEYSIZE+NAME_HASH+10+SIG (=148, i.e. NO
+            // ratchet AND no trailing app_data). A ratcheted-but-app_data-less
+            // announce is >=180 bytes, so its app_data stays b"" (empty, not None).
+            // AnnounceValidator yields parsed.appData == nil for any announce with
+            // no trailing bytes; `announceAppData` reconstructs the distinction from
+            // the ratchet presence so it survives into Identity.recall/recallAppData.
+            try? Identity.remember(
+                packetHash: packet.getFullHash(),
+                destinationHash: parsed.destinationHash,
+                publicKey: publicKeys,
+                appData: Identity.announceAppData(
+                    rawAppData: parsed.appData,
+                    hasRatchet: parsed.ratchet?.isEmpty == false
+                )
+            )
+        }
+        if let ratchet = parsed.ratchet {
+            // RNS Identity.py:612 — if ratchet: Identity._remember_ratchet(destination_hash, ratchet)
+            Identity.rememberRatchet(destinationHash: parsed.destinationHash, ratchet: ratchet)
+        }
+
+        // 4. Record path in path table
         // For PLAIN destinations, we need to handle missing public keys
         let publicKeys = parsed.publicKeys ?? Data(repeating: 0, count: 64)
 
@@ -214,17 +300,16 @@ public actor AnnounceHandler {
             announceData: packet.data  // Cache raw announce payload for path responses
         )
 
-        // Only proceed if path was actually recorded (not a replay or worse path)
+        // Only proceed if path was actually recorded (RNS should_add==True).
         guard pathRecorded else {
-            // Path was rejected (replay or worse hop count), but still mark as seen
-            addToSeenAnnounces(announceHash)
+            // PathTable.record rejected the announce (duplicate random_blob, or a
+            // worse-hop announce not meeting the expired/fresher/unresponsive
+            // replacement criteria) — RNS should_add==False: no rebroadcast and no
+            // external announce-handler dispatch (Transport.py:1755-1823).
             return .ignored(reason: .alreadySeen)
         }
 
-        // 6. Add announce hash to seen set
-        addToSeenAnnounces(announceHash)
-
-        // 7. Determine rebroadcast based on interface mode
+        // 5. Determine rebroadcast based on interface mode
         if interfaceMode.shouldPropagateAnnounces {
             // Create rebroadcast packet with incremented hop count
             let rebroadcastPacket = createRebroadcastPacket(from: packet)
@@ -238,36 +323,6 @@ public actor AnnounceHandler {
     }
 
     // MARK: - Private Helpers
-
-    /// Compute announce hash for deduplication.
-    ///
-    /// C4: Uses the packet's full hash (SHA256 of wire-format hashable part),
-    /// matching Python's `packet.packet_hash`. This allows announces via
-    /// different relay hops (different transport address, incremented hop count)
-    /// to produce different hashes, letting potentially better paths through.
-    ///
-    /// - Parameter packet: Packet to hash
-    /// - Returns: 32-byte SHA256 packet hash
-    private func computeAnnounceHash(_ packet: Packet) -> Data {
-        return packet.getFullHash()
-    }
-
-    /// Add an announce hash to the seen set, pruning if needed.
-    ///
-    /// - Parameter hash: Hash to add
-    private func addToSeenAnnounces(_ hash: Data) {
-        // Prune if over max size (remove oldest by removing arbitrary element)
-        if seenAnnounces.count >= seenAnnouncesMaxSize {
-            // Remove approximately 10% of entries to avoid frequent pruning
-            let removeCount = seenAnnouncesMaxSize / 10
-            for _ in 0..<removeCount {
-                if let first = seenAnnounces.first {
-                    seenAnnounces.remove(first)
-                }
-            }
-        }
-        seenAnnounces.insert(hash)
-    }
 
     /// Create a rebroadcast packet with incremented hop count.
     ///
@@ -292,26 +347,5 @@ public actor AnnounceHandler {
             context: original.context,
             data: original.data
         )
-    }
-
-    // MARK: - Testing Support
-
-    /// Number of seen announces (for testing).
-    public var seenCount: Int {
-        seenAnnounces.count
-    }
-
-    /// Check if an announce hash has been seen (for testing).
-    ///
-    /// - Parameter packet: Packet to check
-    /// - Returns: true if the announce hash has been seen
-    public func hasSeen(packet: Packet) -> Bool {
-        let hash = computeAnnounceHash(packet)
-        return seenAnnounces.contains(hash)
-    }
-
-    /// Clear all seen announces (for testing).
-    public func clearSeen() {
-        seenAnnounces.removeAll()
     }
 }
