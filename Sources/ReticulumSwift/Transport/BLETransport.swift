@@ -62,6 +62,23 @@ public final class BLETransport: Transport {
     /// changed advertised names.
     private let targetDeviceIdentifier: UUID?
 
+    /// True when no target is set (device-picker discovery mode): scan + report peripherals
+    /// via `onPeripheralDiscovered` but never auto-connect, and arm no connection timeout.
+    var isScanOnly: Bool { targetDeviceName == nil && targetDeviceIdentifier == nil }
+
+    /// Whether a discovered peripheral matches the configured target: by identifier first
+    /// (robust to duplicate / changed advertised names), then by advertised name. Returns
+    /// false in scan-only mode (no target id and no target name). Pure + static so the
+    /// match decision is unit-testable without a live CoreBluetooth stack.
+    static func peripheralMatchesTarget(
+        peripheralId: UUID, peripheralName: String?,
+        targetId: UUID?, targetName: String?
+    ) -> Bool {
+        if let targetId { return peripheralId == targetId }
+        if let targetName { return peripheralName == targetName }
+        return false
+    }
+
     /// Logger for BLE transport events.
     fileprivate let logger: Logger
 
@@ -214,7 +231,7 @@ public final class BLETransport: Transport {
             }
         }
 
-        let isScanOnly = (self.targetDeviceName == nil && self.targetDeviceIdentifier == nil)
+        let isScanOnly = self.isScanOnly
 
         if isScanOnly {
             // Scan-only mode (device picker): scan ALL devices so RNodes that
@@ -352,7 +369,7 @@ public final class BLETransport: Transport {
 
             manager.stopScan()
 
-            let isScanOnly = (self.targetDeviceName == nil && self.targetDeviceIdentifier == nil)
+            let isScanOnly = self.isScanOnly
             if isScanOnly {
                 manager.scanForPeripherals(
                     withServices: nil,
@@ -496,19 +513,12 @@ public final class BLETransport: Transport {
             self?.onPeripheralDiscovered?(peripheral, rssi)
         }
 
-        // If no target name AND no target identifier, we're in scan-only mode — don't auto-connect.
-        guard targetDeviceName != nil || targetDeviceIdentifier != nil else {
-            return
-        }
-
-        // Match by identifier first (robust to duplicate / changed advertised names), then name.
-        let matches: Bool
-        if let targetId = targetDeviceIdentifier {
-            matches = peripheral.identifier == targetId
-        } else {
-            matches = peripheral.name == targetDeviceName
-        }
-        guard matches else { return }
+        // Match by identifier first (robust to duplicate / changed advertised names), then
+        // name. Returns false in scan-only mode, so the picker reports but never auto-connects.
+        guard Self.peripheralMatchesTarget(
+            peripheralId: peripheral.identifier, peripheralName: peripheral.name,
+            targetId: targetDeviceIdentifier, targetName: targetDeviceName
+        ) else { return }
 
         // Stop scanning and connect
         logger.error("[BLETRANS] Match! Connecting to '\(name, privacy: .public)'")
