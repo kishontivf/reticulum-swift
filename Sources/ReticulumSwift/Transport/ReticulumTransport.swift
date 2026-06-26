@@ -1452,6 +1452,7 @@ public actor ReticulumTransport {
                     let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
                     let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
                     logger.debug("Converting to HEADER_2: dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
+                    NetworkLog.log("ROUTE dest=\(destHex) → HEADER_2 routed nextHop=\(nextHop.allSatisfy { $0 == 0 } ? "ZERO" : nextHopHex) iface=\(entry.interfaceId) hops=\(entry.hopCount)")
                     // M1: Send on specific interface when path is known
                     let outboundId = entry.interfaceId.isEmpty ? nil : entry.interfaceId
                     if let outboundId {
@@ -1462,6 +1463,7 @@ public actor ReticulumTransport {
                 } else {
                     // Direct delivery (single hop or no path) - send as HEADER_1
                     if let entry = resolvedEntry {
+                        NetworkLog.log("ROUTE dest=\(destHex) → HEADER_1 \(entry.hopCount <= 1 ? "direct" : "(hops>1 nextHop=nil)") iface=\(entry.interfaceId.isEmpty ? "all" : entry.interfaceId) hops=\(entry.hopCount)")
                         if entry.hopCount > 1 && entry.nextHop == nil {
                             logger.warning("hopCount=\(entry.hopCount) but nextHop is nil! Sending as HEADER_1 (transport will route)")
                         } else if entry.hopCount == 1 {
@@ -1481,6 +1483,7 @@ public actor ReticulumTransport {
                         let packetHash = packet.getFullHash()
                         await packetHashlist.record(packetHash)
                         logger.debug("Sending as HEADER_1 (broadcast, no path)")
+                        NetworkLog.log("ROUTE dest=\(destHex) → HEADER_1 BROADCAST (no path in table)")
                         try await sendToAllInterfaces(packet)
                     }
                 }
