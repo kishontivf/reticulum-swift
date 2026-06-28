@@ -263,9 +263,16 @@ public actor AnnounceHandler {
         // - HEADER_1 packets with hops > 0: use destination hash (mirrors Python's received_from = destination_hash)
         //   This enables HEADER_2 conversion for multi-hop routing even when transport node is unknown
         let nextHop: Data?
-        if packet.header.headerType == .header2, let transportAddr = packet.transportAddress {
+        if packet.header.headerType == .header2,
+           let transportAddr = packet.transportAddress,
+           !transportAddr.allSatisfy({ $0 == 0 }) {
+            // Real relaying transport node.
             nextHop = transportAddr
         } else if packet.header.hopCount > 0 {
+            // HEADER_1 with hops>0, OR a HEADER_2 carrying a null (all-zero) transport
+            // address — the relaying node is unknown, so fall back to the destination
+            // hash (Python's received_from = destination_hash) rather than recording a
+            // dead all-zero next hop that can never route.
             // Python behavior: for HEADER_1 announces, received_from = destination_hash
             // This allows HEADER_2 routing to work - the relay will forward appropriately
             nextHop = parsed.destinationHash
@@ -299,6 +306,40 @@ public actor AnnounceHandler {
             nextHop: nextHop,  // Pass transport address for multi-hop routing
             announceData: packet.data  // Cache raw announce payload for path responses
         )
+
+        // NETWORK LOG: after every announce, log what was learned plus a path-table
+        // summary, so the announce store can be followed over time. The full table is
+        // often hundreds of stale/persisted mesh entries — too noisy to dump in full —
+        // so we summarise the counts and list only the *routable/relevant* entries
+        // (a real non-zero next hop, a direct neighbour, or a named node).
+        if NetworkLog.isEnabled {
+            let nhDesc: String
+            if let nh = nextHop {
+                nhDesc = nh.allSatisfy { $0 == 0 } ? "ZERO(\(nh.count)B)" : NetworkLog.hex8(nh)
+            } else {
+                nhDesc = "direct"
+            }
+            let entries = await pathTable.allEntries()
+            let zero = entries.filter { NetworkLog.hasZeroNextHop($0) }.count
+            let direct = entries.filter { $0.nextHop == nil }.count
+            let routed = entries.count - zero - direct          // real non-zero next hop
+            let responsive = entries.filter { $0.pathState == 2 }.count
+            // Only the *routable* entries — a direct neighbour (nil next hop) or a real
+            // non-zero next hop. The hundreds of ZERO-next-hop mesh entries are covered by
+            // the summary counts; listing them all just buries the paths that can carry traffic.
+            let relevant = entries
+                .filter { $0.nextHop == nil || !NetworkLog.hasZeroNextHop($0) }
+                .sorted { NetworkLog.hex8($0.destinationHash) < NetworkLog.hex8($1.destinationHash) }
+            var dump = "ANNOUNCE recorded=\(pathRecorded) dest=\(destHex) hops=\(packet.header.hopCount) "
+                + "header=\(packet.header.headerType) computedNextHop=\(nhDesc) iface=\(interfaceId)\n"
+            dump += "  PATHTABLE total=\(entries.count) zeroNextHop=\(zero) direct=\(direct) "
+                + "routed=\(routed) responsive=\(responsive) — \(relevant.count) relevant:"
+            for entry in relevant.prefix(30) {
+                dump += "\n    " + NetworkLog.describe(entry)
+            }
+            if relevant.count > 30 { dump += "\n    … +\(relevant.count - 30) more relevant" }
+            NetworkLog.log(dump)
+        }
 
         // Only proceed if path was actually recorded (RNS should_add==True).
         guard pathRecorded else {

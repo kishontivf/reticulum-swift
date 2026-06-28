@@ -286,6 +286,23 @@ public actor PathTable {
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
+            // Path 2b: a STRICTLY shorter-hops copy of an announce we already hold (same
+            // blob). This is the same announce reaching us by a better route — e.g. the
+            // direct (1-hop) copy arriving after a relayed multi-hop copy already won the
+            // arrival race. Adopt the shorter path so we don't keep the worse (often
+            // dead-next-hop) route and flicker the destination in and out of reachability.
+            // Keep the existing blobs/timebase since the announce identity is unchanged.
+            if entry.hopCount < existing.hopCount {
+                markPathUnknownState(key)
+                var updated = entry
+                updated.randomBlobs = existingBlobs
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                logger.info("Upgraded \(keyHex): shorter path \(entry.hopCount) < \(existing.hopCount) for the same announce")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
             logger.debug("Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
             return false
         }
