@@ -72,6 +72,11 @@ public actor MPCInterface: @preconcurrency NetworkInterface {
     /// Connected peer interfaces keyed by MCPeerID.displayName
     private var peers: [String: MPCPeerInterface] = [:]
 
+    /// Peers the browser has discovered (keyed by displayName), kept so we can
+    /// re-invite after an unexpected drop instead of waiting for the next
+    /// `foundPeer` (which only fires on a fresh discovery, e.g. next app launch).
+    private var discoveredPeers: [String: MCPeerID] = [:]
+
     /// Peer lifecycle callbacks
     private var onPeerAdded: (@Sendable (MPCPeerInterface) -> Void)?
     private var onPeerRemoved: (@Sendable (String) -> Void)?
@@ -210,6 +215,10 @@ public actor MPCInterface: @preconcurrency NetworkInterface {
     /// Called by SessionHandler when a peer connects.
     fileprivate func handlePeerConnected(_ peerID: MCPeerID) {
         let name = peerID.displayName
+        // Remember the peer so we can re-invite after an unexpected drop even when the
+        // link formed via our advertiser (peer invited us → our browser never fired
+        // foundPeer for it, so discoveredPeers would otherwise be empty for this peer).
+        discoveredPeers[name] = peerID
         guard peers[name] == nil, let session = session else { return }
 
         let peer = MPCPeerInterface(
@@ -234,6 +243,127 @@ public actor MPCInterface: @preconcurrency NetworkInterface {
             await peer.disconnect()
         }
         onPeerRemoved?(peer.id)
+
+        // Recover the link within this session instead of waiting for the next app
+        // launch. A cold-start MPC session can flap once or twice before settling, and a
+        // single re-invite often races the flap, so retry with a bounded, role-staggered
+        // backoff until the peer reconnects (then onPeerAdded re-announces and the queued
+        // first message flushes). Without this the first message stranded until next launch.
+        scheduleReconnect(peerID)
+    }
+
+    /// Called by SessionHandler when the browser discovers a peer.
+    fileprivate func handleFoundPeer(_ peerID: MCPeerID) {
+        discoveredPeers[peerID.displayName] = peerID
+        invitePeerIfNeeded(peerID)
+    }
+
+    /// Called by SessionHandler when the browser loses sight of a peer.
+    fileprivate func handleLostPeer(_ peerID: MCPeerID) {
+        discoveredPeers.removeValue(forKey: peerID.displayName)
+    }
+
+    /// Deterministic invite direction. Both devices advertise AND browse, so without
+    /// this each side invites the other on discovery — two competing session-formation
+    /// attempts that MCSession resolves by tearing one down ~2s after connecting (the
+    /// cold-start flap). To avoid the race, only the peer with the lexicographically
+    /// smaller display name invites; the other auto-accepts (and falls back to inviting
+    /// if no connection forms, covering asymmetric discovery).
+    private func shouldInitiateInvite(to peerID: MCPeerID) -> Bool {
+        localPeerID.displayName < peerID.displayName
+    }
+
+    private func invitePeerIfNeeded(_ peerID: MCPeerID) {
+        guard let session, let browser else { return }
+        guard peers[peerID.displayName] == nil else { return }  // already connected
+
+        if shouldInitiateInvite(to: peerID) {
+            logger.info("Inviting MPC peer \(peerID.displayName, privacy: .public) (primary)")
+            browser.invitePeer(peerID, to: session, withContext: nil, timeout: 15)
+        } else {
+            // We're the higher-named side: let the peer invite first to avoid the
+            // simultaneous-invite race; fall back to inviting if nothing connects.
+            Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                await self?.fallbackInvite(peerID)
+            }
+        }
+    }
+
+    private func fallbackInvite(_ peerID: MCPeerID) {
+        guard peers[peerID.displayName] == nil else { return }            // already connected
+        guard discoveredPeers[peerID.displayName] != nil else { return }  // peer went away
+        guard let session, let browser else { return }
+        logger.info("Fallback-inviting MPC peer \(peerID.displayName, privacy: .public) (no connection after delay)")
+        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 15)
+    }
+
+    /// Bounded, role-staggered reconnect retries after an unexpected peer drop. The two
+    /// sides offset their invites (primary on whole seconds, secondary +500ms) so they
+    /// never re-invite simultaneously — which would recreate the dual-session race — while
+    /// both still drive recovery (the side that dropped may be the deterministic primary).
+    private func scheduleReconnect(_ peerID: MCPeerID, attempt: Int = 1) {
+        let maxAttempts = 6
+        guard attempt <= maxAttempts else {
+            logger.info("Gave up MPC reconnect to \(peerID.displayName, privacy: .public) after \(maxAttempts) attempts")
+            return
+        }
+        // Attempt 1 fires immediately — the first message is the most latency-sensitive
+        // and a fast re-invite is what triggers the peer's half-open session rebuild
+        // (see prepareSessionForReinvitation). Later attempts back off by whole seconds.
+        let base = UInt64(attempt - 1) * 1_000_000_000
+        let offset: UInt64 = shouldInitiateInvite(to: peerID) ? 0 : 500_000_000
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: base + offset)
+            await self?.attemptReconnect(peerID, attempt: attempt)
+        }
+    }
+
+    private func attemptReconnect(_ peerID: MCPeerID, attempt: Int) {
+        guard peers[peerID.displayName] == nil else { return }            // already reconnected
+        guard discoveredPeers[peerID.displayName] != nil else { return }  // peer went away
+        guard let session, let browser else { return }
+        logger.info("MPC reconnect attempt \(attempt) → \(peerID.displayName, privacy: .public)")
+        browser.invitePeer(peerID, to: session, withContext: nil, timeout: 10)
+        scheduleReconnect(peerID, attempt: attempt + 1)
+    }
+
+    /// A peer we STILL consider connected is inviting us again. That only happens
+    /// when our side of the link is half-open: the peer's MCSession dropped us (the
+    /// cold-start flap, seen only from the side that got the `.notConnected`) while
+    /// our MCSession never noticed and still lists the peer as connected. Returning
+    /// that stale session makes MPC sit on its dead half until its own keepalive
+    /// expires (~60s) before re-handshaking — long enough to strand the first
+    /// message and fail the turn. Instead, rebuild the MCSession so the incoming
+    /// invitation handshakes into a clean session immediately. Guarded on the peer
+    /// already being present, so steady state (first-time invites) is untouched.
+    func sessionForInvitation(from peerID: MCPeerID) -> MCSession? {
+        guard peers[peerID.displayName] != nil else { return session }
+        logger.info("Half-open MPC link to \(peerID.displayName, privacy: .public) — rebuilding session to accept re-invitation")
+        return rebuildSession()
+    }
+
+    /// Tear down the current MCSession and its (now-stale) peer interfaces and stand
+    /// up a fresh one wired to the same SessionHandler. Used only to heal a half-open
+    /// link; advertiser/browser keep running so discovery is unaffected.
+    private func rebuildSession() -> MCSession? {
+        guard let handler = sessionHandler else { return session }
+        for (name, peer) in peers {
+            Task { await peer.disconnect() }
+            onPeerRemoved?(peer.id)
+            logger.info("Dropped stale MPC peer \(name, privacy: .public) during session rebuild")
+        }
+        peers.removeAll()
+
+        session?.disconnect()
+        let fresh = MCSession(
+            peer: localPeerID,
+            securityIdentity: nil,
+            encryptionPreference: .none
+        )
+        fresh.delegate = handler
+        self.session = fresh
+        return fresh
     }
 
     /// Called by SessionHandler when data arrives from a peer.
@@ -255,9 +385,6 @@ public actor MPCInterface: @preconcurrency NetworkInterface {
     public var connectedPeerNames: [String] { Array(peers.keys) }
 
     // MARK: - Internal Accessors (for SessionHandler)
-
-    /// Returns the active MCSession, if any. Used by SessionHandler for invitations.
-    func getSession() -> MCSession? { session }
 
     /// Report an error through the delegate.
     func reportError(_ error: Error) {
@@ -380,8 +507,10 @@ private final class SessionHandler: NSObject,
 
         logger.info("Auto-accepting MPC invitation from \(peerID.displayName, privacy: .public)")
         Task {
-            let session = await interface.getSession()
-            invitationHandler(true, session)
+            // Use a clean session if this is a half-open re-invitation (peer already
+            // present), otherwise the current one. Heals the cold-start flap fast.
+            let session = await interface.sessionForInvitation(from: peerID)
+            invitationHandler(session != nil, session)
         }
     }
 
@@ -407,11 +536,9 @@ private final class SessionHandler: NSObject,
 
         logger.info("MPC browser found peer: \(peerID.displayName, privacy: .public)")
 
-        // Auto-invite discovered peers
-        Task {
-            guard let session = await interface.getSession() else { return }
-            browser.invitePeer(peerID, to: session, withContext: nil, timeout: 30)
-        }
+        // Deterministic invite direction is decided inside the actor (see
+        // invitePeerIfNeeded) to avoid the simultaneous-invite race.
+        Task { await interface.handleFoundPeer(peerID) }
     }
 
     func browser(
@@ -420,6 +547,8 @@ private final class SessionHandler: NSObject,
     ) {
         logger.info("MPC browser lost peer: \(peerID.displayName, privacy: .public)")
         // MCSession state change handles actual disconnect
+        guard let interface = interface else { return }
+        Task { await interface.handleLostPeer(peerID) }
     }
 
     func browser(
