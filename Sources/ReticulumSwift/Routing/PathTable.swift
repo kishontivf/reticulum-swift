@@ -63,6 +63,29 @@ public actor PathTable {
     /// Paths indexed by destination hash (in-memory cache)
     private var paths: [Data: PathEntry] = [:]
 
+    /// Interfaces treated as low-priority *fallback* links (configured by the embedder). A path on
+    /// a normal interface always out-ranks a path on a fallback interface for the same destination
+    /// — regardless of hop count — and a fallback path is only kept while it's the sole path.
+    /// This is a generic routing knob; the embedder decides which interfaces are fallback (e.g. an
+    /// app's virtual BLE carrier, so TCP is preferred when it exists and the carrier is used only
+    /// when there's no other route). Hop counts are never altered, so direct-vs-routed send
+    /// behaviour is unaffected.
+    private var fallbackInterfaceIds: Set<String> = []
+
+    /// How much fresher (in announce-emission seconds) a fallback announce must be than the current
+    /// normal path before it takes the route over. Must exceed one announce interval so that, while
+    /// a peer is still reachable over its normal interface, the carrier's copy of an announce
+    /// arriving a little ahead of the multi-hop normal copy does NOT flip the route back and forth.
+    /// Also the (approx) delay before the carrier adopts a peer whose normal path genuinely stopped.
+    public static var fallbackTakeoverGraceSeconds: UInt64 = 45
+
+    /// Destinations pinned to their fallback interface: while pinned, announces from NON-fallback
+    /// interfaces are rejected, so the destination stays on the fallback path and can't be pulled
+    /// back onto a stale/relayed normal-interface route. The embedder pins a peer it knows is only
+    /// reachable over the fallback (e.g. one that signalled it lost internet, whose old TCP path a
+    /// transport node may keep re-announcing) and unpins it when that's no longer true.
+    private var fallbackPinnedDestinations: Set<Data> = []
+
     /// SQLite database handle for persistence
     private var db: OpaquePointer?
 
@@ -250,6 +273,24 @@ public actor PathTable {
     ///
     /// - Parameter entry: Path entry to record
     /// - Returns: true if path was recorded, false if rejected
+    /// Mark (or unmark) an interface as a low-priority fallback. See `fallbackInterfaceIds`.
+    public func setFallbackInterface(_ interfaceId: String, isFallback: Bool = true) {
+        if isFallback {
+            fallbackInterfaceIds.insert(interfaceId)
+        } else {
+            fallbackInterfaceIds.remove(interfaceId)
+        }
+    }
+
+    /// Pin (or unpin) a destination to its fallback interface. See `fallbackPinnedDestinations`.
+    public func setDestinationPinnedToFallback(_ destinationHash: Data, _ pinned: Bool) {
+        if pinned {
+            fallbackPinnedDestinations.insert(destinationHash)
+        } else {
+            fallbackPinnedDestinations.remove(destinationHash)
+        }
+    }
+
     @discardableResult
     public func record(entry: PathEntry) -> Bool {
         let key = entry.destinationHash
@@ -271,6 +312,58 @@ public actor PathTable {
         let existingBlobs = existing.randomBlobs
         let isNewBlob = !existingBlobs.contains(newBlob)
         let pathTimebase = existing.latestEmissionTimestamp
+
+        // Fallback-interface priority, resolved by announce FRESHNESS (not hop count). A fallback
+        // link (e.g. an app's BLE carrier) is direct/low-hop and would otherwise always out-rank a
+        // real route on hops — but the two must be distinguished by *which announce is newer*:
+        //   • Both endpoints online → the peer's latest announce reaches us over BOTH its normal
+        //     interface and the fallback with the SAME emission timestamp → we keep the normal path.
+        //   • Peer offline → its latest announce now arrives ONLY over the fallback (fresher than
+        //     the stale normal path a transport node keeps relaying) → the fallback takes over.
+        // So: the strictly-fresher announce wins; on an emission tie, the normal interface wins.
+        let newIsFallback = fallbackInterfaceIds.contains(entry.interfaceId)
+        let existingIsFallback = fallbackInterfaceIds.contains(existing.interfaceId)
+        if newIsFallback != existingIsFallback {
+            let emitDelta = Int64(bitPattern: announceEmitted) - Int64(bitPattern: pathTimebase)
+            if newIsFallback {
+                // Candidate = fallback, incumbent = normal. Take over only once the normal path has
+                // genuinely gone STALE — fresher by more than one announce interval (the grace
+                // margin). While the peer is still reachable over the normal interface its announces
+                // keep that path fresh (emitΔ stays within ~one interval), so a carrier copy that
+                // merely beats the multi-hop normal copy of the SAME announce must NOT flip the
+                // route. We only adopt the carrier when the normal announces have actually stopped.
+                guard announceEmitted > pathTimebase &+ Self.fallbackTakeoverGraceSeconds else {
+                    logger.debug("Ignored \(keyHex): fallback \(entry.interfaceId) within grace of normal \(existing.interfaceId)")
+                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): fallback \(entry.interfaceId) within grace of "
+                        + "normal \(existing.interfaceId) (emitΔ=\(emitDelta)s ≤ \(Self.fallbackTakeoverGraceSeconds)s) → keep TCP")
+                    return false
+                }
+                // Normal path is stale beyond the grace margin → fall through and adopt the carrier.
+                NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): fallback \(entry.interfaceId) — normal "
+                    + "\(existing.interfaceId) STALE (emitΔ=+\(emitDelta)s) → carrier takes over")
+            } else {
+                // Candidate = normal, incumbent = fallback. Reject a STALE relayed announce (older
+                // than the fallback route); otherwise promote — same-emission (peer back online,
+                // announcing on both) or fresher normal announce re-takes the route.
+                guard announceEmitted >= pathTimebase else {
+                    logger.debug("Ignored \(keyHex): stale normal \(entry.interfaceId) won't replace fresher fallback \(existing.interfaceId)")
+                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): STALE normal \(entry.interfaceId) vs "
+                        + "fresher fallback \(existing.interfaceId) (emitΔ=\(emitDelta)s) → keep carrier")
+                    return false
+                }
+                NetworkLog.log("[FALLBACK] PROMOTE \(keyHex): normal \(entry.interfaceId) replaces "
+                    + "fallback \(existing.interfaceId) (emitΔ=\(emitDelta)s) → back to TCP")
+                markPathUnknownState(key)
+                var updated = entry
+                updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                logger.info("Promoted \(keyHex): \(entry.interfaceId) (hops \(entry.hopCount)) replaces fallback \(existing.interfaceId)")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
+        }
 
         if entry.hopCount <= existing.hopCount {
             // Path 2: Equal or better hops + new blob + fresher timestamp
