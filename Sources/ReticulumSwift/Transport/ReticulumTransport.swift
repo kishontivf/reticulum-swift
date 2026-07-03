@@ -1452,7 +1452,7 @@ public actor ReticulumTransport {
                     let routedPacket = convertToHeader2(packet: packet, nextHop: nextHop)
                     let nextHopHex = nextHop.prefix(8).map { String(format: "%02x", $0) }.joined()
                     logger.debug("Converting to HEADER_2: dest=\(destHex), nextHop=\(nextHopHex), hops=\(entry.hopCount)")
-                    NetworkLog.log("ROUTE dest=\(destHex) → HEADER_2 routed nextHop=\(nextHop.allSatisfy { $0 == 0 } ? "ZERO" : nextHopHex) iface=\(entry.interfaceId) hops=\(entry.hopCount)")
+                    NetworkLog.debug("ROUTE dest=\(destHex) → HEADER_2 routed nextHop=\(nextHop.allSatisfy { $0 == 0 } ? "ZERO" : nextHopHex) iface=\(entry.interfaceId) hops=\(entry.hopCount)")
                     // M1: Send on specific interface when path is known
                     let outboundId = entry.interfaceId.isEmpty ? nil : entry.interfaceId
                     if let outboundId {
@@ -1849,8 +1849,11 @@ public actor ReticulumTransport {
         do {
             try await interface.send(encoded)
             logger.debug("Routed packet sent via interface '\(interfaceId)'")
+            let nextHopHex = pathEntry.nextHop.map { NetworkLog.hex8($0) } ?? "direct"
+            NetworkLog.debug("ROUTE dest=\(destHex) → HEADER_2 nextHop=\(nextHopHex) iface=\(interfaceId) hops=\(pathEntry.hopCount) size=\(encoded.count)")
         } catch {
             logger.error("Send failed via '\(interfaceId)': \(error.localizedDescription)")
+            NetworkLog.debug("ROUTE dest=\(destHex) → HEADER_2 SEND-FAIL iface=\(interfaceId): \(error.localizedDescription)")
             throw TransportError.sendFailed(interfaceId: interfaceId, underlying: error.localizedDescription)
         }
     }
