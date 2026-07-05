@@ -221,10 +221,16 @@ public actor AnnounceHandler {
             logger.warning("Parse/validate error: \(error)")
             NetworkLog.debug("[ANNDROP] \(NetworkLog.hex8(packet.destination)) parse/validate FAILED iface=\(interfaceId) hops=\(packet.header.hopCount): \(error)")
             // Determine if it's a format or signature error
-            if error is AnnounceValidationError {
-                let validationError = error as! AnnounceValidationError
-                if validationError == .signatureInvalid {
+            if let validationError = error as? AnnounceValidationError {
+                switch validationError {
+                case .signatureInvalid:
                     return .ignored(reason: .invalidSignature)
+                case .hashMismatch:
+                    // Destination hash does not derive from the announced keys:
+                    // an identity-spoofing attempt. Drop as an authenticity failure.
+                    return .ignored(reason: .invalidSignature)
+                default:
+                    break
                 }
             }
             return .ignored(reason: .invalidFormat)
@@ -238,6 +244,20 @@ public actor AnnounceHandler {
         // same/near-second re-announce as not fresher) is what lets recall/get_ratchet
         // see the newest app_data / ratchet — RNS overwrites known_destinations
         // in place (Identity.py:108-113) and adopts the newest ratchet unconditionally.
+        // SECURITY (known-key collision guard) — RNS Identity.py:588-596. Even with a
+        // valid signature AND a correct destination binding, refuse to overwrite the
+        // public key already known for this destination with a *different* key. This is
+        // only reachable via a truncated-hash collision (the binding check in
+        // parseAndValidate makes it astronomically unlikely), but RNS rejects rather than
+        // permit a path/key swap, so we mirror that.
+        if let publicKeys = parsed.publicKeys,
+           let knownKeys = Identity.recall(parsed.destinationHash)?.publicKeys,
+           knownKeys != publicKeys {
+            logger.warning("Rejected announce: destination already known with a different public key (possible hash collision / path-modification attempt)")
+            NetworkLog.debug("[ANNDROP] \(NetworkLog.hex8(packet.destination)) known-key-mismatch iface=\(interfaceId)")
+            return .ignored(reason: .invalidSignature)
+        }
+
         if let publicKeys = parsed.publicKeys, publicKeys.count == PUBLIC_KEYS_LENGTH {
             // RNS Identity.py:591 — Identity.remember(packet.get_hash(), destination_hash, public_key, app_data)
             //
