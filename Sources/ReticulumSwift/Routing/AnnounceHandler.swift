@@ -152,6 +152,14 @@ public actor AnnounceHandler {
     /// Maximum hop count allowed (Reticulum standard is 128).
     public let maxHops: UInt8 = TransportConstants.PATHFINDER_M
 
+    /// The per-announce cheap `ANNOUNCE recorded=` line logs every time; the EXPENSIVE full
+    /// path-table snapshot (allEntries + sort over hundreds of mesh entries) only every
+    /// `snapshotEvery` announces. Running the snapshot per-announce serialized on this actor
+    /// throttled announce processing to ~0.5/s under a reconnect announce flood (session 6),
+    /// stalling a contact's TCP announce for ~115s behind the mesh backlog.
+    private static let snapshotEvery = 25
+    private var snapshotThrottleCounter = 0
+
     // MARK: - Initialization
 
     /// Create an announce handler with the specified path table.
@@ -197,6 +205,7 @@ public actor AnnounceHandler {
         // 1. Check hop limit
         if packet.header.hopCount >= maxHops {
             logger.warning("Ignored: hop limit exceeded (\(packet.header.hopCount) >= \(self.maxHops))")
+            NetworkLog.debug("[ANNDROP] \(NetworkLog.hex8(packet.destination)) hop-limit \(packet.header.hopCount)>=\(maxHops) iface=\(interfaceId)")
             return .ignored(reason: .hopLimitExceeded)
         }
 
@@ -210,6 +219,7 @@ public actor AnnounceHandler {
             logger.debug("Parsed successfully: destHash=\(parsed.destinationHash.prefix(8).map { String(format: "%02x", $0) }.joined())")
         } catch {
             logger.warning("Parse/validate error: \(error)")
+            NetworkLog.debug("[ANNDROP] \(NetworkLog.hex8(packet.destination)) parse/validate FAILED iface=\(interfaceId) hops=\(packet.header.hopCount): \(error)")
             // Determine if it's a format or signature error
             if error is AnnounceValidationError {
                 let validationError = error as! AnnounceValidationError
@@ -319,26 +329,36 @@ public actor AnnounceHandler {
             } else {
                 nhDesc = "direct"
             }
-            let entries = await pathTable.allEntries()
-            let zero = entries.filter { NetworkLog.hasZeroNextHop($0) }.count
-            let direct = entries.filter { $0.nextHop == nil }.count
-            let routed = entries.count - zero - direct          // real non-zero next hop
-            let responsive = entries.filter { $0.pathState == 2 }.count
-            // Only the *routable* entries — a direct neighbour (nil next hop) or a real
-            // non-zero next hop. The hundreds of ZERO-next-hop mesh entries are covered by
-            // the summary counts; listing them all just buries the paths that can carry traffic.
-            let relevant = entries
-                .filter { $0.nextHop == nil || !NetworkLog.hasZeroNextHop($0) }
-                .sorted { NetworkLog.hex8($0.destinationHash) < NetworkLog.hex8($1.destinationHash) }
-            var dump = "ANNOUNCE recorded=\(pathRecorded) dest=\(destHex) hops=\(packet.header.hopCount) "
-                + "header=\(packet.header.headerType) computedNextHop=\(nhDesc) iface=\(interfaceId)\n"
-            dump += "  PATHTABLE total=\(entries.count) zeroNextHop=\(zero) direct=\(direct) "
-                + "routed=\(routed) responsive=\(responsive) — \(relevant.count) relevant:"
-            for entry in relevant.prefix(30) {
-                dump += "\n    " + NetworkLog.describe(entry)
+            // Cheap, per-announce — this is what following a route needs (grepped as "ANNOUNCE recorded=").
+            NetworkLog.log("ANNOUNCE recorded=\(pathRecorded) dest=\(destHex) hops=\(packet.header.hopCount) "
+                + "header=\(packet.header.headerType) computedNextHop=\(nhDesc) iface=\(interfaceId)")
+
+            // Expensive table SNAPSHOT — throttled (see `snapshotEvery`): allEntries() copies the
+            // whole table off the PathTable actor and sorts it, so doing it per-announce serialized
+            // announce processing under a flood. Emitting it periodically keeps the store followable
+            // without throttling the pipeline.
+            snapshotThrottleCounter += 1
+            if snapshotThrottleCounter >= Self.snapshotEvery {
+                snapshotThrottleCounter = 0
+                let entries = await pathTable.allEntries()
+                let zero = entries.filter { NetworkLog.hasZeroNextHop($0) }.count
+                let direct = entries.filter { $0.nextHop == nil }.count
+                let routed = entries.count - zero - direct          // real non-zero next hop
+                let responsive = entries.filter { $0.pathState == 2 }.count
+                // Only the *routable* entries — a direct neighbour (nil next hop) or a real
+                // non-zero next hop. The hundreds of ZERO-next-hop mesh entries are covered by
+                // the summary counts; listing them all just buries the paths that can carry traffic.
+                let relevant = entries
+                    .filter { $0.nextHop == nil || !NetworkLog.hasZeroNextHop($0) }
+                    .sorted { NetworkLog.hex8($0.destinationHash) < NetworkLog.hex8($1.destinationHash) }
+                var dump = "  PATHTABLE total=\(entries.count) zeroNextHop=\(zero) direct=\(direct) "
+                    + "routed=\(routed) responsive=\(responsive) — \(relevant.count) relevant:"
+                for entry in relevant.prefix(30) {
+                    dump += "\n    " + NetworkLog.describe(entry)
+                }
+                if relevant.count > 30 { dump += "\n    … +\(relevant.count - 30) more relevant" }
+                NetworkLog.log(dump)
             }
-            if relevant.count > 30 { dump += "\n    … +\(relevant.count - 30) more relevant" }
-            NetworkLog.log(dump)
         }
 
         // Only proceed if path was actually recorded (RNS should_add==True).

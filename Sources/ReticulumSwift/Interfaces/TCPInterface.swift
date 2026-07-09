@@ -168,7 +168,13 @@ public actor TCPInterface: @preconcurrency NetworkInterface {
         self.id = config.id
         self.config = config
         self.mode = config.mode
-        self.backoff = ExponentialBackoff()
+        // Cap the reconnect delay low (10s) instead of the 300s default. A device that loses then
+        // regains connectivity accrues several failed attempts while offline, so with the default
+        // the next retry can be scheduled 32-64s out and the interface stays down that long AFTER
+        // internet is back (the slow "regains internet" turnaround). A 10s cap bounds that recovery
+        // to ≤10s; the cost is more frequent retries to a genuinely-dead endpoint, which is
+        // acceptable for a messenger that prioritises fast reconnection.
+        self.backoff = ExponentialBackoff(baseDelay: 1.0, maxDelay: 10.0)
     }
 
     // MARK: - Connection Methods

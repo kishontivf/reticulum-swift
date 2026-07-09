@@ -62,6 +62,20 @@ public enum NetworkLog {
     /// Whether a destination is configured. Cheap; guard snapshot building with this.
     public static var isEnabled: Bool { fileURL != nil }
 
+    /// Hardwired master switch for the TEMPORARY debug scaffolding added while finalising
+    /// transport switching (the `[MSG]` / `[ROUTE] HEADER_2` / `[ANNDROP]` / `[RECORD]` /
+    /// `[FALLBACK] register` / `[ANNOUNCE] emit|interval` markers, emitted via `debug(_:)`).
+    /// Flip to `false` to silence them all in one place without touching the call sites;
+    /// they're slated for removal once the offline/return behaviour is signed off.
+    nonisolated(unsafe) public static var debugScaffolding = true
+
+    /// Append a line ONLY when both the log is configured and `debugScaffolding` is on. Used for
+    /// the temporary diagnostic markers so they can be toggled/removed via the single flag above.
+    public static func debug(_ message: @autoclosure () -> String) {
+        guard debugScaffolding else { return }
+        log(message())
+    }
+
     /// One-line summary of a path entry for snapshots. An all-zero `nextHop` is
     /// rendered as `ZERO` (not `direct`) so a degenerate/null next hop is obvious
     /// versus a genuinely direct (nil) one.

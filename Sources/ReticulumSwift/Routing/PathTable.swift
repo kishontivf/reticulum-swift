@@ -63,6 +63,45 @@ public actor PathTable {
     /// Paths indexed by destination hash (in-memory cache)
     private var paths: [Data: PathEntry] = [:]
 
+    /// Interfaces treated as low-priority *fallback* links (configured by the embedder). A path on
+    /// a normal interface always out-ranks a path on a fallback interface for the same destination
+    /// — regardless of hop count — and a fallback path is only kept while it's the sole path.
+    /// This is a generic routing knob; the embedder decides which interfaces are fallback (e.g. an
+    /// app's virtual BLE carrier, so TCP is preferred when it exists and the carrier is used only
+    /// when there's no other route). Hop counts are never altered, so direct-vs-routed send
+    /// behaviour is unaffected.
+    private var fallbackInterfaceIds: Set<String> = []
+
+    /// How long (wall-clock seconds) a destination's normal interface may go *silent* — no announce
+    /// received on any non-fallback interface — before the carrier is allowed to take the route over.
+    /// Liveness, not freshness: while the peer's normal announces keep arriving (even though the
+    /// carrier re-announces far more often and its copies always look "fresher"), the normal path is
+    /// considered alive and the carrier cannot flip the route. The carrier adopts a destination only
+    /// once its normal announces have actually stopped for this long. Should exceed one announce
+    /// interval plus slack so a single missed/late announce doesn't trigger a spurious takeover
+    /// (at 45s ≈ 1.5× a 30s interval one late announce flapped; 75s ≈ 2.5× tolerates it).
+    public static var fallbackTakeoverGraceSeconds: UInt64 = 75
+
+    /// DEPRECATED / no longer consulted (kept for API/source stability). Promotion of a normal
+    /// interface over a fallback is now UNCONDITIONAL when the destination is unpinned — see the
+    /// promote branch in `record()`. A freshness/lag gate here let the direct carrier win the
+    /// announce race indefinitely and hold the route (session-3 ~140s BLE→TCP return), so it was
+    /// removed; the pin (offline hold) and the 75s liveness window (anti-flap) are the real guards.
+    public static var fallbackPromoteMaxLagSeconds: UInt64 = 90
+
+    /// Destinations pinned to their fallback interface: while pinned, announces from NON-fallback
+    /// interfaces are rejected, so the destination stays on the fallback path and can't be pulled
+    /// back onto a stale/relayed normal-interface route. The embedder pins a peer it knows is only
+    /// reachable over the fallback (e.g. one that signalled it lost internet, whose old TCP path a
+    /// transport node may keep re-announcing) and unpins it when that's no longer true.
+    private var fallbackPinnedDestinations: Set<Data> = []
+
+    /// Per-destination, per-interface wall-clock time of the last announce received on that interface.
+    /// Drives the liveness-based carrier takeover (see `fallbackTakeoverGraceSeconds`): the normal
+    /// path counts as "alive" while some non-fallback interface here was heard within the takeover
+    /// window, regardless of how often the carrier re-announces. Pruned alongside `paths`.
+    private var lastHeardByInterface: [Data: [String: Date]] = [:]
+
     /// SQLite database handle for persistence
     private var db: OpaquePointer?
 
@@ -250,12 +289,60 @@ public actor PathTable {
     ///
     /// - Parameter entry: Path entry to record
     /// - Returns: true if path was recorded, false if rejected
+    /// Mark (or unmark) an interface as a low-priority fallback. See `fallbackInterfaceIds`.
+    public func setFallbackInterface(_ interfaceId: String, isFallback: Bool = true) {
+        if isFallback {
+            fallbackInterfaceIds.insert(interfaceId)
+        } else {
+            fallbackInterfaceIds.remove(interfaceId)
+        }
+        NetworkLog.debug("[FALLBACK] register \(interfaceId) isFallback=\(isFallback) → fallbackSet=\(fallbackInterfaceIds.sorted())")
+    }
+
+    /// Pin (or unpin) a destination to its fallback interface. See `fallbackPinnedDestinations`.
+    public func setDestinationPinnedToFallback(_ destinationHash: Data, _ pinned: Bool) {
+        if pinned {
+            fallbackPinnedDestinations.insert(destinationHash)
+        } else {
+            fallbackPinnedDestinations.remove(destinationHash)
+        }
+    }
+
+    /// Whether `destination` was heard on any NON-fallback (normal) interface within the given window
+    /// — i.e. its normal path is still delivering announces and shouldn't yet yield to the carrier.
+    /// Fallback interfaces are excluded, so a fast-re-announcing carrier can never mask a dead normal.
+    private func normalInterfaceHeardRecently(_ destination: Data, within seconds: UInt64) -> Bool {
+        guard let heard = lastHeardByInterface[destination] else { return false }
+        let cutoff = Date().addingTimeInterval(-Double(seconds))
+        for (interfaceId, at) in heard where !fallbackInterfaceIds.contains(interfaceId) {
+            if at >= cutoff { return true }
+        }
+        return false
+    }
+
     @discardableResult
     public func record(entry: PathEntry) -> Bool {
         let key = entry.destinationHash
         let keyHex = key.prefix(8).map { String(format: "%02x", $0) }.joined()
         let newBlob = entry.randomBlob
         let announceEmitted = PathEntry.emissionTimestamp(from: newBlob)
+
+        // A destination pinned to its fallback (carrier) — e.g. a nearby peer that told us over the
+        // side channel that it lost internet — rejects announces on NON-fallback interfaces. A
+        // transport node may keep relaying that peer's now-dead TCP/LAN path for a while; without
+        // this, each stale relay refreshes the liveness signal below and keeps the carrier from ever
+        // taking over (the 90s+ takeover seen when only silence-timeout drove it). While pinned only
+        // the carrier can hold the route; the embedder clears the pin when the peer signals it's back.
+        if fallbackPinnedDestinations.contains(key), !fallbackInterfaceIds.contains(entry.interfaceId) {
+            logger.debug("Ignored \(keyHex): dest pinned to carrier, rejecting normal \(entry.interfaceId)")
+            NetworkLog.log("[FALLBACK] REJECT \(keyHex): \(entry.interfaceId) — dest PINNED to carrier (peer offline)")
+            return false
+        }
+
+        // Track when we last heard this destination on each interface (local wall-clock). This is the
+        // liveness signal the carrier-takeover decision uses instead of announce-emission freshness —
+        // recorded before any early return so it captures every arrival, including duplicate blobs.
+        lastHeardByInterface[key, default: [:]][entry.interfaceId] = Date()
 
         guard let existing = paths[key] else {
             // Path 1: Unknown destination → accept
@@ -272,6 +359,67 @@ public actor PathTable {
         let isNewBlob = !existingBlobs.contains(newBlob)
         let pathTimebase = existing.latestEmissionTimestamp
 
+        // Fallback-interface priority, resolved by announce FRESHNESS (not hop count). A fallback
+        // link (e.g. an app's BLE carrier) is direct/low-hop and would otherwise always out-rank a
+        // real route on hops — but the two must be distinguished by *which announce is newer*:
+        //   • Both endpoints online → the peer's latest announce reaches us over BOTH its normal
+        //     interface and the fallback with the SAME emission timestamp → we keep the normal path.
+        //   • Peer offline → its latest announce now arrives ONLY over the fallback (fresher than
+        //     the stale normal path a transport node keeps relaying) → the fallback takes over.
+        // So: the strictly-fresher announce wins; on an emission tie, the normal interface wins.
+        let newIsFallback = fallbackInterfaceIds.contains(entry.interfaceId)
+        let existingIsFallback = fallbackInterfaceIds.contains(existing.interfaceId)
+        if newIsFallback != existingIsFallback {
+            let emitDelta = Int64(bitPattern: announceEmitted) - Int64(bitPattern: pathTimebase)
+            if newIsFallback {
+                // Candidate = carrier, incumbent = normal. Take over only once the normal path has
+                // gone SILENT — no announce on any non-fallback interface for the takeover window.
+                // Liveness beats freshness: the carrier re-announces far more often than the periodic
+                // normal announce, so its copies always look "fresher"; comparing emission timestamps
+                // let it flip the route back and forth (the session-37 flapping). Instead we keep the
+                // normal path while it's still delivering announces — tracked in lastHeardByInterface,
+                // with the incumbent's own timestamp as a startup fallback before any arrival is
+                // recorded — and adopt the carrier only when those announces have actually stopped.
+                let window = Self.fallbackTakeoverGraceSeconds
+                let normalLive = normalInterfaceHeardRecently(key, within: window)
+                    || Date().timeIntervalSince(existing.timestamp) < Double(window)
+                if normalLive {
+                    logger.debug("Ignored \(keyHex): normal \(existing.interfaceId) still live; carrier \(entry.interfaceId) stands by")
+                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): normal \(existing.interfaceId) heard "
+                        + "< \(window)s ago (alive) → keep TCP, carrier \(entry.interfaceId) stands by")
+                    return false
+                }
+                // Normal announces have stopped past the window → adopt the carrier.
+                NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): normal \(existing.interfaceId) SILENT "
+                    + "> \(window)s → carrier \(entry.interfaceId) takes over")
+            } else {
+                // Candidate = normal, incumbent = fallback (carrier). Reaching here means the dest is
+                // NOT pinned (a pinned dest's normal announces are rejected at the top of record), i.e.
+                // the peer is considered ONLINE — so TCP reclaims the route from the carrier
+                // IMMEDIATELY, on the first normal announce, regardless of emission freshness or
+                // whether this exact announce already arrived over the carrier first.
+                //
+                // Why unconditional: the two links carry the SAME peer's announces, and the direct
+                // carrier (1 hop, physically adjacent) beats the relayed normal copy to every one — so
+                // any freshness/emitΔ gate lets the carrier hold the route indefinitely once it wins.
+                // Session-3 saw a ~140s BLE→TCP return for exactly this reason. The authoritative
+                // holds are elsewhere: the PIN keeps the carrier while the peer is offline, and the
+                // 75s liveness window (takeover branch above) stops a flap back to carrier once TCP is
+                // in. So an unconditional promote here is both safe and the point of a "fallback".
+                NetworkLog.log("[FALLBACK] PROMOTE \(keyHex): normal \(entry.interfaceId) replaces "
+                    + "fallback \(existing.interfaceId) (emitΔ=\(emitDelta)s, unpinned → TCP wins) → back to TCP")
+                markPathUnknownState(key)
+                var updated = entry
+                updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                logger.info("Promoted \(keyHex): \(entry.interfaceId) (hops \(entry.hopCount)) replaces fallback \(existing.interfaceId)")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
+        }
+
         if entry.hopCount <= existing.hopCount {
             // Path 2: Equal or better hops + new blob + fresher timestamp
             if isNewBlob && announceEmitted > pathTimebase {
@@ -283,6 +431,9 @@ public actor PathTable {
                 paths[key] = updated
                 saveToDatabase(updated)
                 logger.info("Updated \(keyHex): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
+                if newIsFallback || existingIsFallback {
+                    NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) equal/better hops (\(entry.hopCount)<=\(existing.hopCount)) + fresh emit")
+                }
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
@@ -300,10 +451,16 @@ public actor PathTable {
                 paths[key] = updated
                 saveToDatabase(updated)
                 logger.info("Upgraded \(keyHex): shorter path \(entry.hopCount) < \(existing.hopCount) for the same announce")
+                if newIsFallback || existingIsFallback {
+                    NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) shorter path (\(entry.hopCount)<\(existing.hopCount)) same announce")
+                }
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
             logger.debug("Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
+            if newIsFallback || existingIsFallback {
+                NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — equal/better hops but DUPLICATE blob or stale emit")
+            }
             return false
         }
 
@@ -321,10 +478,16 @@ public actor PathTable {
                 paths[key] = updated
                 saveToDatabase(updated)
                 logger.info("Updated \(keyHex): expired path replaced, hops=\(entry.hopCount)")
+                if newIsFallback || existingIsFallback {
+                    NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) replaced EXPIRED path hops=\(entry.hopCount)")
+                }
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
             logger.debug("Ignored \(keyHex): expired path but duplicate blob")
+            if newIsFallback || existingIsFallback {
+                NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — expired path but DUPLICATE blob")
+            }
             return false
         }
 
@@ -339,10 +502,16 @@ public actor PathTable {
                 paths[key] = updated
                 saveToDatabase(updated)
                 logger.info("Updated \(keyHex): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
+                if newIsFallback || existingIsFallback {
+                    NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) fresher emission, worse hops (\(entry.hopCount)>\(existing.hopCount))")
+                }
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
             logger.debug("Ignored \(keyHex): fresher emission but duplicate blob")
+            if newIsFallback || existingIsFallback {
+                NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — fresher emission but DUPLICATE blob")
+            }
             return false
         }
 
@@ -355,11 +524,17 @@ public actor PathTable {
             pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
             saveToDatabase(updated)
             logger.info("Updated \(keyHex): same emission but path was unresponsive")
+            if newIsFallback || existingIsFallback {
+                NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) same emission, prior path unresponsive")
+            }
             pathUpdateContinuation?.yield(updated)
             return true
         }
 
         logger.debug("Ignored \(keyHex): worse hops, not expired, not fresher, not unresponsive")
+        if newIsFallback || existingIsFallback {
+            NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — worse hops, not expired/fresher/unresponsive")
+        }
         return false
     }
 
@@ -842,6 +1017,7 @@ public actor PathTable {
     /// - Parameter destinationHash: 16-byte destination hash
     public func remove(destinationHash: Data) {
         paths.removeValue(forKey: destinationHash)
+        lastHeardByInterface.removeValue(forKey: destinationHash)
         removeFromDatabase(destinationHash)
     }
 
@@ -861,6 +1037,7 @@ public actor PathTable {
             return false
         }
         paths.removeValue(forKey: destinationHash)
+        lastHeardByInterface.removeValue(forKey: destinationHash)
         removeFromDatabase(destinationHash)
         return true
     }
@@ -868,6 +1045,7 @@ public actor PathTable {
     /// Remove all paths from the table and database.
     public func removeAll() {
         paths.removeAll()
+        lastHeardByInterface.removeAll()
         clearDatabase()
     }
 
@@ -893,6 +1071,7 @@ public actor PathTable {
         for key in expiredKeys {
             paths.removeValue(forKey: key)
             pathStates.removeValue(forKey: key)
+            lastHeardByInterface.removeValue(forKey: key)
             removeFromDatabase(key)
         }
 
@@ -904,6 +1083,7 @@ public actor PathTable {
             for key in deadKeys {
                 paths.removeValue(forKey: key)
                 pathStates.removeValue(forKey: key)
+                lastHeardByInterface.removeValue(forKey: key)
                 removeFromDatabase(key)
             }
         }
