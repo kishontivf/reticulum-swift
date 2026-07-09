@@ -226,11 +226,62 @@ public enum AnnounceValidator {
             throw AnnounceValidationError.signatureInvalid
         }
 
+        // Bind the destination hash to the announced identity. A valid signature only
+        // proves the announcer holds the private key for the *announced* public keys —
+        // not that those keys own the destination hash in the header. Without this an
+        // attacker can announce someone else's destination hash with their own keys and
+        // a self-valid signature, poisoning Identity.remember/recall and the path table
+        // so traffic to that destination is encrypted to the attacker (impersonation /
+        // MITM). Single source of truth: validateDestinationBinding.
+        try validateDestinationBinding(parsed: parsed)
+
         logger.debug("Signature verification PASSED")
         return true
     }
 
+    /// Verify the announced public keys are cryptographically bound to the destination hash.
+    ///
+    /// A valid signature only proves the announcer holds the private key for the public
+    /// keys *carried in the payload* — it does NOT prove those keys belong to
+    /// `destinationHash`. Without this check an attacker can announce ANY destination
+    /// hash with their own keypair, self-sign it (the signature verifies against their
+    /// own key), and thereby install a path for the victim destination pointing at
+    /// themselves and overwrite its cached public key — so senders resolving that
+    /// destination encrypt to the attacker (identity/route hijack).
+    ///
+    /// RNS enforces this binding in `Identity.validate_announce` (Identity.py:585-599):
+    /// ```python
+    /// hash_material = name_hash + announced_identity.hash   # identity.hash = truncated_hash(public_key)
+    /// expected_hash = full_hash(hash_material)[:TRUNCATED_HASHLENGTH//8]
+    /// if destination_hash != expected_hash: return False    # "Destination mismatch"
+    /// ```
+    ///
+    /// PLAIN announces carry no keys and have no binding to verify (skipped).
+    ///
+    /// - Parameter parsed: The parsed announce (already signature-verified).
+    /// - Throws: `AnnounceValidationError.hashMismatch` if the keys are not bound to the hash.
+    public static func validateDestinationBinding(parsed: ParsedAnnounce) throws {
+        guard let publicKeys = parsed.publicKeys else { return }  // PLAIN: nothing to bind
+
+        // identity.hash = truncated_hash(public_key); expected = truncated_hash(name_hash || identity.hash)
+        let identityHash = Hashing.truncatedHash(publicKeys)
+        var hashMaterial = parsed.nameHash
+        hashMaterial.append(identityHash)
+        let expected = Hashing.truncatedHash(hashMaterial)
+
+        guard expected == parsed.destinationHash else {
+            logger.warning("Destination binding FAILED: announced keys do not hash to the destination — rejecting spoofed announce")
+            throw AnnounceValidationError.hashMismatch(
+                computed: expected.map { String(format: "%02x", $0) }.joined(),
+                expected: parsed.destinationHash.map { String(format: "%02x", $0) }.joined()
+            )
+        }
+    }
+
     /// Parse and validate in one step.
+    ///
+    /// `validate(parsed:)` performs both the Ed25519 signature check and the
+    /// destination-hash binding, so this is the full RNS `validate_announce`.
     ///
     /// - Parameters:
     ///   - packet: The announce packet
