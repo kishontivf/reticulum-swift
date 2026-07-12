@@ -342,9 +342,17 @@ public actor RatchetManager {
         ])
         let packed = packMsgPack(container)
 
-        // Write atomically
+        // Write atomically. These are forward-secrecy PRIVATE keys — the signature only
+        // authenticates the file, it does not protect confidentiality — so write with data
+        // protection (readable after first unlock, matching the identity/DB stores) and
+        // exclude from device backups, so the keys whose whole purpose is to bound the
+        // blast radius of an identity-key compromise never land in an unencrypted backup.
         do {
-            try packed.write(to: URL(fileURLWithPath: storagePath), options: .atomic)
+            var url = URL(fileURLWithPath: storagePath)
+            try packed.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            var resourceValues = URLResourceValues()
+            resourceValues.isExcludedFromBackup = true
+            try? url.setResourceValues(resourceValues)
         } catch {
             throw RatchetError.persistenceFailed("Write failed: \(error)")
         }

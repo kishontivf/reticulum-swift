@@ -2215,6 +2215,20 @@ public actor ReticulumTransport {
             await link.setAttachedInterface(interfaceId)
             logger.debug("Link \(linkIdHex) stored in activeLinks, awaiting LRRTT")
 
+            // Establishment-timeout watchdog. A responder link waits in `.handshake` for
+            // the initiator's LRRTT. If that never arrives (packet loss, or a peer that
+            // deliberately never completes), the per-link stale watchdog — which only
+            // starts once the link activates — never runs, `cleanupLinks` skips it
+            // (`.handshake` is not terminal), and the link is pinned in `activeLinks` and
+            // `destination._links` forever. An unauthenticated LINKREQUEST flood would then
+            // exhaust memory/CPU. Bound the wait: if the link has not established, close it
+            // (→ `.closed`, terminal) so `periodicTableCleanup`/`cleanupLinks` reclaims it.
+            let pendingLinkId = incomingRequest.linkId
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(LinkConstants.ESTABLISHMENT_TIMEOUT_PER_HOP * 5))
+                await self?.closeIfUnestablished(linkId: pendingLinkId)
+            }
+
             logger.info("LINKREQUEST accepted for \(hexPrefix, privacy: .public)..., PROOF sent, awaiting LRRTT")
 
         } catch {
@@ -3191,6 +3205,20 @@ public actor ReticulumTransport {
             }
             announceQueues[id] = queue.isEmpty ? nil : queue
         }
+    }
+
+    /// Close a responder link that never finished establishing (still `.handshake` /
+    /// `.pending` past the establishment timeout). Closing makes it terminal so
+    /// `cleanupLinks` removes it; a link that already activated or was already closed is
+    /// left untouched. See the establishment-timeout watchdog in `handleLinkRequest`.
+    private func closeIfUnestablished(linkId: Data) async {
+        guard let link = activeLinks[linkId] else { return }
+        let state = await link.state
+        guard !state.isEstablished, !state.isTerminal else { return }
+        let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+        logger.info("Establishment timeout for link \(linkIdHex)... — closing half-open responder link")
+        await link.close(reason: .timeout)
+        activeLinks.removeValue(forKey: linkId)
     }
 
     /// H3: Clean up closed links from pendingLinks and activeLinks dictionaries.

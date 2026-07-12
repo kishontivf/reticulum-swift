@@ -701,26 +701,47 @@ public struct Identity {
     public func saveToKeychain(service: String, account: String) throws {
         let privateKeyData = try exportPrivateKeys()
 
-        // Delete any existing item first
-        let deleteQuery: [String: Any] = [
+        let baseQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: account
         ]
-        SecItemDelete(deleteQuery as CFDictionary)
 
-        // Add new item
-        let addQuery: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: account,
+        // The identity is the user's account: losing it is unrecoverable. Two hardening
+        // choices here:
+        //
+        // 1. `AfterFirstUnlockThisDeviceOnly` (not `WhenUnlockedThisDeviceOnly`) so the key
+        //    stays readable while the screen is locked, once the device has been unlocked
+        //    since boot. A background relaunch (BLE/location wake-up) with the phone locked
+        //    in a pocket must be able to read it, or the caller would treat the key as
+        //    missing and regenerate.
+        // 2. A non-destructive update-or-add. The former delete-then-add could, while the
+        //    device was locked, succeed at deleting the real key and then FAIL to add the
+        //    new one — destroying the only copy. `SecItemUpdate` never removes the item
+        //    unless the new value is written in the same operation.
+        let attributes: [String: Any] = [
             kSecValueData as String: privateKeyData,
-            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
 
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        guard status == errSecSuccess else {
-            throw IdentityError.keychainError(status: status)
+        let updateStatus = SecItemUpdate(baseQuery as CFDictionary, attributes as CFDictionary)
+        if updateStatus == errSecSuccess {
+            return
+        }
+        // Only "no such item" justifies an add; any other error (e.g.
+        // errSecInteractionNotAllowed while locked) must surface, never silently
+        // fall through to overwriting.
+        guard updateStatus == errSecItemNotFound else {
+            throw IdentityError.keychainError(status: updateStatus)
+        }
+
+        var addQuery = baseQuery
+        addQuery[kSecValueData as String] = privateKeyData
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+
+        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
+        guard addStatus == errSecSuccess else {
+            throw IdentityError.keychainError(status: addStatus)
         }
     }
 
