@@ -102,6 +102,20 @@ public actor PathTable {
     /// window, regardless of how often the carrier re-announces. Pruned alongside `paths`.
     private var lastHeardByInterface: [Data: [String: Date]] = [:]
 
+    /// Interface IDs whose transport link is currently `.connected`, pushed periodically by the
+    /// transport (`setConnectedInterfaces`). Used as a *connectivity* liveness signal for the
+    /// carrier takeover: while a destination's incumbent normal interface is still connected (and the
+    /// destination isn't pinned offline), the peer is reachable over it, so the carrier stays on
+    /// standby even if its announces arrive less often than the carrier's direct re-announce.
+    ///
+    /// Announce-recency alone is not a reliable liveness signal here: a peer's announce reaches us
+    /// over TCP via a rate-limiting relay far less often than it reaches us directly over the BLE
+    /// carrier, so a live TCP route can go "announce-silent" past the window while its socket is
+    /// perfectly up (session-4: argonath stayed connected the whole run yet the carrier took over
+    /// after 75s). The PIN (`fallbackPinnedDestinations`, set from the peer's internet-lost signal)
+    /// remains the authoritative offline trigger and overrides this connectivity check.
+    private var connectedInterfaces: Set<String> = []
+
     /// SQLite database handle for persistence
     private var db: OpaquePointer?
 
@@ -299,6 +313,13 @@ public actor PathTable {
         NetworkLog.debug("[FALLBACK] register \(interfaceId) isFallback=\(isFallback) → fallbackSet=\(fallbackInterfaceIds.sorted())")
     }
 
+    /// Update the set of interfaces whose transport link is currently `.connected`. The transport
+    /// pushes this (e.g. from its periodic maintenance) so the carrier-takeover decision can tell a
+    /// live-but-quiet normal interface from a genuinely dead one. See `connectedInterfaces`.
+    public func setConnectedInterfaces(_ ids: Set<String>) {
+        connectedInterfaces = ids
+    }
+
     /// Pin (or unpin) a destination to its fallback interface. See `fallbackPinnedDestinations`.
     public func setDestinationPinnedToFallback(_ destinationHash: Data, _ pinned: Bool) {
         if pinned {
@@ -381,12 +402,25 @@ public actor PathTable {
                 // with the incumbent's own timestamp as a startup fallback before any arrival is
                 // recorded — and adopt the carrier only when those announces have actually stopped.
                 let window = Self.fallbackTakeoverGraceSeconds
-                let normalLive = normalInterfaceHeardRecently(key, within: window)
+                // Connectivity is the primary liveness signal: while the incumbent normal interface's
+                // socket is still connected, the peer is reachable over it, so the carrier stays on
+                // standby — no matter how sparsely the peer's relay-forwarded announces arrive versus
+                // the carrier's direct re-announce (the false takeover of a live TCP route, session-4).
+                // Excluded when the destination is PINNED: a peer that signalled it lost internet must
+                // still yield to the carrier even though our socket to the relay is up.
+                let incumbentNormalConnected = !fallbackPinnedDestinations.contains(key)
+                    && connectedInterfaces.contains(existing.interfaceId)
+                // Announce-recency remains a backstop for when the incumbent interface is gone from the
+                // connected set (e.g. we lost internet) but a normal announce is still fresh; the
+                // startup-timestamp term covers the window before any arrival is recorded.
+                let normalLive = incumbentNormalConnected
+                    || normalInterfaceHeardRecently(key, within: window)
                     || Date().timeIntervalSince(existing.timestamp) < Double(window)
                 if normalLive {
+                    let reason = incumbentNormalConnected ? "interface connected" : "heard < \(window)s ago"
                     logger.debug("Ignored \(keyHex): normal \(existing.interfaceId) still live; carrier \(entry.interfaceId) stands by")
-                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): normal \(existing.interfaceId) heard "
-                        + "< \(window)s ago (alive) → keep TCP, carrier \(entry.interfaceId) stands by")
+                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): normal \(existing.interfaceId) \(reason) "
+                        + "(alive) → keep TCP, carrier \(entry.interfaceId) stands by")
                     return false
                 }
                 // Normal announces have stopped past the window → adopt the carrier.

@@ -3229,6 +3229,8 @@ public actor ReticulumTransport {
         // matching ble-reticulum), not by weakening this sweep.
         let activeIds = Set(interfaces.keys)
         await pathTable.cleanup(activeInterfaceIds: activeIds)
+        let connectedIds = Set(interfaces.filter { $0.value.state == .connected }.map(\.key))
+        await pathTable.setConnectedInterfaces(connectedIds)
         await cleanupLinks()
     }
 
