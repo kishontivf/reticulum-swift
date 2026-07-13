@@ -320,6 +320,28 @@ public actor PathTable {
         connectedInterfaces = ids
     }
 
+    /// The fallback (carrier) interface IDs registered via `setFallbackInterface`. Used by the
+    /// dual-dispatch delivery path to know which interfaces are carriers.
+    public func fallbackInterfaceIdsList() -> [String] {
+        Array(fallbackInterfaceIds)
+    }
+
+    /// Whether `destination`'s announce was heard on `interfaceId` within the given window — i.e.
+    /// the peer is currently reachable over that specific (e.g. carrier) interface. Used to gate a
+    /// dual-dispatch carrier copy so it's only sent to a peer that is actually nearby on the carrier.
+    public func wasHeardOnInterface(_ destination: Data, interfaceId: String, within seconds: TimeInterval) -> Bool {
+        guard let at = lastHeardByInterface[destination]?[interfaceId] else { return false }
+        return Date().timeIntervalSince(at) <= seconds
+    }
+
+    /// Whether the destination's current best path already routes over a fallback (carrier)
+    /// interface — in which case the normal send already used the carrier and a dual-dispatch copy
+    /// would be redundant.
+    public func isBestPathFallback(_ destination: Data) -> Bool {
+        guard let entry = paths[destination] else { return false }
+        return fallbackInterfaceIds.contains(entry.interfaceId)
+    }
+
     /// Pin (or unpin) a destination to its fallback interface. See `fallbackPinnedDestinations`.
     public func setDestinationPinnedToFallback(_ destinationHash: Data, _ pinned: Bool) {
         if pinned {
@@ -408,14 +430,30 @@ public actor PathTable {
                 // the carrier's direct re-announce (the false takeover of a live TCP route, session-4).
                 // Excluded when the destination is PINNED: a peer that signalled it lost internet must
                 // still yield to the carrier even though our socket to the relay is up.
+                //
+                // NOTE (session-13): keying on any-connected-normal-interface was too aggressive — for a
+                // peer on 5G behind carrier NAT the multi-hop TCP path resolves but never DELIVERS, and
+                // keeping TCP then blocks the carrier (the only working path). The right signal is
+                // delivery success, not connectivity; that is being handled via the delivery-failure
+                // demotion path, not by widening this check.
+                // DELIVERY-AWARE: if LXMF has marked this path unresponsive (repeated delivery
+                // failures — e.g. a peer on 5G whose multi-hop TCP path resolves but never delivers),
+                // stop keeping TCP and let the carrier take over, no matter the interface connectivity
+                // or announce recency. This is the real "should we fall to the carrier" signal —
+                // delivery success, not connectivity. It also un-blocks the demotion failover
+                // (LXMRouter.markPathUnresponsive → Path 5 below), which this branch otherwise
+                // short-circuits by returning false before Path 5 can run (session-13: message stuck
+                // onroute on a live-but-undelivering TCP path while the working carrier was rejected).
+                let pathResponsive = !isPathUnresponsive(key)
                 let incumbentNormalConnected = !fallbackPinnedDestinations.contains(key)
                     && connectedInterfaces.contains(existing.interfaceId)
                 // Announce-recency remains a backstop for when the incumbent interface is gone from the
                 // connected set (e.g. we lost internet) but a normal announce is still fresh; the
                 // startup-timestamp term covers the window before any arrival is recorded.
-                let normalLive = incumbentNormalConnected
+                let normalLive = pathResponsive && (
+                    incumbentNormalConnected
                     || normalInterfaceHeardRecently(key, within: window)
-                    || Date().timeIntervalSince(existing.timestamp) < Double(window)
+                    || Date().timeIntervalSince(existing.timestamp) < Double(window))
                 if normalLive {
                     let reason = incumbentNormalConnected ? "interface connected" : "heard < \(window)s ago"
                     logger.debug("Ignored \(keyHex): normal \(existing.interfaceId) still live; carrier \(entry.interfaceId) stands by")
@@ -423,9 +461,12 @@ public actor PathTable {
                         + "(alive) → keep TCP, carrier \(entry.interfaceId) stands by")
                     return false
                 }
-                // Normal announces have stopped past the window → adopt the carrier.
-                NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): normal \(existing.interfaceId) SILENT "
-                    + "> \(window)s → carrier \(entry.interfaceId) takes over")
+                // Reaching here: the normal path is not "live" — either silent past the window, or
+                // marked unresponsive by delivery failures. Distinguish for the log.
+                let takeoverReason = pathResponsive ? "SILENT > \(window)s" : "UNRESPONSIVE (delivery failing)"
+                // Normal path is silent past the window or unresponsive → adopt the carrier.
+                NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): normal \(existing.interfaceId) \(takeoverReason) "
+                    + "→ carrier \(entry.interfaceId) takes over")
             } else {
                 // Candidate = normal, incumbent = fallback (carrier). Reaching here means the dest is
                 // NOT pinned (a pinned dest's normal announces are rejected at the top of record), i.e.

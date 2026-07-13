@@ -1883,6 +1883,40 @@ public actor ReticulumTransport {
         }
     }
 
+    /// Dual-dispatch: send a copy of `packet` over any nearby carrier (fallback) interface, in
+    /// addition to its normal route. Used by opportunistic LXMF delivery so a message reaches a
+    /// peer even when the normal (TCP) route can't actually deliver to it (e.g. a 5G peer behind
+    /// carrier NAT) — without waiting for the delivery-failure demotion to reroute. The receiver
+    /// dedups by packet hash, so the duplicate is harmless. Only fires when the destination was
+    /// recently heard on the carrier (peer physically nearby) and the normal route isn't already the
+    /// carrier (else it would just double-send over the same link).
+    public func sendFallbackCopy(packet: Packet, heardWithin: TimeInterval = 120) async {
+        let dest = packet.destination
+        let destHex = dest.prefix(8).map { String(format: "%02x", $0) }.joined()
+        if await pathTable.isBestPathFallback(dest) {
+            NetworkLog.debug("[DUAL] \(destHex): skipped — best path already on carrier")
+            return
+        }
+        let fallbackIds = await pathTable.fallbackInterfaceIdsList()
+        guard !fallbackIds.isEmpty else { return }
+        var encoded: Data?
+        for id in fallbackIds {
+            guard interfaces[id]?.state == .connected else { continue }
+            guard await pathTable.wasHeardOnInterface(dest, interfaceId: id, within: heardWithin) else {
+                NetworkLog.debug("[DUAL] \(destHex): carrier \(id) skipped — peer not heard within \(Int(heardWithin))s")
+                continue
+            }
+            let data = encoded ?? packet.encode()
+            encoded = data
+            do {
+                try await sendToInterface(data, interfaceId: id)
+                NetworkLog.log("[DUAL] \(destHex): carrier copy sent over \(id) (peer nearby, \(data.count)B)")
+            } catch {
+                NetworkLog.log("[DUAL] \(destHex): carrier copy over \(id) FAILED: \(error.localizedDescription)")
+            }
+        }
+    }
+
     // MARK: - Inbound Packet Routing
 
     /// Receive and route an inbound packet.
@@ -2858,6 +2892,13 @@ public actor ReticulumTransport {
 
         // L2: Rebroadcast detection moved to after validation (inside .recordedAndRebroadcast case)
 
+        // Keep the path table's connected-interface set fresh right before the announce is recorded,
+        // so the carrier-takeover decision (fallback vs normal in pathTable.record) can tell a
+        // live-but-quiet normal interface from a dead one. This runs on every inbound announce, so it
+        // works in ENDPOINT mode — unlike periodicTableCleanup, whose retransmission loop is stopped
+        // when transport (relay) mode is off, which left connectedInterfaces empty and the fix inert.
+        await refreshConnectedInterfaces()
+
         // Process via announce handler
         let result = await announceHandler.process(
             packet: packet,
@@ -3246,6 +3287,23 @@ public actor ReticulumTransport {
     /// Throttle counter for periodic cleanup in retransmission loop (H4/H3).
     private var tableCullCounter: Int = 0
 
+    /// Last connected-interface set pushed to the path table — so `refreshConnectedInterfaces`
+    /// only pushes/logs when connectivity actually changes.
+    private var lastConnectedInterfaceSet: Set<String> = []
+
+    /// Recompute the set of interfaces with a live (`.connected`) link and push it to the path table
+    /// (used by the carrier-takeover decision). Pushes/logs only on change. Called from the inbound
+    /// announce path (`processAnnounce`) so it stays current in ENDPOINT mode, and from
+    /// `periodicTableCleanup` for relay mode.
+    private func refreshConnectedInterfaces() async {
+        let connectedIds = Set(interfaces.filter { $0.value.state == .connected }.map(\.key))
+        guard connectedIds != lastConnectedInterfaceSet else { return }
+        lastConnectedInterfaceSet = connectedIds
+        await pathTable.setConnectedInterfaces(connectedIds)
+        // TEMP diagnostic (carrier-takeover fix validation): remove once confirmed.
+        NetworkLog.log("[FALLBACK] connected set = \(connectedIds.sorted()) (of \(interfaces.count) registered)")
+    }
+
     /// H3/H4: Periodic cleanup of links and paths, throttled to every ~5 seconds.
     private func periodicTableCleanup() async {
         tableCullCounter += 1
@@ -3257,8 +3315,7 @@ public actor ReticulumTransport {
         // matching ble-reticulum), not by weakening this sweep.
         let activeIds = Set(interfaces.keys)
         await pathTable.cleanup(activeInterfaceIds: activeIds)
-        let connectedIds = Set(interfaces.filter { $0.value.state == .connected }.map(\.key))
-        await pathTable.setConnectedInterfaces(connectedIds)
+        await refreshConnectedInterfaces()
         await cleanupLinks()
     }
 
