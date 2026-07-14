@@ -59,8 +59,19 @@ public final class TCPTransport: Transport {
     /// Queue for connection operations.
     private let connectionQueue = DispatchQueue(label: "com.columba.tcptransport", qos: .userInitiated)
 
-    /// Current connection state.
-    public private(set) var state: TransportState = .disconnected
+    /// Guards `_state` so external callers (e.g. the reconnect loop) can read `state` from any
+    /// thread while the connection callbacks mutate it on `connectionQueue`, without racing the
+    /// retain/release of its associated `Error` payload (the cause of an `objc_retain`
+    /// use-after-free crash under concurrent connect/disconnect + timeout).
+    private let stateLock = NSLock()
+    private var _state: TransportState = .disconnected
+
+    /// Current connection state. Thread-safe.
+    public var state: TransportState {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _state
+    }
 
     /// Connection timeout work item (cancelled on success or disconnect).
     private var connectionTimeoutWork: DispatchWorkItem?
@@ -92,6 +103,13 @@ public final class TCPTransport: Transport {
 
     /// Establish TCP connection to the configured server.
     public func connect() {
+        // All access to connection/state/timeout state is serialized on `connectionQueue` —
+        // the same queue the NWConnection callbacks and timeout run on — so a caller-thread
+        // connect can't race those callbacks.
+        connectionQueue.async { [weak self] in self?.connectOnQueue() }
+    }
+
+    private func connectOnQueue() {
         guard state == .disconnected || state != .connecting else {
             logger.warning("Connect called but already connecting/connected")
             return
@@ -163,6 +181,10 @@ public final class TCPTransport: Transport {
     ///   - data: Data to send.
     ///   - completion: Optional callback with nil on success, Error on failure.
     public func send(_ data: Data, completion: ((Error?) -> Void)? = nil) {
+        connectionQueue.async { [weak self] in self?.sendOnQueue(data, completion: completion) }
+    }
+
+    private func sendOnQueue(_ data: Data, completion: ((Error?) -> Void)? = nil) {
         guard state == .connected else {
             let error = TransportError.notConnected
             logger.error("Send failed: not connected")
@@ -183,6 +205,10 @@ public final class TCPTransport: Transport {
 
     /// Disconnect and clean up the connection.
     public func disconnect() {
+        connectionQueue.async { [weak self] in self?.disconnectOnQueue() }
+    }
+
+    private func disconnectOnQueue() {
         logger.info("Disconnecting TCP connection")
         connectionTimeoutWork?.cancel()
         connectionTimeoutWork = nil
@@ -241,7 +267,9 @@ public final class TCPTransport: Transport {
     }
 
     private func updateState(_ newState: TransportState) {
-        state = newState
+        stateLock.lock()
+        _state = newState
+        stateLock.unlock()
         // Invoke the callback on our dedicated connection queue rather
         // than DispatchQueue.main. The UI-oriented original implementation
         // assumed a main run loop was live, but that breaks non-UI hosts
