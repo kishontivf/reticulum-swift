@@ -548,5 +548,58 @@ When pulling new upstream work:
    (D1 depends on the latter) or the `PATH_STATE_*` constants.
 5. Re-sync `kishontivf/LXMF-swift` in lockstep — see [Downstream coupling](#downstream).
 6. `swift build && swift test`.
-7. Update the base/HEAD/net-diff/last-reviewed lines at the top of this file, and append any
-   new fork commits to the [commit ledger](#summary).
+7. Update the base/HEAD/net-diff/last-reviewed lines at the top of this file, refresh
+   [Status at generation](#status), and append any new fork commits to the
+   [commit ledger](#summary).
+
+---
+
+## Status at generation {#status}
+
+**Generated:** 2026-08-02 (all figures below measured on that date, against
+`upstream` = `git@github.com:torlando-tech/reticulum-swift.git` after `git fetch upstream`).
+
+| Metric | Value |
+|--------|-------|
+| Fork HEAD | `36b9d20` — 2026-07-14 (19 days old) |
+| Upstream base we sit on | `52e2a9a` — 2026-06-23 (**40 days old**) |
+| Upstream `main` tip | `52e2a9a` — identical to our base |
+| Upstream commits we are missing | **0** — `upstream/main` has not moved since we branched |
+| Our commits ahead of upstream | **16** (10 content commits + 6 merges) |
+
+So the fork is strictly ahead: nothing to pull, 16 commits to carry. The "40 days old"
+figure is the age of upstream's newest work on `main`, not a backlog — upstream `main`
+itself has been idle since 2026-06-23.
+
+**Unmerged upstream branches** (not on `main`, so not counted above, but they are where the
+next re-sync conflict will come from):
+
+| Branch | Ahead of `main` | Tip | Relevance |
+|--------|-----------------|-----|-----------|
+| `fix/conformance-failures` | 27 | `c2f335c` — 2026-06-24 | **The one to watch.** 31 files, and it touches `AnnounceHandler.swift` and `ReticulumTransport.swift` — direct overlap with [D1](#d1), [D2](#d2), [D3](#d3), [D4](#d4), [D6](#d6) and [D12](#d12). It also splits the transport into `ReticulumTransport+Transport.swift` / `+Tunnels.swift`, so our transport changes would need re-homing, not just merging |
+| `fix/ios-rnode-session-restoration` | 2 | `604a82f` — 2026-07-31 | Newest upstream work anywhere. Touches `BLETransport.swift` and `RNodeBLEIdentityTests.swift` only — no overlap with our D-sections |
+| `docs/add-implementation-status` | 1 | `5d7ebe6` — 2026-03-27 | `ReticulumSwift.swift` only; documentation/status. No overlap |
+
+Four further upstream branches (`cleanup/remove-unused-module-entry`,
+`fix/invalidate-stale-path-interface`, `fix/link-data-no-header2-conversion`,
+`fix/pathtable-ne-safe-h4`) are 0 ahead of `main` — already contained in our base, nothing
+to re-apply.
+
+**Ledger date note:** the commit ledger shows **author** dates, and author and committer
+dates agree throughout — nothing in this fork was rebased. `c25b95e` (2026-05-30) reads as
+older than the base it sits on because the fork branched from an earlier upstream point and
+later took `upstream/main` in as a merge (`7e68ab6`) rather than rebasing onto it. Two
+commits have a committer date one day after their author date (`c2cdf92`, `d989b02`) — PR
+merge timing, no history rewrite.
+
+## Document changelog {#doc-changelog}
+
+Revisions to *this file*, newest first. One row per edit; the "Covers" column is the fork
+HEAD the file described at that point.
+
+| Date | Covers | Change |
+|------|--------|--------|
+| 2026-08-02 | `36b9d20` | Added [Status at generation](#status) and this changelog. |
+| 2026-08-02 | `36b9d20` | Restructured to match `kishontivf/LXMF-swift`'s format: [D1](#d1)–[D13](#d13) numbered divergence sections with `{#dN}` anchors, summary table with `Depends on`, commit ledger, [Schema & domain changes](#schema) as a standing register with ledger rows [S1/S2](#schema) and rules, per-section `Known gap` callouts, new [Downstream coupling](#downstream) chapter, and a re-sync checklist. Dropped source line-number citations. |
+| 2026-08-02 | `36b9d20` | Corrected seven per-file diff counts in the summary table that had used git's total-lines-changed column as the insertion count; the table now sums to the verified +1021 / −46. |
+| 2026-08-02 | `36b9d20` | Initial version — chapter-based layout (schema vs. implementation logic), commit index, wire/interop impact, risks and open items. |
