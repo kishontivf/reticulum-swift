@@ -1,180 +1,442 @@
-# KVF divergence from upstream `reticulum-swift`
+# KVF divergence from upstream reticulum-swift
 
-Divergence of `kishontivf/reticulum-swift` (`origin/master`) from `torlando-tech/reticulum-swift`
-(`upstream/main`).
+Living record of every change this fork (`kishontivf/reticulum-swift`) carries on top of
+upstream (`torlando-tech/reticulum-swift`). **Keep this file current: any commit that adds,
+changes, or drops a divergence must update the matching section — and its commit list —
+in the same commit.**
 
-| | |
-|---|---|
-| Fork HEAD | `36b9d20` — *Crash fix* |
-| Upstream base | `52e2a9a` — *Merge pull request #25 from torlando-tech/feat/rnode-ble-uuid-identity* |
-| Relationship | **Fast-forward ahead.** 16 commits ahead, **0 behind** — the fork contains all of `upstream/main`, no upstream work is missing and no divergent history exists |
-| Net diff | 14 files changed, 1021 insertions(+), 46 deletions(-) |
-| Date range | 2026-05-30 → 2026-07-14 |
+These are our own product requirements — there is no intent to upstream them. The point of
+this file is to know exactly what to re-apply and what to watch for when pulling upstream
+work *in*.
 
-Reproduce with:
+Scope note: this file tracks *fork vs. upstream*. `port-deviations.md` tracks *Swift port
+vs. python RNS* and is upstream's document — the fork has added no entries to it. If we
+ever do, that entry is itself a divergence and must be listed here.
 
-```sh
-git fetch upstream
-git rev-list --left-right --count upstream/main...HEAD   # → 0  16
-git diff 52e2a9a..HEAD
-```
+Downstream note: `kishontivf/LXMF-swift` depends on this fork and consumes two of these
+divergences directly — see [Downstream coupling](#downstream).
 
-## Contents
+- **Upstream base:** `52e2a9a` (`Merge pull request #25 … feat/rnode-ble-uuid-identity`)
+- **Fork HEAD at last update:** `36b9d20` (Crash fix)
+- **Upstream commits not in this fork:** none — the fork is strictly ahead (16 / 0).
+- **Net diff:** 14 files, +1021 / −46
+- **Last reviewed:** 2026-08-02
 
-1. [Divergence at a glance](#1-divergence-at-a-glance)
-2. [Schema & domain changes](#2-schema--domain-changes) ← every change that introduced domain or storage state
-3. [Implementation-logic changes](#3-implementation-logic-changes)
-4. [Commit index](#4-commit-index)
-5. [Wire-protocol & interop impact](#5-wire-protocol--interop-impact)
-6. [Risks and open items](#6-risks-and-open-items)
+## Summary
+
+| ID | Area | Change | Commits | Depends on |
+|----|------|--------|---------|------------|
+| [D1](#d1) | Routing (PathTable) | Fallback/carrier interface model — deprioritise a carrier against normal interfaces regardless of hop count | `5695d00`, `c154af3`, `bc483ec`, `2e11b59` | — |
+| [D2](#d2) | Transport (outbound) | Dual dispatch — `sendFallbackCopy` emits a carrier copy alongside the normal route | `2e11b59` | D1 |
+| [D3](#d3) | Routing (announce) | Path-recording fixes: null next-hop fallback, shorter-hop upgrade | `c154af3`, `2e11b59` | — |
+| [D4](#d4) | Protocol (announce) | Destination-hash binding + known-key collision guard | `c2cdf92` | — |
+| [D5](#d5) | Protocol (MessagePack) | Decoder depth cap | `c2cdf92` | — |
+| [D6](#d6) | Transport (link) | Half-open link establishment watchdog | `d989b02` | — |
+| [D7](#d7) | Crypto (Identity) | Keychain accessibility + non-destructive write | `d989b02` | — |
+| [D8](#d8) | Crypto (RatchetManager) | Ratchet file protection class + backup exclusion | `d989b02` | — |
+| [D9](#d9) | Interfaces (MPC) | Deterministic invite direction, bounded reconnect, half-open session healing | `d7dcc67` | — |
+| [D10](#d10) | Transport (TCP) | `TCPTransport` thread-safety — lock-guarded state, queue-serialised API | `36b9d20` | — |
+| [D11](#d11) | Interfaces (TCP) | Reconnect backoff capped at 10 s | `c154af3` | — |
+| [D12](#d12) | Logging | `NetworkLog` — opt-in routing diagnostic log | `ebda44b`, `c154af3` | — |
+| [D13](#d13) | Repo hygiene | `.gitignore` additions | `c25b95e` | — |
+
+### Commit ledger
+
+Every fork commit since the upstream base, oldest first. Merge commits (`b3e5b64`,
+`49cc82e`, `aa5f0b6`, `15232eb`, `318a0fb` — the PR merges for `feature/offline-improvements`,
+`feature/bluetooth`, `feature/fable-security-fixes`, `review/fable-fixes`,
+`feature/improvements` — and `7e68ab6`, the upstream merge) carry no changes of their own
+and are omitted.
+
+| Commit | Date | Subject | Divergence |
+|--------|------|---------|------------|
+| `c25b95e` | 2026-05-30 | Improvements and locks | [D13](#d13) |
+| `ebda44b` | 2026-06-26 | Logs and improvements | [D12](#d12) |
+| `d7dcc67` | 2026-06-30 | MPCInterface discovery fix | [D9](#d9) |
+| `5695d00` | 2026-07-02 | Asymmetric transports | [D1](#d1) (initial fallback model) |
+| `c154af3` | 2026-07-03 | Fallback interface support | [D1](#d1), [D3](#d3), [D11](#d11), [D12](#d12) |
+| `c2cdf92` | 2026-07-05 | Fable security fixes | [D4](#d4), [D5](#d5) |
+| `d989b02` | 2026-07-12 | Fable review, fixes. Identity fix if app running without unlock | [D6](#d6), [D7](#d7), [D8](#d8) |
+| `bc483ec` | 2026-07-13 | Keeping up multiple active interfaces | [D1](#d1) (connected-interface set) |
+| `2e11b59` | 2026-07-13 | Improving message sending | [D1](#d1), [D2](#d2), [D3](#d3) |
+| `36b9d20` | 2026-07-14 | Crash fix | [D10](#d10) |
+
+The D-sections below cover **logic/behaviour** divergence. Anything that changes the
+*shape* of the stored data — DB schema, persisted record attributes, or domain model — is
+tracked separately in [Schema & domain changes](#schema) and must be logged there too.
 
 ---
 
-## 1. Divergence at a glance
+## Schema & domain changes {#schema}
 
-| File | ± | Theme |
-|---|---|---|
-| `Sources/ReticulumSwift/Routing/PathTable.swift` | +272 | Fallback-interface routing model (new domain state) |
-| `Sources/ReticulumSwift/Interfaces/MPC/MPCInterface.swift` | +139/−10 | Deterministic invite direction, reconnect, half-open session healing |
-| `Sources/ReticulumSwift/Logging/NetworkLog.swift` | +135 (new file) | New opt-in routing diagnostic log |
-| `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` | +93 | Dual-dispatch send, link establishment watchdog, connected-interface push |
-| `Sources/ReticulumSwift/Routing/AnnounceHandler.swift` | +85/−4 | Known-key collision guard, null next-hop fix, throttled snapshots |
-| `Sources/ReticulumSwift/Protocol/AnnounceValidator.swift` | +51 | Destination-hash binding (announce spoofing fix) |
-| `Sources/ReticulumSwift/Crypto/Identity.swift` | +33/−12 | Keychain accessibility + non-destructive write |
-| `Sources/ReticulumSwift/Transport/TCPTransport.swift` | +31/−3 | Lock-guarded state, queue-serialized API (crash fix) |
-| `Sources/ReticulumSwift/Protocol/MessagePack.swift` | +24/−14 | Decoder depth cap |
-| `Sources/ReticulumSwift/Crypto/RatchetManager.swift` | +10/−2 | Ratchet file protection + backup exclusion |
-| `Sources/ReticulumSwift/Interfaces/TCPInterface.swift` | +7/−1 | Reconnect backoff cap |
-| `Tests/…/AnnounceBindingTests.swift` | +91 (new) | Announce binding tests |
-| `Tests/…/MessagePackHardeningTests.swift` | +47 (new) | Width/depth bomb tests |
-| `.gitignore` | +3 | Ignore `Derived/`, `*.xcodeproj`, `*.xcworkspace` |
+Standing register for structural changes: new/renamed/dropped **tables**, **columns**,
+**indexes**, and new/changed **persisted properties** on domain types. Logic-only changes
+do not belong here — this chapter answers "did the stored data shape change, and can an
+older or newer build still read it?"
 
-Untouched relative to upstream: `README.md`, `port-deviations.md`, `Package.swift`, `codecov.yml`,
-CI workflows, `Sources/ConformanceBridge/`, and every other source file.
+**Current state: no SQLite divergence, two persisted-attribute divergences.**
+
+The `paths` table and both migrations are upstream's, byte-identical. There is no database
+migration to run, and a persisted path database opens unchanged in either direction:
+
+| Structure | Origin |
+|-----------|--------|
+| `paths` base DDL — `CREATE TABLE IF NOT EXISTS paths (…)`, 11 columns | upstream |
+| `migrateRandomBlobColumn()` — `random_blob` BLOB → `random_blobs` TEXT, via table rebuild | upstream |
+| `migrateAnnounceDataColumn()` — `ALTER TABLE paths ADD COLUMN announce_data BLOB` | upstream |
+
+Unlike LXMF-swift there is **no version counter**: reticulum's migrations are idempotent
+functions that self-detect via `PRAGMA table_info(paths)` and return early if already
+applied. This changes the collision failure mode — see [rule 2](#rules) below.
+
+Two fork changes *do* alter how existing records are stored, without touching shape. Both
+are implicit, applied on next write, and one-way:
+
+### Ledger
+
+Append one row per structural change. Keep it even after upstream adopts the same idea —
+the point is to be able to reconstruct what our stored data looks like at any commit.
+
+| ID | Commit | Date | Migration | Structure changed | Domain property | Reason |
+|----|--------|------|-----------|-------------------|-----------------|--------|
+| S1 | `d989b02` | 2026-07-12 | none — implicit, on next `saveToKeychain` | Keychain identity item: `kSecAttrAccessible` `WhenUnlockedThisDeviceOnly` → `AfterFirstUnlockThisDeviceOnly` | — (attribute of the stored item, not a Swift property) | Background relaunch with the device locked could not read the key, concluded it was missing, and regenerated a new identity — see [D7](#d7) |
+| S2 | `d989b02` | 2026-07-12 | none — implicit, on next ratchet write | Ratchet key file: protection class → `completeFileProtectionUntilFirstUserAuthentication`; `isExcludedFromBackup = true` | — | File holds forward-secrecy private keys; its signature authenticates but does not protect confidentiality — see [D8](#d8) |
+
+**Not in this ledger, deliberately:**
+
+- **The fallback/liveness domain model** ([D1](#d1)) adds four instance properties, two
+  public statics and six public methods to `PathTable`, but **none of it is persisted** —
+  it is in-memory only, so it changes no stored shape. Its restart semantics are a real
+  operational hazard and are documented in D1 instead.
+- **Row-lifecycle changes** in the `paths` table ([D1](#d1), [D3](#d3)) change *which* rows
+  get written and *which* interface owns a route, not the columns. Same schema, different
+  contents.
+- **`TCPTransport.state`** ([D10](#d10)) moved from a stored property to a lock-guarded
+  computed one. Storage shape in memory only; nothing persisted, and the public name, type
+  and read semantics are unchanged.
+
+### Rules for adding one {#rules}
+
+1. **Append, never edit.** A migration that has shipped has already run on user devices —
+   changing its body is silently a no-op there. Add a new migration function instead.
+2. **There is no counter to collide on — the risk is the column name.** Upstream will keep
+   adding self-detecting `migrate<Thing>Column()` functions guarded by
+   `PRAGMA table_info(paths)`. If we add a column upstream later adds under the same name,
+   both guards see it present and neither runs, and the two builds silently disagree about
+   what the column *means*. Prefix ours `kvf_<what>` so a re-sync produces a visible
+   conflict at the migration list instead of two different semantics sharing one column.
+3. **Log the domain side too.** If the column backs a new property on `PathEntry` or
+   another domain type, name it in the ledger — that property is part of the public API
+   surface consumers compile against.
+4. **Check every reader.** `PathTable` opens the database with plain `sqlite3_open`
+   (read/write, create) and there is no read-only mode. Any second process opening the same
+   file gets a writable handle and will run its own migrations, so a column added by a newer
+   binary must tolerate being read by an older one still running against the same file.
+5. **Every migration must apply to a database written before it existed.** Make no
+   assumptions about pre-existing rows, and make the guard idempotent in both directions —
+   the `announce_data` migration is the model to copy: probe `table_info`, return early if
+   present, otherwise a single `ALTER TABLE … ADD COLUMN`. Prefer `ADD COLUMN` over the
+   table-rebuild pattern in `migrateRandomBlobColumn()`, which drops and recreates.
+6. **Update the summary table** with an `S<n>` row and this chapter's entry in the same commit.
 
 ---
 
-## 2. Schema & domain changes
+## D1 — Fallback (carrier) interface routing model {#d1}
 
-This chapter covers every fork change that introduced **new domain state, domain objects, public
-domain API, or persisted-storage change** — as opposed to changes that only altered implementation
-logic. Changes that are purely logic live in [chapter 3](#3-implementation-logic-changes).
+**Commits:** `5695d00` (initial model), `c154af3` (takeover/promotion rules, pinning),
+`bc483ec` (connected-interface set), `2e11b59` (delivery-awareness, unconditional promote)
 
-### 2.0 Headline: no relational schema change
+**Files:** `Sources/ReticulumSwift/Routing/PathTable.swift`,
+`Sources/ReticulumSwift/Transport/ReticulumTransport.swift`
 
-**No SQLite table, column, or index was created, altered, or dropped by the fork.** The `paths`
-table DDL in `PathTable.swift` (`CREATE TABLE … paths`, the `announce_data` `ALTER TABLE`
-migration) is byte-identical to upstream. There is **no database migration to run** and an existing
-persisted path database opens unchanged in both directions.
+The largest divergence in the fork: a whole routing concept upstream does not have. A
+*fallback (carrier) interface* is deliberately deprioritised against normal interfaces
+**regardless of hop count**, plus the liveness bookkeeping needed to decide when the
+carrier may take a route over.
 
-What *did* change at the database level is **row lifecycle** — which rows get written, updated, or
-withheld. See [2.4](#24-row-lifecycle-changes-in-the-paths-table).
+The problem it solves: a carrier (e.g. an app's virtual BLE link) is physically adjacent
+and therefore always low-hop, so on pure hop-count it beats any real route; and it
+re-announces far more often than a periodic relayed announce, so on pure freshness it also
+always looks newer. Either metric alone lets the carrier capture and hold every route.
 
-### 2.1 New domain objects
+New instance state on the `PathTable` actor — **all in-memory, none persisted**:
 
-#### `NetworkLog` — new public type
+| Property | Type | Meaning |
+|----------|------|---------|
+| `fallbackInterfaceIds` | `Set<String>` | Interfaces the embedder marked low-priority carrier |
+| `fallbackPinnedDestinations` | `Set<Data>` | Destinations pinned to the carrier; normal-interface announces are rejected while pinned |
+| `lastHeardByInterface` | `[Data: [String: Date]]` | Per-destination, per-interface last-announce time — the liveness signal |
+| `connectedInterfaces` | `Set<String>` | Interfaces whose transport link is `.connected`, pushed by the transport |
 
-`Sources/ReticulumSwift/Logging/NetworkLog.swift` (new file, new `Logging/` directory).
+New public statics: `fallbackTakeoverGraceSeconds` (`UInt64`, 75) and
+`fallbackPromoteMaxLagSeconds` (`UInt64`, 90 — **dead, see the known gap below**).
 
-A public, opt-in, file-backed diagnostic log dedicated to *following routing decisions*, kept
-separate from the `os.Logger` firehose.
+New public methods: `setFallbackInterface(_:isFallback:)`, `setConnectedInterfaces(_:)`,
+`fallbackInterfaceIdsList()`, `wasHeardOnInterface(_:interfaceId:within:)`,
+`isBestPathFallback(_:)`, `setDestinationPinnedToFallback(_:_:)`. On the transport side:
+`lastConnectedInterfaceSet`, `refreshConnectedInterfaces()`.
 
-| Member | Kind | Notes |
-|---|---|---|
-| `configure(directory:fileName:)` | `public static func` | Enables the log; default file `reticulum-network.log` |
-| `disable()` | `public static func` | Back to no-op |
-| `isEnabled` | `public static var` (get) | Cheap guard for expensive snapshot building |
-| `debugScaffolding` | `public static var` | **Defaults to `true`**; master switch for the temporary `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK]` markers |
-| `log(_:)` / `debug(_:)` | `public static func` | `@autoclosure`; `debug` additionally gated on `debugScaffolding` |
-| `describe(_ entry: PathEntry)` | `public static func` | One-line path-entry summary |
-| `hex8(_:)`, `hasZeroNextHop(_:)` | `public static func` | Formatting / null-next-hop predicate |
+Decision rules as implemented, inside `PathTable.record(entry:)`:
 
-Storage side effects (new persisted artifacts on disk):
+- **Carrier may take over** only when the normal path is genuinely dead — silent on every
+  non-fallback interface for `fallbackTakeoverGraceSeconds` (75 s ≈ 2.5× a 30 s announce
+  interval; 45 s flapped on a single late announce), **or** its interface is not in the
+  connected set, **or** the path is marked unresponsive by delivery failures.
+- **Delivery-awareness is the decisive signal, not connectivity.** Keying purely on
+  "incumbent interface is connected" was too aggressive: a peer on 5G behind carrier NAT
+  has a TCP path that resolves but never delivers, and holding it blocked the only working
+  link. `isPathUnresponsive` (upstream API, fed by `LXMRouter.markPathUnresponsive`)
+  overrides the connectivity check — which also un-blocks the existing demotion failover
+  that this branch would otherwise short-circuit with an early `return false`.
+- **Normal reclaims unconditionally** on the first normal-interface announce for an
+  unpinned destination. Any freshness gate here let the direct carrier — which wins every
+  arrival race — hold the route indefinitely (a ~140 s BLE→TCP return was observed). The
+  authoritative holds are the pin and the 75 s anti-flap window.
+- **Pinning is the authoritative offline trigger.** While a peer is pinned, normal-interface
+  announces are rejected outright, so a transport node still relaying that peer's dead TCP
+  path cannot refresh liveness and starve the carrier.
+- **Connected-set refresh** is called from the *inbound announce path* as well as
+  `periodicTableCleanup`, because the latter's retransmission loop is stopped when relay
+  mode is off — which left `connectedInterfaces` permanently empty in ENDPOINT mode and made
+  the whole liveness check inert.
 
-- Creates `<directory>/reticulum-network.log`.
-- Rolls one generation aside to `<directory>/reticulum-network.prev.log` on each `configure`.
-- Written on a private serial `DispatchQueue`; `fileURL` and `debugScaffolding` are
-  `nonisolated(unsafe)` statics.
-- **No file-protection class or backup exclusion is set on these files**, unlike the ratchet store
-  ([2.5](#25-persisted-storage-attribute-changes)). Log content includes destination hashes (first
-  8 bytes), interface IDs, hop counts, and node display names (control characters stripped).
+`lastHeardByInterface` is pruned everywhere `paths` is pruned. The other three sets are
+never pruned (small, embedder-controlled).
 
-### 2.2 New domain properties
+**Why it matters:** with no fallback interface registered, routing is upstream's except for
+the shorter-hop upgrade in [D3](#d3). Every behaviour above is dormant until the embedder
+calls `setFallbackInterface`.
 
-#### `PathTable` — the fallback-interface / liveness model
+**Known gap — restart semantics.** None of this state is persisted. After a process restart
+the fallback registry must be re-declared by the embedder, all pins are lost, and
+`lastHeardByInterface` is empty — the takeover decision then falls back to the incumbent
+entry's own `timestamp` as a startup liveness proxy. Nothing in the library enforces or
+reminds; a host that registers once at first launch silently loses the behaviour on relaunch.
 
-`Sources/ReticulumSwift/Routing/PathTable.swift`. This is the largest domain addition in the fork:
-a whole new routing concept — a *fallback (carrier) interface* that is deliberately deprioritized
-against normal interfaces regardless of hop count, plus the liveness bookkeeping needed to decide
-when the carrier may take a route over.
+**Known gap — `fallbackPromoteMaxLagSeconds` is public, mutable and dead.** It survives only
+for source stability; the unconditional-promote change removed its last reader. An embedder
+tuning it gets no effect and no warning.
 
-New instance state (all **in-memory only — none of it is persisted to SQLite**):
+**Known gap — process-wide mutable statics.** `fallbackTakeoverGraceSeconds` is global
+configuration, not per-instance: a concern for multi-instance hosts and for tests running in
+parallel.
 
-| Property | Type | Line | Meaning |
-|---|---|---|---|
-| `fallbackInterfaceIds` | `Set<String>` | 73 | Interfaces the embedder marked low-priority fallback/carrier |
-| `fallbackPinnedDestinations` | `Set<Data>` | 97 | Destinations pinned to the carrier; announces from normal interfaces are rejected while pinned |
-| `lastHeardByInterface` | `[Data: [String: Date]]` | 103 | Per-destination, per-interface wall-clock last-announce time — the liveness signal |
-| `connectedInterfaces` | `Set<String>` | 117 | Interfaces whose transport link is `.connected`, pushed by the transport |
+**Known gap — no test coverage.** The entire model is untested; its correctness rationale
+lives in in-code comments referencing field sessions ("session-3", "session-13",
+"session-37") that are not reproducible from this repository.
 
-New static configuration (public, mutable, process-wide):
+## D2 — Dual dispatch (carrier copy) {#d2}
 
-| Property | Type | Default | Line | Meaning |
-|---|---|---|---|---|
-| `fallbackTakeoverGraceSeconds` | `UInt64` | `75` | 83 | How long a destination's normal interface may go announce-silent before the carrier may take over |
-| `fallbackPromoteMaxLagSeconds` | `UInt64` | `90` | 90 | **Deprecated / dead** — kept for source stability, no longer consulted. Promotion is now unconditional for unpinned destinations |
+**Commits:** `2e11b59`
 
-New public methods on the `PathTable` actor:
+**Files:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift`
 
-| Method | Line | Purpose |
-|---|---|---|
-| `setFallbackInterface(_:isFallback:)` | 307 | Register/unregister an interface as fallback |
-| `setConnectedInterfaces(_:)` | 319 | Transport pushes the live-connection set |
-| `fallbackInterfaceIdsList() -> [String]` | 325 | Carrier IDs, for the dual-dispatch send path |
-| `wasHeardOnInterface(_:interfaceId:within:) -> Bool` | 332 | Is the peer currently reachable on that specific interface |
-| `isBestPathFallback(_:) -> Bool` | 340 | Does the current best path already route over a carrier |
-| `setDestinationPinnedToFallback(_:_:) -> Void` | 346 | Pin/unpin a peer to the carrier (embedder sets this from an out-of-band "peer lost internet" signal) |
+New `public func sendFallbackCopy(packet:heardWithin:)` (default `heardWithin` = 120 s).
+Sends a second copy of a packet over a nearby carrier interface *in addition to* its normal
+route, so a message reaches an undeliverable-but-nearby peer without waiting for demotion.
 
-New private helper: `normalInterfaceHeardRecently(_:within:)` (line 357).
+Gated on three conditions: the best path is not already the carrier, the carrier interface
+is `.connected`, and the peer was heard on that carrier within `heardWithin`. The receiver
+dedups by packet hash, so the loser is a no-op and the duplicate is transparent to a
+conformant peer.
 
-**Lifecycle wiring:** `lastHeardByInterface` is pruned everywhere `paths` is pruned —
-`remove(destinationHash:)`, the conditional remove, `removeAll()`, and both expiry sweeps in
-`cleanup(activeInterfaceIds:)`. `fallbackInterfaceIds`, `fallbackPinnedDestinations`, and
-`connectedInterfaces` are never pruned (they are small, embedder-controlled sets).
+**Why it matters:** this is the API `kishontivf/LXMF-swift` D5 calls from `sendOpportunistic`
+— removing or renaming it breaks the downstream fork. See [Downstream coupling](#downstream).
 
-**Restart semantics (important):** because none of this state is persisted, after a process
-restart the fallback registry must be re-declared by the embedder, all pins are lost, and
-`lastHeardByInterface` is empty — the takeover decision then falls back to the incumbent entry's
-own `timestamp` as its startup liveness proxy (`PathTable.swift:350`).
+**Known gap:** untested, and it has no `sendDirect` (link-based) equivalent — it applies to
+the opportunistic path only.
 
-#### `ReticulumTransport`
+## D3 — Announce path-recording fixes {#d3}
 
-| Member | Kind | Line | Notes |
-|---|---|---|---|
-| `sendFallbackCopy(packet:heardWithin:)` | **new `public func`** | 1893 | Dual-dispatch: sends a second copy of a packet over any nearby carrier interface in addition to its normal route. Default `heardWithin` = 120 s |
-| `lastConnectedInterfaceSet` | new `private var Set<String>` | 3292 | Change-detection so the connected set is only pushed/logged on change |
-| `refreshConnectedInterfaces()` | new `private func` | 3298 | Recomputes and pushes the connected set to `PathTable` |
-| `closeIfUnestablished(linkId:)` | new `private func` | 3255 | Closes a responder link stuck in `.handshake` past the establishment timeout |
+**Commits:** `c154af3` (null next-hop), `2e11b59` (shorter-hop upgrade)
 
-#### `MPCInterface`
+**Files:** `Sources/ReticulumSwift/Routing/AnnounceHandler.swift`,
+`Sources/ReticulumSwift/Routing/PathTable.swift`
 
-| Member | Kind | Line | Notes |
-|---|---|---|---|
-| `discoveredPeers` | new `private var [String: MCPeerID]` | 78 | Peers seen by the browser *or* connected via our advertiser, retained so a dropped link can be re-invited within the session |
-| `sessionForInvitation(from:)` | new internal method | 340 | Replaces `getSession()`; returns a rebuilt session when the link is half-open |
-| `getSession()` | **removed** | — | Was internal (not `public`), so this is not a public API break |
-| `handleFoundPeer` / `handleLostPeer` / `invitePeerIfNeeded` / `fallbackInvite` / `shouldInitiateInvite` / `scheduleReconnect` / `attemptReconnect` / `rebuildSession` | new methods | 256–349 | See [3.3](#33-multipeer-connectivity-mpcinterface) |
+Two independent correctness fixes in how an announce becomes a path row. Both apply with no
+fallback interface registered, so these are the *only* routing changes a plain deployment sees.
 
-#### `AnnounceHandler`
+- **Null next-hop fallback.** A HEADER_2 announce carrying an all-zero transport address now
+  falls back to the destination hash as next hop, matching python's
+  `received_from = destination_hash`. Upstream recorded a dead all-zero next hop that could
+  never route.
+- **Shorter-hop upgrade ("Path 2b").** A strictly-shorter-hop copy of an *already-held*
+  announce (same random blob) now upgrades the row, preserving the existing
+  `randomBlobs`/timebase. Upstream ignored this case and kept the worse, often
+  dead-next-hop route — which made a destination flicker in and out of reachability when a
+  relayed copy won the arrival race against the direct copy.
 
-| Member | Kind | Line | Notes |
-|---|---|---|---|
-| `snapshotEvery` | new `private static let Int = 25` | 160 | Throttle divisor for the expensive path-table snapshot |
-| `snapshotThrottleCounter` | new `private var Int` | 161 | Per-actor counter |
+Also here: `error as! AnnounceValidationError` — a forced cast that would trap on any other
+error type — became a non-trapping `as?` + `switch`.
 
-#### `TCPTransport` — stored-to-computed property change
+## D4 — Announce destination-hash binding + known-key collision guard {#d4}
 
-`Sources/ReticulumSwift/Transport/TCPTransport.swift:66-74`.
+**Commits:** `c2cdf92`
+
+**Files:** `Sources/ReticulumSwift/Protocol/AnnounceValidator.swift`,
+`Sources/ReticulumSwift/Routing/AnnounceHandler.swift`,
+`Tests/ReticulumSwiftTests/AnnounceBindingTests.swift`
+
+Upstream verified the Ed25519 signature on an announce but never checked that the announced
+public keys actually *own* the destination hash in the header. A valid signature only proves
+the announcer holds the private key for the keys carried in the payload — so an attacker
+could announce any victim's destination hash with their own keypair and a self-valid
+signature, installing a path for the victim pointing at themselves and overwriting the
+cached public key. Senders resolving that destination would then encrypt to the attacker.
+Identity/route hijack, pre-auth.
+
+- New `public static func validateDestinationBinding(parsed:)` restores the RNS check
+  (`Identity.validate_announce`): reject unless
+  `destination_hash == truncated_hash(name_hash ‖ truncated_hash(public_key))`.
+- It is called from inside `validate(parsed:)`, so *existing* callers get the stricter check
+  automatically and `parseAndValidate` is now the full RNS `validate_announce`.
+- PLAIN announces carry no keys and skip the check.
+- **Known-key collision guard** in `AnnounceHandler`: even with a valid signature *and* a
+  correct binding, refuse to overwrite a destination's already-known public key with a
+  different one. Only reachable via a truncated-hash collision, but RNS rejects rather than
+  permit a key swap.
+- `.hashMismatch` is classified as an authenticity failure (`.invalidSignature`), not a
+  format error.
+
+Four tests: correctly-bound announce passes, spoofed announce rejected, wrong name hash
+rejected, PLAIN announce skips binding.
+
+**Why it matters:** this makes the fork *stricter* than upstream but no stricter than python
+RNS — it rejects exactly what the reference rejects. No conformant announce is newly refused.
+
+## D5 — MessagePack decoder hardening {#d5}
+
+**Commits:** `c2cdf92`
+
+**Files:** `Sources/ReticulumSwift/Protocol/MessagePack.swift`,
+`Tests/ReticulumSwiftTests/MessagePackHardeningTests.swift`
+
+The decoder runs on raw inbound bytes before any signature check — reachable pre-auth via
+announce `app_data` and resource metadata.
+
+- **Depth bomb:** new module-private `messagePackMaxDepth = 64`, with a `depth` parameter
+  threaded through `decodeValue` / `decodeArray` / `decodeMap`, throwing
+  `MessagePackError.decodingFailed` past the cap. Unbounded recursion overflows the native
+  stack, which is an uncatchable crash in Swift, not a throw.
+- **Width bomb:** the bounded `reserveCapacity(min(count, remaining))` guards were *already*
+  upstream; the fork adds regression tests for them.
+
+Four tests: array32 and map32 width bombs, 200-deep nesting rejected, 8-deep accepted.
+
+**Why it matters:** this narrows the accepted payload set. RNS/LXMF structures nest only a
+few levels and python's `umsgpack` is bounded by the interpreter recursion limit, so the cap
+restores parity rather than departing from it.
+
+## D6 — Half-open link establishment watchdog {#d6}
+
+**Commits:** `d989b02`
+
+**Files:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift`
+
+A responder link waits in `.handshake` for the initiator's LRRTT. If that never arrived the
+per-link stale watchdog never ran (it only starts on activation), `cleanupLinks` skipped it
+(`.handshake` is not terminal), and the link was pinned in `activeLinks` and
+`destination._links` forever — an unauthenticated LINKREQUEST flood could exhaust memory
+and CPU.
+
+New `closeIfUnestablished(linkId:)` arms an `ESTABLISHMENT_TIMEOUT_PER_HOP * 5` timer that
+closes any still-unestablished link, making it terminal so the existing sweep reclaims it.
+
+**Known gap:** untested.
+
+## D7 — Keychain identity persistence hardening {#d7}
+
+**Commits:** `d989b02` — **schema ledger [S1](#schema)**
+
+**Files:** `Sources/ReticulumSwift/Crypto/Identity.swift` (`saveToKeychain(service:account:)`)
+
+| Aspect | Upstream | Fork |
+|--------|----------|------|
+| Accessibility class | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` | `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly` |
+| Write strategy | `SecItemDelete` then `SecItemAdd` | `SecItemUpdate`, falling back to `SecItemAdd` only on `errSecItemNotFound` |
+| Error handling | Delete result ignored; add failure throws | Any non-`errSecItemNotFound` update error throws instead of silently proceeding |
+
+Both changes protect the identity key, which is unrecoverable if lost. The accessibility
+relaxation lets a background relaunch (BLE/location wake-up) with the device locked read the
+key, instead of concluding it is missing and regenerating a new identity. The update-or-add
+removes a window where a locked device could successfully delete the real key and then fail
+to add the replacement, destroying the only copy.
+
+**Migration:** `SecItemUpdate` carries `kSecAttrAccessible` in its attribute dictionary, so
+the next save of an existing identity migrates the item in place. No explicit step, and **no
+rollback** — an item already migrated stays readable-while-locked even if the code is reverted.
+
+**Known gap — deliberate security trade-off.** `AfterFirstUnlockThisDeviceOnly` is a strictly
+weaker at-rest posture than upstream's `WhenUnlockedThisDeviceOnly`: the identity private key
+is readable by the process while the screen is locked, once the device has been unlocked
+since boot. It remains non-exportable off-device (`ThisDeviceOnly`). This is availability
+over confidentiality, chosen for background operation.
+
+## D8 — Ratchet key file protection {#d8}
+
+**Commits:** `d989b02` — **schema ledger [S2](#schema)**
+
+**Files:** `Sources/ReticulumSwift/Crypto/RatchetManager.swift`
+
+| Aspect | Upstream | Fork |
+|--------|----------|------|
+| Write options | `.atomic` | `[.atomic, .completeFileProtectionUntilFirstUserAuthentication]` |
+| Backup | included in device backups | `URLResourceValues.isExcludedFromBackup = true` (best-effort, `try?`) |
+
+The file holds forward-secrecy **private** keys and its existing signature only authenticates
+it — it does not protect confidentiality. The protection class now matches the identity and
+database stores; backup exclusion keeps keys whose whole purpose is to bound the blast radius
+of an identity compromise out of unencrypted backups.
+
+**Migration:** applied on next write. A file written by an older build keeps its old class
+until then.
+
+**Known gap:** backup exclusion is best-effort (`try?`) and failures are swallowed, so it is
+not guaranteed. Practical consequence: ratchets no longer survive a device restore. Acceptable
+for ephemeral forward-secrecy state, but it is a behavioural change.
+
+## D9 — Multipeer Connectivity discovery & reconnect {#d9}
+
+**Commits:** `d7dcc67`
+
+**Files:** `Sources/ReticulumSwift/Interfaces/MPC/MPCInterface.swift`
+
+New `discoveredPeers: [String: MCPeerID]` retains peers seen by the browser *or* connected
+via our advertiser, so a dropped link can be re-invited within the session.
+`sessionForInvitation(from:)` replaces the internal `getSession()` (not `public`, so no API
+break).
+
+- **Deterministic invite direction.** Both devices advertise *and* browse, so upstream had
+  each side inviting the other on discovery — two competing session-formation attempts that
+  MCSession resolves by tearing one down ~2 s after connecting (the cold-start flap). Now
+  only the lexicographically smaller display name invites; the higher-named side auto-accepts
+  and fallback-invites after 4 s if nothing formed, covering asymmetric discovery.
+- **Bounded reconnect.** Up to 6 attempts, first immediate then 1 s steps, role-staggered
+  (+500 ms for the secondary) so the two sides never re-invite simultaneously. Upstream
+  waited for the next `foundPeer`, which only fires on fresh discovery — in practice the next
+  app launch, which stranded the first message.
+- **Half-open session healing.** A peer we still consider connected re-inviting us means our
+  half of the link is dead while MCSession has not noticed; returning the stale session made
+  MPC sit on it until its ~60 s keepalive expired. The fork rebuilds the MCSession so the
+  incoming invitation handshakes into a clean one immediately. Guarded on the peer already
+  being present, so first-time invites are untouched.
+- `invitationHandler(session != nil, session)` replaces an unconditional `true`, so a nil
+  session is declined rather than accepted.
+- `browser(_:lostPeer:)` now clears `discoveredPeers`; invite timeouts dropped 30 s → 15 s
+  (10 s for reconnects).
+
+**Known gap:** untested.
+
+## D10 — `TCPTransport` thread-safety {#d10}
+
+**Commits:** `36b9d20`
+
+**Files:** `Sources/ReticulumSwift/Transport/TCPTransport.swift`
+
+An `objc_retain` use-after-free under concurrent connect/disconnect plus timeout. `state` is
+a `TransportState` whose payload can carry an `Error`, mutated on `connectionQueue` by
+NWConnection callbacks while external callers (the reconnect loop) read it from other
+threads, racing the retain/release of that payload.
 
 ```diff
 -public private(set) var state: TransportState = .disconnected
@@ -183,383 +445,108 @@ own `timestamp` as its startup liveness proxy (`PathTable.swift:350`).
 +public var state: TransportState { stateLock.lock(); defer { stateLock.unlock() }; return _state }
 ```
 
-The public name, type, and read semantics are unchanged; the backing storage moved behind a lock.
-Source-compatible for readers. (This is a domain/storage-shape change; the reason for it is the
-crash fix described in [3.4](#34-concurrency-and-crash-fixes).)
+`connect()`, `send(_:completion:)` and `disconnect()` now all hop to `connectionQueue`
+(`connectOnQueue` / `sendOnQueue` / `disconnectOnQueue`), so every access to connection,
+state and timeout work items is serialised on the same queue the callbacks run on. The
+public name, type and read semantics are unchanged — source-compatible for readers.
 
-### 2.3 New public API surface (behavioral, no new state)
+**Known gap:** the pre-existing guard `state == .disconnected || state != .connecting` in
+`connectOnQueue` was carried over verbatim. It is tautologically true for every state except
+`.connecting`, and was not touched by the fork.
 
-| Symbol | File:line | Notes |
-|---|---|---|
-| `AnnounceValidator.validateDestinationBinding(parsed:)` | `AnnounceValidator.swift:263` | New `public static func`. Also now called from inside `validate(parsed:)`, so *existing* callers get the stricter check automatically |
+## D11 — TCP reconnect backoff cap {#d11}
 
-No public symbol was removed or renamed anywhere in the fork.
+**Commits:** `c154af3`
 
-### 2.4 Row-lifecycle changes in the `paths` table
+**Files:** `Sources/ReticulumSwift/Interfaces/TCPInterface.swift`
 
-Schema unchanged, but the fork adds and changes decision branches inside `PathTable.record(entry:)`
-that determine whether a row is written at all. Behavioural delta versus upstream:
+`ExponentialBackoff(baseDelay: 1.0, maxDelay: 10.0)` — reconnect backoff capped at 10 s
+instead of the 300 s default. A device that loses and regains connectivity accrues failed
+attempts while offline, so the default scheduled the next retry 32–64 s after internet
+returned. Trade-off accepted in-code: more frequent retries against a genuinely dead endpoint,
+in exchange for ≤10 s recovery.
 
-| Branch | New/changed | Effect on persisted rows |
-|---|---|---|
-| Pinned-destination rejection (`PathTable.swift:379`) | new | An announce on a **non-fallback** interface for a pinned destination is rejected outright — the existing row is **not** updated (upstream would have updated it) |
-| Carrier takeover (`:417-469`) | new | A fallback-interface announce replaces the incumbent row **only** when the normal path is silent past `fallbackTakeoverGraceSeconds`, its interface is disconnected, or the path is marked unresponsive |
-| Normal-over-fallback promotion (`:470-495`) | new | A normal-interface announce **unconditionally** replaces a fallback incumbent (unpinned destinations), writes the row, and resets `pathState` to `PATH_STATE_UNKNOWN` |
-| Shorter-hop upgrade, "Path 2b" (`:515-529`) | new | A strictly-shorter-hop copy of an **already-held** announce (same random blob) now upgrades the row, preserving the existing `randomBlobs`/timebase. Upstream ignored this case and kept the worse, often dead-next-hop route |
-| `lastHeardByInterface` write (`:388`) | new | Recorded **before** any early return, so duplicate-blob arrivals still refresh liveness (in-memory only) |
+## D12 — `NetworkLog` routing diagnostics {#d12}
 
-Net effect: for a single-interface deployment the persisted rows are identical to upstream except
-for the Path 2b shorter-hop upgrade. For a deployment that registers a fallback interface, row
-ownership (`interface_id`, `hop_count`, `next_hop`) can differ substantially from upstream.
+**Commits:** `ebda44b` (the type and first markers), `c154af3` (fallback markers); further
+markers added throughout the D1/D2 commits
 
-### 2.5 Persisted-storage attribute changes
+**Files:** `Sources/ReticulumSwift/Logging/NetworkLog.swift` (new file, new `Logging/`
+directory), call sites in `AnnounceHandler.swift`, `PathTable.swift`,
+`ReticulumTransport.swift`
 
-These change how existing records are stored on device. No schema, but real migration semantics.
+A public, opt-in, file-backed diagnostic log dedicated to *following routing decisions*, kept
+separate from the `os.Logger` firehose. It is a no-op until `configure(directory:)` is called.
+Markers: `ANNOUNCE recorded=`, `PATHTABLE` (throttled snapshot), `[ANNDROP]`, `[RECORD]`,
+`[FALLBACK]`, `ROUTE`, `[DUAL]`.
 
-#### Keychain identity item — `Identity.saveToKeychain(service:account:)`
+**Performance note captured in-code:** running the full path-table snapshot per announce,
+serialised on the `AnnounceHandler` actor, throttled announce processing to ~0.5/s under a
+reconnect flood, stalling a contact's TCP announce ~115 s behind the mesh backlog. Hence
+`snapshotEvery = 25`, `snapshotThrottleCounter`, and the `if NetworkLog.isEnabled` guard
+around snapshot construction.
 
-`Sources/ReticulumSwift/Crypto/Identity.swift:701-748`.
+**Known gap — the log records identifiers.** Destination hashes (first 8 bytes), interface
+IDs, hop counts and node display names (control characters stripped) are written to an
+unprotected, non-backup-excluded file. `NetworkLog.debugScaffolding` defaults to `true`, so
+any build that configures the log gets the full scaffolding. Release builds that never
+configure it are unaffected.
 
-| Aspect | Upstream | Fork |
-|---|---|---|
-| Accessibility class | `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` | **`kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`** |
-| Write strategy | `SecItemDelete` then `SecItemAdd` | `SecItemUpdate`, falling back to `SecItemAdd` **only** on `errSecItemNotFound` |
-| Error handling | Delete result ignored; add failure throws | Any non-`errSecItemNotFound` update error throws instead of silently proceeding |
+**Known gap — scaffolding marked for removal is still present.** The in-code comments commit
+to removing the `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK] register` markers,
+`NetworkLog.debugScaffolding` and the `refreshConnectedInterfaces` log line once the
+offline/return behaviour is signed off. That cleanup has not happened.
 
-Both changes are stated in-code as protecting the identity key, which is unrecoverable if lost:
+## D13 — Repo hygiene {#d13}
 
-- The accessibility relaxation lets a background relaunch (BLE/location wake-up) with the device
-  locked read the key, instead of concluding it is missing and regenerating a new identity.
-- The update-or-add removes a window where a locked device could successfully delete the real key
-  and then fail to add the replacement, destroying the only copy.
+**Commits:** `c25b95e`
 
-**Migration:** `SecItemUpdate` carries `kSecAttrAccessible` in its attribute dictionary, so the next
-save of an existing identity migrates that item in place from `WhenUnlocked…` to
-`AfterFirstUnlock…`. There is no explicit migration step and no rollback — an item already migrated
-stays readable-while-locked even if the code is reverted.
+**Files:** `.gitignore`
 
-**Security trade-off, stated plainly:** `AfterFirstUnlockThisDeviceOnly` is a strictly weaker
-at-rest posture than `WhenUnlockedThisDeviceOnly` — the identity private key is readable by the
-process while the screen is locked, once the device has been unlocked since boot. It remains
-non-exportable off-device (`ThisDeviceOnly`). This is a deliberate availability-over-confidentiality
-choice for background operation.
-
-#### Ratchet key file — `RatchetManager`
-
-`Sources/ReticulumSwift/Crypto/RatchetManager.swift:345-356`.
-
-| Aspect | Upstream | Fork |
-|---|---|---|
-| Write options | `.atomic` | `[.atomic, .completeFileProtectionUntilFirstUserAuthentication]` |
-| Backup | included in device backups | `URLResourceValues.isExcludedFromBackup = true` (best-effort, `try?`) |
-
-Rationale in-code: the file holds forward-secrecy **private** keys and its existing signature only
-authenticates it, it does not protect confidentiality. Protection class matches the identity/DB
-stores; backup exclusion keeps keys whose purpose is to bound the blast radius of an identity
-compromise out of unencrypted backups.
-
-**Migration:** the protection class is applied on the next write; a file written by an older build
-keeps its old class until then. Backup exclusion is likewise applied on next write, and failures
-are swallowed (`try?`) — it is not guaranteed. Practical consequence: ratchets no longer survive a
-device restore, which is acceptable for ephemeral forward-secrecy state but is a behavioural change.
-
-### 2.6 Decoder acceptance-envelope change
-
-`Sources/ReticulumSwift/Protocol/MessagePack.swift:240`. A new module-private constant
-`messagePackMaxDepth = 64` and a `depth` parameter threaded through `decodeValue` / `decodeArray` /
-`decodeMap`.
-
-This is not new state, but it does narrow the set of payloads the library will accept: any
-MessagePack value nested deeper than 64 container levels now throws
-`MessagePackError.decodingFailed` where upstream would recurse (and, past a few thousand levels,
-overflow the native stack — an uncatchable crash in Swift, not a throw). RNS/LXMF structures nest
-only a few levels, so no legitimate payload is affected. Python's `umsgpack` is bounded by the
-interpreter recursion limit, so this restores parity rather than departing from it.
-
-### 2.7 Summary table — changes with domain/storage impact
-
-| # | Change | Kind | Persisted? | Migration needed |
-|---|---|---|---|---|
-| 1 | `NetworkLog` type + log files | New public type, new on-disk artifacts | Yes (log files) | No |
-| 2 | `PathTable` fallback/liveness model (4 properties, 2 statics, 6 public methods) | New domain state + API | **No** — in-memory only | No; embedder must re-register on each launch |
-| 3 | `ReticulumTransport.sendFallbackCopy` + connected-set state | New public API + private state | No | No |
-| 4 | `MPCInterface.discoveredPeers` + session-rebuild API | New domain state | No | No |
-| 5 | `TCPTransport.state` stored → lock-guarded computed | Storage-shape change | No | No (source-compatible) |
-| 6 | `AnnounceValidator.validateDestinationBinding` | New public API | No | No |
-| 7 | `AnnounceHandler` snapshot throttle counters | New private state | No | No |
-| 8 | Keychain accessibility + update-or-add | **Persisted record attribute** | Yes | Implicit, on next save; not reversible |
-| 9 | Ratchet file protection + backup exclusion | **Persisted file attribute** | Yes | Implicit, on next write |
-| 10 | `paths` row-lifecycle branches | Row semantics, not schema | Yes (existing table) | No |
-| 11 | MessagePack depth cap | Acceptance envelope | No | No |
-| — | **SQLite tables / columns / indexes** | **unchanged** | — | **none** |
+Adds `Derived/*`, `*.xcodeproj`, `*.xcworkspace`. Nothing previously tracked became ignored —
+`ReticulumSwift.xcodeproj` and `Derived/` are untracked locally.
 
 ---
 
-## 3. Implementation-logic changes
+## Downstream coupling {#downstream}
 
-Changes below alter behaviour only — no new domain or storage state.
+`kishontivf/LXMF-swift` depends on this fork (its D1 pins
+`https://github.com/kishontivf/reticulum-swift.git`, `from: "0.4.1"`) and calls into two
+APIs across the boundary:
 
-### 3.1 Security hardening
+| LXMF-swift | Calls | Provenance | Risk |
+|------------|-------|------------|------|
+| D5 — dual dispatch | `ReticulumTransport.sendFallbackCopy(packet:)` | **fork-only** ([D2](#d2)) | Renaming or removing it breaks the downstream build outright |
+| D4 — `PATH_DEMOTE_ATTEMPTS` | `PathTable.markPathUnresponsive(_:)` | **upstream API** | The symbol is upstream's and safe; but what an unresponsive path *does* — release the route to a carrier — is fork behaviour from [D1](#d1). Dropping D1 silently makes LXMF-swift's failover assist a no-op |
 
-Commit `c2cdf92` *Fable security fixes*, plus parts of `d989b02`.
-
-**Announce destination-hash binding** — `AnnounceValidator.swift:226-275`, `AnnounceHandler.swift:219-250`.
-
-Upstream verified the Ed25519 signature on an announce but never checked that the announced public
-keys actually *own* the destination hash in the header. A valid signature only proves the announcer
-holds the private key for the keys carried in the payload. An attacker could therefore announce any
-victim's destination hash with their own keypair and a self-valid signature, installing a path for
-the victim pointing at themselves and overwriting the cached public key — so senders resolving that
-destination would encrypt to the attacker. Identity/route hijack, pre-auth.
-
-The fork restores the RNS check (`Identity.validate_announce`, Identity.py:585-599):
-
-```
-expected = truncated_hash(name_hash || truncated_hash(public_key))
-reject if destination_hash != expected
-```
-
-called from inside `validate(parsed:)`, so `parseAndValidate` is now the full RNS
-`validate_announce`. PLAIN announces carry no keys and skip the check.
-
-**Known-key collision guard** — `AnnounceHandler.swift:247-258`. Mirrors RNS Identity.py:588-596:
-even with a valid signature *and* a correct binding, refuse to overwrite a destination's already
-known public key with a different one. Only reachable via a truncated-hash collision, but RNS
-rejects rather than permit a key swap.
-
-**Announce error classification** — `AnnounceHandler.swift:222-233`. `error as!
-AnnounceValidationError` (a forced cast that would trap on any other error type) became a
-non-trapping `as?` + `switch`, with `.hashMismatch` classified as an authenticity failure
-(`.invalidSignature`) rather than a format error.
-
-**MessagePack width and depth bombs** — `MessagePack.swift`. The depth cap is described in
-[2.6](#26-decoder-acceptance-envelope-change). The width-bomb reservation bounds
-(`reserveCapacity(min(count, remaining))`) were already upstream; the fork adds regression tests for
-them. Both paths are reachable pre-auth via announce `app_data` and resource metadata.
-
-**Half-open link watchdog** — `ReticulumTransport.swift:2252-2264`, `3255-3268`. A responder link
-waits in `.handshake` for the initiator's LRRTT. If that never arrived, the per-link stale watchdog
-(which only starts on activation) never ran, `cleanupLinks` skipped it (`.handshake` is not
-terminal), and the link was pinned in `activeLinks` and `destination._links` forever — an
-unauthenticated LINKREQUEST flood could exhaust memory/CPU. The fork arms a
-`ESTABLISHMENT_TIMEOUT_PER_HOP * 5` timer that closes any still-unestablished link, making it
-terminal so the existing sweep reclaims it.
-
-### 3.2 Routing: fallback interfaces and message delivery
-
-Commits `5695d00` *Asymmetric transports*, `c154af3` *Fallback interface support*, `bc483ec` *Keeping
-up multiple active interfaces*, `2e11b59` *Improving message sending*. The domain state these
-introduce is in [2.2](#22-new-domain-properties); the decision logic is here.
-
-The problem: a fallback carrier (e.g. an app's virtual BLE link) is physically adjacent and
-therefore always low-hop, so on pure hop-count it beats any real route; and it re-announces far more
-often than a periodic relayed announce, so on pure freshness it also always looks newer. Either
-metric alone lets the carrier capture and hold every route.
-
-Resolution as implemented:
-
-- **Carrier may take over** only when the normal path is genuinely dead — silent on every
-  non-fallback interface for `fallbackTakeoverGraceSeconds` (`PathTable.swift:417-469`; 75 s ≈ 2.5× a 30 s announce interval,
-  chosen after 45 s flapped on a single late announce), **or** its interface is not in the connected
-  set, **or** the path is marked unresponsive by delivery failures.
-- **Delivery-awareness** (`PathTable.swift:447`) is the decisive signal, not connectivity. Keying
-  purely on "incumbent interface is connected" was too aggressive: a peer on 5G behind carrier NAT
-  has a TCP path that resolves but never delivers, and holding it blocked the only working link.
-  `isPathUnresponsive` (fed by `LXMRouter.markPathUnresponsive`) overrides the connectivity check —
-  and doing so also un-blocks the existing demotion failover, which this branch would otherwise
-  short-circuit with an early `return false`.
-- **Normal reclaims unconditionally** (`PathTable.swift:470-495`) on the first normal-interface
-  announce for an unpinned destination. Any freshness gate here let the direct carrier — which wins
-  every arrival race — hold the route indefinitely (a ~140 s BLE→TCP return was observed). The
-  authoritative holds are the pin and the 75 s anti-flap window, so an unconditional promote is both
-  safe and the point of a "fallback".
-- **Pinning** (`PathTable.swift:379`) is the authoritative offline trigger: while a peer is pinned,
-  normal-interface announces are rejected, so a transport node still relaying that peer's dead TCP
-  path cannot refresh liveness and starve the carrier.
-- **Dual dispatch** (`ReticulumTransport.swift:1893`) sends a carrier copy alongside the normal
-  route for opportunistic LXMF delivery, so a message reaches an undeliverable-but-nearby peer
-  without waiting for demotion. Gated on: best path is not already the carrier, carrier interface is
-  `.connected`, and the peer was heard on that carrier within `heardWithin` (120 s default). The
-  receiver dedups by packet hash, so the duplicate is harmless.
-- **Connected-set refresh** (`ReticulumTransport.swift:2900`, `3318`) is called from the *inbound
-  announce path* as well as `periodicTableCleanup`, because the latter's retransmission loop is
-  stopped when relay mode is off — which left `connectedInterfaces` permanently empty in ENDPOINT
-  mode and made the whole liveness check inert.
-
-**Null next-hop fix** — `AnnounceHandler.swift:293-305`. A HEADER_2 announce carrying an all-zero
-transport address now falls back to the destination hash as next hop (matching Python's
-`received_from = destination_hash`) instead of recording a dead all-zero next hop that can never
-route.
-
-**Shorter-hop upgrade** — see Path 2b in [2.4](#24-row-lifecycle-changes-in-the-paths-table).
-Prevents a destination flickering in and out of reachability when a relayed copy wins the arrival
-race against the direct copy.
-
-### 3.3 Multipeer Connectivity (`MPCInterface`)
-
-Commit `d7dcc67` *MPCInterface discovery fix*.
-
-- **Deterministic invite direction** (`:272`). Both devices advertise *and* browse, so upstream had
-  each side inviting the other on discovery — two competing session-formation attempts that MCSession
-  resolves by tearing one down ~2 s after connecting (the cold-start flap). Now only the
-  lexicographically smaller display name invites; the higher-named side auto-accepts and
-  fallback-invites after 4 s if nothing formed (covering asymmetric discovery).
-- **Bounded reconnect** (`:305`). Up to 6 attempts, first immediate then 1 s steps, role-staggered
-  (+500 ms for the secondary) so the two sides never re-invite simultaneously. Upstream waited for
-  the next `foundPeer`, which only fires on fresh discovery — in practice the next app launch, which
-  stranded the first message.
-- **Half-open session healing** (`:340`, `:349`). A peer we still consider connected re-inviting us
-  means our half of the link is dead while MCSession hasn't noticed; returning the stale session made
-  MPC sit on it until its ~60 s keepalive expired. The fork rebuilds the MCSession so the incoming
-  invitation handshakes into a clean one immediately. Guarded on the peer already being present, so
-  first-time invites are untouched.
-- `invitationHandler(session != nil, session)` replaces an unconditional `true`, so a nil session is
-  now declined rather than accepted.
-- `browser(_:lostPeer:)` now clears `discoveredPeers`; invite timeouts dropped 30 s → 15 s (10 s for
-  reconnects).
-
-### 3.4 Concurrency and crash fixes
-
-Commit `36b9d20` *Crash fix* — `TCPTransport.swift`.
-
-An `objc_retain` use-after-free under concurrent connect/disconnect plus timeout: `state` is a
-`TransportState` whose payload can carry an `Error`, mutated on `connectionQueue` by NWConnection
-callbacks while external callers (the reconnect loop) read it from other threads, racing the
-retain/release of that payload.
-
-Fix: `_state` behind an `NSLock` with a thread-safe computed `state`, and `connect()`, `send(_:completion:)`,
-`disconnect()` all now hop to `connectionQueue` (`connectOnQueue` / `sendOnQueue` / `disconnectOnQueue`),
-so every access to connection, state, and timeout work items is serialized on the same queue the
-callbacks run on.
-
-**Note:** the pre-existing guard `state == .disconnected || state != .connecting` in `connectOnQueue`
-was carried over verbatim; it is tautologically true for every state except `.connecting`, and was
-not touched by the fork.
-
-### 3.5 Interface tuning
-
-`TCPInterface.swift:170-177` — reconnect backoff capped at 10 s instead of the 300 s default
-(`ExponentialBackoff(baseDelay: 1.0, maxDelay: 10.0)`). A device that loses and regains connectivity
-accrues failed attempts while offline, so the default scheduled the next retry 32–64 s after
-internet returned. Trade-off accepted in-code: more frequent retries against a genuinely dead
-endpoint, in exchange for ≤10 s recovery.
-
-### 3.6 Diagnostics
-
-Commit `ebda44b` *Logs and improvements* plus markers added throughout later commits.
-`NetworkLog` itself is documented in [2.1](#21-new-domain-objects). Call sites:
-
-| Marker | Where | Content |
-|---|---|---|
-| `ANNOUNCE recorded=` | `AnnounceHandler.swift:353` | Per-announce: dest, hops, header type, computed next hop, interface |
-| `PATHTABLE` | `AnnounceHandler.swift:360-377` | Throttled snapshot: totals for zero-next-hop / direct / routed / responsive, plus up to 30 *routable* entries |
-| `[ANNDROP]` | `AnnounceHandler.swift` | Hop-limit, parse/validate failure, known-key mismatch |
-| `[RECORD]` | `PathTable.swift` | Accept/ignore reason on every `record()` branch, emitted only when a fallback interface is involved |
-| `[FALLBACK]` | `PathTable.swift`, `ReticulumTransport.swift` | register / REJECT / ACCEPT / PROMOTE, and the connected-interface set |
-| `ROUTE` | `ReticulumTransport.swift:1455-1486`, `1853-1856` | HEADER_2 routed vs HEADER_1 direct vs no-path broadcast, and send failures |
-| `[DUAL]` | `ReticulumTransport.swift:1893` | Dual-dispatch carrier copy sent / skipped / failed |
-
-**Performance note captured in-code:** running the full path-table snapshot per announce serialized
-on the `AnnounceHandler` actor throttled announce processing to ~0.5/s under a reconnect flood,
-stalling a contact's TCP announce ~115 s behind the mesh backlog. Hence `snapshotEvery = 25` and the
-`if NetworkLog.isEnabled` guard around snapshot construction.
-
-The in-code comments mark the `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK] register`
-markers, `NetworkLog.debugScaffolding`, and the `refreshConnectedInterfaces` log line as
-**temporary scaffolding slated for removal** once the offline/return behaviour is signed off.
-
-### 3.7 Tests
-
-| File | Coverage |
-|---|---|
-| `Tests/ReticulumSwiftTests/AnnounceBindingTests.swift` | 4 tests: correctly-bound announce passes; spoofed announce rejected with `.hashMismatch`; wrong name hash rejected; PLAIN announce skips binding |
-| `Tests/ReticulumSwiftTests/MessagePackHardeningTests.swift` | 4 tests: array32 and map32 width bombs throw instead of allocating; 200-deep nesting rejected; 8-deep nesting accepted |
-
-Both files carry the upstream MPL-2.0 header and `Copyright (c) 2026 Torlando Tech LLC`.
-
-**Coverage gap:** the entire `PathTable` fallback/liveness model, `sendFallbackCopy`, the
-`MPCInterface` invite/reconnect logic, the link establishment watchdog, and the `TCPTransport`
-locking have **no unit tests** in the fork. Their correctness rationale is recorded only as in-code
-comments referencing field sessions ("session-3", "session-4", "session-13", "session-37").
-
-### 3.8 Build and repo hygiene
-
-Commit `c25b95e`. `.gitignore` gains `Derived/*`, `*.xcodeproj`, `*.xcworkspace`. Consequence: the
-`ReticulumSwift.xcodeproj` and `Derived/` present in the working tree are untracked — the package is
-consumed via SwiftPM and the Xcode project is a local artifact. No tracked file was removed.
+The second row is the subtle one: a re-sync that keeps the symbol but drops the fallback
+model leaves LXMF-swift compiling and quietly ineffective. Re-sync the two forks in lockstep.
 
 ---
 
-## 4. Commit index
+## Re-sync checklist
 
-| Commit | Date | Subject | Chapters |
-|---|---|---|---|
-| `c25b95e` | 2026-05-30 | Improvements and locks | [3.8](#38-build-and-repo-hygiene) |
-| `ebda44b` | 2026-06-26 | Logs and improvements | [2.1](#21-new-domain-objects), [3.6](#36-diagnostics) |
-| `d7dcc67` | 2026-06-30 | MPCInterface discovery fix | [2.2](#22-new-domain-properties), [3.3](#33-multipeer-connectivity-mpcinterface) |
-| `5695d00` | 2026-07-02 | Asymmetric transports | [2.2](#22-new-domain-properties), [2.4](#24-row-lifecycle-changes-in-the-paths-table), [3.2](#32-routing-fallback-interfaces-and-message-delivery) |
-| `c154af3` | 2026-07-03 | Fallback interface support | [2.2](#22-new-domain-properties), [2.4](#24-row-lifecycle-changes-in-the-paths-table), [3.2](#32-routing-fallback-interfaces-and-message-delivery), [3.5](#35-interface-tuning) |
-| `c2cdf92` | 2026-07-05 | Fable security fixes | [2.3](#23-new-public-api-surface-behavioral-no-new-state), [2.6](#26-decoder-acceptance-envelope-change), [3.1](#31-security-hardening), [3.7](#37-tests) |
-| `d989b02` | 2026-07-12 | Fable review, fixes. Identity fix if app running without unlock | [2.5](#25-persisted-storage-attribute-changes), [3.1](#31-security-hardening) |
-| `bc483ec` | 2026-07-13 | Keeping up multiple active interfaces | [2.2](#22-new-domain-properties), [3.2](#32-routing-fallback-interfaces-and-message-delivery) |
-| `2e11b59` | 2026-07-13 | Improving message sending | [2.2](#22-new-domain-properties), [2.4](#24-row-lifecycle-changes-in-the-paths-table), [3.2](#32-routing-fallback-interfaces-and-message-delivery) |
-| `36b9d20` | 2026-07-14 | Crash fix | [2.2](#22-new-domain-properties), [3.4](#34-concurrency-and-crash-fixes) |
+When pulling new upstream work:
 
-Merge commits `318a0fb` (#5), `15232eb` (#6), `aa5f0b6` (#4), `49cc82e` (#3), `b3e5b64` (#2),
-`7e68ab6` (upstream merge) carry no changes of their own.
-
----
-
-## 5. Wire-protocol & interop impact
-
-| Aspect | Impact |
-|---|---|
-| Packet / announce wire format | **None.** No encoding, header, or field change |
-| Announce validation strictness | **Increased, toward RNS parity.** The fork now rejects announces the Python reference also rejects (unbound destination hash, known-key mismatch). No conformant announce is newly rejected |
-| MessagePack acceptance | Narrowed to ≤64 nesting levels — inside Python's own recursion bound, so no conformant payload is affected |
-| Routing decisions | Diverge from upstream **only** when the embedder registers a fallback interface via `setFallbackInterface`. With no fallback registered, the only routing delta is the Path 2b shorter-hop upgrade |
-| Dual dispatch | Emits a duplicate packet over the carrier link; peers dedup by packet hash, so this is transparent to a conformant receiver |
-| Conformance suite | Not modified; `Sources/ConformanceBridge/` untouched |
-
-Interoperability with the Python RNS reference is unaffected or improved by every change in the fork.
-
----
-
-## 6. Risks and open items
-
-1. **Keychain accessibility relaxation is a one-way, silent migration.** `AfterFirstUnlockThisDeviceOnly`
-   is weaker than upstream's `WhenUnlockedThisDeviceOnly`, it migrates existing items on the next
-   save, and reverting the code does not revert already-migrated items. Deliberate; see
-   [2.5](#25-persisted-storage-attribute-changes).
-2. **Ratchet files are excluded from backup on a best-effort basis** (`try?`). Ratchets no longer
-   survive a device restore. Acceptable for ephemeral forward-secrecy state, but it is a
-   behavioural change.
-3. **`NetworkLog.debugScaffolding` defaults to `true`.** Once `configure(directory:)` is called, the
-   temporary scaffolding markers write destination hashes, interface IDs, and peer display names to
-   an unprotected, non-backup-excluded file. The log is a no-op until configured, so release builds
-   that never configure it are unaffected — but any build that does configure it gets the full
-   scaffolding by default.
-4. **Fallback routing state is entirely non-persistent.** After a restart the embedder must
-   re-register fallback interfaces and re-apply pins, and liveness history is empty. Nothing in the
-   library enforces or reminds; a host that registers once at first launch will silently lose the
-   behaviour on relaunch.
-5. **`PathTable.fallbackPromoteMaxLagSeconds` is public, mutable, and dead.** It is documented as no
-   longer consulted but still settable, so an embedder tuning it gets no effect and no warning.
-6. **Two process-wide mutable statics** (`fallbackTakeoverGraceSeconds`,
-   `NetworkLog.debugScaffolding`, the latter `nonisolated(unsafe)`) are global configuration, not
-   per-instance — a concern for multi-instance hosts and for tests running in parallel.
-7. **No test coverage for the largest divergence.** The fallback/liveness routing model, dual
-   dispatch, MPC reconnect, link watchdog, and `TCPTransport` locking are untested; their
-   justification lives in in-code comments referencing field sessions that are not reproducible from
-   this repository.
-8. **Scaffolding marked for removal is still present.** The in-code comments commit to removing the
-   `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK] register` markers and the
-   `refreshConnectedInterfaces` diagnostic once the offline/return behaviour is signed off; that
-   cleanup has not happened.
-9. **Upstream merge risk is concentrated in `PathTable.record()`.** The fork inserts several
-   decision branches into the middle of a function upstream actively maintains; any upstream change
-   to path-selection ordering will conflict there first.
-
----
-
-*Generated 2026-08-02 against `36b9d20` vs `upstream/main` @ `52e2a9a`.*
+1. `git fetch upstream && git log --oneline HEAD..upstream/main`
+2. Conflict-prone files, in order of likelihood:
+   `Sources/ReticulumSwift/Routing/PathTable.swift` (D1, D3 — **by far the most likely**;
+   the fork inserts several decision branches into the middle of `record()`, a function
+   upstream actively maintains, so any upstream change to path-selection ordering conflicts
+   here first),
+   `Sources/ReticulumSwift/Routing/AnnounceHandler.swift` (D3, D4, D12),
+   `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` (D1, D2, D6),
+   `Sources/ReticulumSwift/Interfaces/MPC/MPCInterface.swift` (D9),
+   `Sources/ReticulumSwift/Crypto/Identity.swift` (D7),
+   `Sources/ReticulumSwift/Protocol/MessagePack.swift` (D5).
+3. Diff the migration functions in `PathTable` against
+   [Schema & domain changes](#schema). The failure mode to look for is upstream adding a
+   column under a name we already use with different semantics — both `PRAGMA table_info`
+   guards see it present, neither runs, and the builds silently disagree. Resolve by renaming
+   ours to `kvf_…`, never by editing an already-shipped migration.
+4. Check upstream has not renamed or removed `markPathUnresponsive` / `isPathUnresponsive`
+   (D1 depends on the latter) or the `PATH_STATE_*` constants.
+5. Re-sync `kishontivf/LXMF-swift` in lockstep — see [Downstream coupling](#downstream).
+6. `swift build && swift test`.
+7. Update the base/HEAD/net-diff/last-reviewed lines at the top of this file, and append any
+   new fork commits to the [commit ledger](#summary).
