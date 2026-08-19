@@ -405,6 +405,47 @@ public actor ReticulumTransport {
         self.onInterfaceConnected = callback
     }
 
+    /// [TEMPORARY] Rolling per-interface transmit tally, flushed to NetworkLog as `[TXSTAT]`.
+    ///
+    /// Deliberately an aggregate rather than a line per send: a single image rides a
+    /// Resource of several hundred parts, and one line each would bury the routing
+    /// story this log exists to tell. The tally answers the question that actually
+    /// matters during a carrier switch — which interface is moving the bytes right
+    /// now — at a fixed cost per interval.
+    private var txTally: [String: (packets: Int, bytes: Int, failures: Int)] = [:]
+    private var txTallyLastFlush: ContinuousClock.Instant = .now
+
+    /// [TEMPORARY] Fold one transmit into the tally and flush the whole thing if the window
+    /// elapsed. Called on every send, so it stays allocation-free in the common path.
+    private func recordTransmit(interfaceId: String, bytes: Int, failed: Bool) {
+        guard NetworkLog.isEnabled else { return }
+        var entry = txTally[interfaceId] ?? (0, 0, 0)
+        entry.packets += 1
+        entry.bytes += bytes
+        if failed { entry.failures += 1 }
+        txTally[interfaceId] = entry
+
+        guard ContinuousClock.now - txTallyLastFlush >= Self.txTallyInterval else { return }
+        let window = txTallyLastFlush
+        txTallyLastFlush = .now
+        let summary = txTally
+            .sorted { $0.key < $1.key }
+            .map { id, t in
+                "\(id)=\(t.packets)p/\(NetworkLog.bytes(t.bytes))\(t.failures > 0 ? "/\(t.failures)FAIL" : "")"
+            }
+            .joined(separator: " ")
+        txTally.removeAll(keepingCapacity: true)
+        NetworkLog.debug("[TXSTAT] over \(NetworkLog.ms(since: window)): \(summary)")
+    }
+
+    /// [TEMPORARY] Flush window for `[TXSTAT]`. Short enough to localise a stall to the right
+    /// side of a coverage change, long enough not to spam a multi-hour field session.
+    private static let txTallyInterval: Duration = .seconds(10)
+
+    /// [TEMPORARY] Current state of each interface and when it entered that state, so a
+    /// transition can report how long the previous state held. See `handleInterfaceStateChange`.
+    private var interfaceStateSince: [String: (state: InterfaceState, since: ContinuousClock.Instant)] = [:]
+
     /// Diagnostic callback for packet receive events (set by app layer).
     public var onDiagnostic: (@Sendable (String) -> Void)?
 
@@ -1383,6 +1424,9 @@ public actor ReticulumTransport {
         // spurious failures on the conformance bridge's server side (where the
         // listening parent's interface map can be momentarily empty/racing).
         guard !interfaces.isEmpty else {
+            // [TEMPORARY]
+            NetworkLog.debug("[TX] DROP dest=\(packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()) "
+                + "— no interfaces registered at all")
             logger.debug("send(packet:): no interfaces registered — best-effort no-op (RNS outbound returns sent=False)")
             return
         }
@@ -1676,9 +1720,13 @@ public actor ReticulumTransport {
                 let transmitData = applyIFAC(raw: encoded, interfaceId: id)
                 try await interface.send(transmitData)
                 successCount += 1
+                recordTransmit(interfaceId: id, bytes: transmitData.count, failed: false)
                 logger.debug("Broadcast sent \(transmitData.count) bytes via '\(id)'")
             } catch {
                 lastError = error
+                // [TEMPORARY]
+                recordTransmit(interfaceId: id, bytes: encoded.count, failed: true)
+                NetworkLog.debug("[TX] FAIL broadcast iface=\(id) dest=\(destHex): \(error.localizedDescription)")
                 logger.warning("Broadcast failed on '\(id)': \(error.localizedDescription)")
             }
         }
@@ -1695,6 +1743,11 @@ public actor ReticulumTransport {
                 logger.error("sendToAllInterfaces failed: no interfaces succeeded")
                 throw TransportError.sendFailed(interfaceId: "all", underlying: error.localizedDescription)
             } else {
+                // [TEMPORARY] A silent best-effort drop is correct behaviour (RNS returns
+                // sent=False) but it is indistinguishable, after the fact, from "never attempted".
+                // Name it: this is what a device with no usable radio looks like from the inside.
+                NetworkLog.debug("[TX] DROP dest=\(destHex) — no connected interface "
+                    + "(registered=\(interfaces.count): \(interfaces.keys.sorted().joined(separator: ",")))")
                 logger.debug("sendToAllInterfaces: no eligible/connected interface — best-effort no-op (RNS outbound returns sent=False)")
             }
             return
@@ -1876,9 +1929,16 @@ public actor ReticulumTransport {
         // E8: Apply IFAC before transmitting
         let transmitData = applyIFAC(raw: data, interfaceId: interfaceId)
 
+        let started = ContinuousClock.now
         do {
             try await interface.send(transmitData)
+            recordTransmit(interfaceId: interfaceId, bytes: transmitData.count, failed: false)
         } catch {
+            recordTransmit(interfaceId: interfaceId, bytes: transmitData.count, failed: true)
+            // [TEMPORARY] Logged individually (unlike successes, which only feed the tally): a
+            // failing interface is rare, and it is the event that explains a stalled queue upstream.
+            NetworkLog.debug("[TX] FAIL iface=\(interfaceId) \(NetworkLog.bytes(transmitData.count)) "
+                + "after \(NetworkLog.ms(since: started)): \(error.localizedDescription)")
             throw TransportError.sendFailed(interfaceId: interfaceId, underlying: error.localizedDescription)
         }
     }
@@ -4336,6 +4396,14 @@ extension ReticulumTransport {
     func handleInterfaceStateChange(id: String, state: InterfaceState) {
         logger.info("Interface \(id, privacy: .public) state: \(String(describing: state), privacy: .public)")
         onDiagnostic?("[IFACE] \(id) → \(state)")
+
+        // [TEMPORARY] Dwell time is the whole point of logging this: "icWifi0 → disconnected"
+        // alone can't distinguish a link that flapped for 200ms from one that had been carrying
+        // traffic for twenty minutes and then died at the edge of coverage.
+        let previous = interfaceStateSince[id]
+        interfaceStateSince[id] = (state, .now)
+        let dwell = previous.map { " (was \($0.state) for \(NetworkLog.ms(since: $0.since)))" } ?? ""
+        NetworkLog.debug("[IFACE] \(id) → \(state)\(dwell)")
 
         // When any interface transitions to connected, fire onInterfaceConnected
         // so the app layer can send announces over the newly-available link.

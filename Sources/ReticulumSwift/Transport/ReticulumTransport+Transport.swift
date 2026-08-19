@@ -46,19 +46,20 @@ extension ReticulumTransport {
     ///   - packet: The LINKREQUEST packet
     ///   - interfaceId: Interface that received the packet
     public func forwardLinkRequest(_ packet: Packet, from interfaceId: String) async {
-        let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+        let destHex = { packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined() }
 
         // Only forward HEADER_2 packets addressed to our transport identity
         guard packet.header.headerType == .header2,
               let transportAddr = packet.transportAddress,
               transportAddr == transportIdentityHash else {
-            onDiagnostic?("[TRANSPORT] LINKREQUEST not addressed to us, ignoring dest=\(destHex)")
+            onDiagnostic?("[TRANSPORT] LINKREQUEST not addressed to us, ignoring dest=\(destHex())")
             return
         }
 
         // Look up path to the actual destination
         guard let pathEntry = await pathTable.lookup(destinationHash: packet.destination) else {
-            onDiagnostic?("[TRANSPORT] No path to dest=\(destHex), dropping LINKREQUEST")
+            onDiagnostic?("[TRANSPORT] No path to dest=\(destHex()), dropping LINKREQUEST")
             return
         }
 
@@ -66,11 +67,12 @@ extension ReticulumTransport {
         // The hashable part is hop-independent and transport-address-independent,
         // so the link_id is the same regardless of the transport chain.
         let linkId = computeLinkIdFromPacket(packet)
-        let linkIdHex = linkId.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+        let linkIdHex = { linkId.prefix(8).map { String(format: "%02x", $0) }.joined() }
 
         // Don't forward if we already have this link in the table
         guard linkTable[linkId] == nil else {
-            onDiagnostic?("[TRANSPORT] Duplicate LINKREQUEST for link=\(linkIdHex), ignoring")
+            onDiagnostic?("[TRANSPORT] Duplicate LINKREQUEST for link=\(linkIdHex()), ignoring")
             return
         }
 
@@ -179,9 +181,10 @@ extension ReticulumTransport {
             try await sendToInterface(forwardedRaw, interfaceId: outboundInterfaceId)
             // D12: Touch path table timestamp after successful forwarding
             await pathTable.touch(destinationHash: packet.destination)
-            let nextHopHex = pathEntry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "direct"
-            onDiagnostic?("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex) → \(outboundInterfaceId) nextHop=\(nextHopHex) hops=\(newHops)")
-            transportExtLogger.info("Forwarded LINKREQUEST link=\(linkIdHex) dest=\(destHex) via=\(outboundInterfaceId) hops=\(newHops)")
+            // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+            let nextHopHex = { pathEntry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "direct" }
+            onDiagnostic?("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex()) → \(outboundInterfaceId) nextHop=\(nextHopHex()) hops=\(newHops)")
+            transportExtLogger.info("Forwarded LINKREQUEST link=\(linkIdHex()) dest=\(destHex()) via=\(outboundInterfaceId) hops=\(newHops)")
         } catch {
             // Failed to forward — remove link table entry
             linkTable.removeValue(forKey: linkId)
@@ -203,11 +206,12 @@ extension ReticulumTransport {
     ///   - linkEntry: The link table entry for this link
     ///   - interfaceId: Interface that received the proof
     public func forwardLinkProof(_ packet: Packet, linkEntry: LinkTableEntry, from interfaceId: String) async {
-        let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+        let linkIdHex = { packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined() }
 
         // Proof should arrive from the outbound side (destination direction)
         guard interfaceId == linkEntry.outboundInterfaceId else {
-            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) arrived on wrong interface (\(interfaceId) != \(linkEntry.outboundInterfaceId))")
+            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) arrived on wrong interface (\(interfaceId) != \(linkEntry.outboundInterfaceId))")
             return
         }
 
@@ -217,7 +221,7 @@ extension ReticulumTransport {
         // Swift doesn't do global increment, so we add 1 to the wire hop count for comparison.
         let proofHopsPostIncrement = packet.header.hopCount &+ 1
         guard proofHopsPostIncrement == linkEntry.remainingHops else {
-            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) hop count mismatch: hops=\(proofHopsPostIncrement) expected=\(linkEntry.remainingHops)")
+            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) hop count mismatch: hops=\(proofHopsPostIncrement) expected=\(linkEntry.remainingHops)")
             return
         }
 
@@ -227,7 +231,7 @@ extension ReticulumTransport {
         let proofMinLen = 96  // sig(64) + encPubkey(32)
         let proofMaxLen = 99  // sig(64) + encPubkey(32) + signaling(3)
         guard packet.data.count == proofMinLen || packet.data.count == proofMaxLen else {
-            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) invalid data length: \(packet.data.count) (expected \(proofMinLen) or \(proofMaxLen))")
+            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) invalid data length: \(packet.data.count) (expected \(proofMinLen) or \(proofMaxLen))")
             return
         }
 
@@ -253,18 +257,18 @@ extension ReticulumTransport {
             do {
                 let valid = try Identity.verify(signature: signature, for: signedData, publicKey: peerSigPubBytes)
                 guard valid else {
-                    onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) FAILED signature validation")
+                    onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) FAILED signature validation")
                     return
                 }
-                onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) signature validated")
+                onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) signature validated")
             } catch {
                 // Key format error — can't validate, treat like Python's recall() returning None
-                onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) key error, skipping validation: \(error)")
+                onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) key error, skipping validation: \(error)")
             }
         } else {
             // No path entry or no valid signing key — can't validate
             // Python: Identity.recall() returning None skips validation but still forwards
-            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex) cannot validate (no path/identity for destination)")
+            onDiagnostic?("[TRANSPORT] LINKPROOF for link=\(linkIdHex()) cannot validate (no path/identity for destination)")
         }
 
         // D5: Record deferred packet hash now that we've decided to forward
@@ -281,8 +285,8 @@ extension ReticulumTransport {
         do {
             try await sendToInterface(forwardedRaw, interfaceId: linkEntry.receivingInterfaceId)
 
-            onDiagnostic?("[TRANSPORT] Forwarded LINKPROOF link=\(linkIdHex) → \(linkEntry.receivingInterfaceId) hops=\(newHops)")
-            transportExtLogger.info("Forwarded LINKPROOF link=\(linkIdHex) via=\(linkEntry.receivingInterfaceId) hops=\(newHops)")
+            onDiagnostic?("[TRANSPORT] Forwarded LINKPROOF link=\(linkIdHex()) → \(linkEntry.receivingInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded LINKPROOF link=\(linkIdHex()) via=\(linkEntry.receivingInterfaceId) hops=\(newHops)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward LINKPROOF: \(error)")
         }
@@ -301,7 +305,8 @@ extension ReticulumTransport {
     ///   - linkEntry: The link table entry for this link
     ///   - interfaceId: Interface that received the packet
     public func forwardLinkData(_ packet: Packet, linkEntry: LinkTableEntry, from interfaceId: String) async {
-        let linkIdHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+        let linkIdHex = { packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined() }
 
         // B1: Python does `packet.hops += 1` globally (line 1319) BEFORE any checks.
         // All hop comparisons in Python use the post-incremented value.
@@ -315,7 +320,7 @@ extension ReticulumTransport {
             // D4: Same-interface case — both sides of the link on the same interface
             // Accept if hops match either direction
             guard hopsPostIncrement == linkEntry.remainingHops || hopsPostIncrement == linkEntry.takenHops else {
-                onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex) hop count mismatch (same-if): hops=\(hopsPostIncrement) taken=\(linkEntry.takenHops) remaining=\(linkEntry.remainingHops)")
+                onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex()) hop count mismatch (same-if): hops=\(hopsPostIncrement) taken=\(linkEntry.takenHops) remaining=\(linkEntry.remainingHops)")
                 await packetHashlist.remove(packet.getFullHash())  // E17
                 return
             }
@@ -324,7 +329,7 @@ extension ReticulumTransport {
             // Data flowing from responder toward initiator
             // D3: Hop count must match remainingHops (outbound direction)
             guard hopsPostIncrement == linkEntry.remainingHops else {
-                onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex) hop count mismatch (outbound): hops=\(hopsPostIncrement) expected=\(linkEntry.remainingHops)")
+                onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex()) hop count mismatch (outbound): hops=\(hopsPostIncrement) expected=\(linkEntry.remainingHops)")
                 await packetHashlist.remove(packet.getFullHash())  // E17
                 return
             }
@@ -333,13 +338,13 @@ extension ReticulumTransport {
             // Data flowing from initiator toward responder
             // D3: Hop count must match takenHops (receiving direction)
             guard hopsPostIncrement == linkEntry.takenHops else {
-                onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex) hop count mismatch (receiving): hops=\(hopsPostIncrement) expected=\(linkEntry.takenHops)")
+                onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex()) hop count mismatch (receiving): hops=\(hopsPostIncrement) expected=\(linkEntry.takenHops)")
                 await packetHashlist.remove(packet.getFullHash())  // E17
                 return
             }
             targetInterfaceId = linkEntry.outboundInterfaceId
         } else {
-            onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex) arrived on unknown interface \(interfaceId)")
+            onDiagnostic?("[TRANSPORT] Link DATA for link=\(linkIdHex()) arrived on unknown interface \(interfaceId)")
             await packetHashlist.remove(packet.getFullHash())  // E17
             return
         }
@@ -355,7 +360,7 @@ extension ReticulumTransport {
 
         do {
             try await sendToInterface(forwardedRaw, interfaceId: targetInterfaceId)
-            onDiagnostic?("[TRANSPORT] Forwarded link DATA link=\(linkIdHex) → \(targetInterfaceId) hops=\(hopsPostIncrement)")
+            onDiagnostic?("[TRANSPORT] Forwarded link DATA link=\(linkIdHex()) → \(targetInterfaceId) hops=\(hopsPostIncrement)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward link DATA: \(error)")
         }
@@ -374,11 +379,12 @@ extension ReticulumTransport {
     ///   - packet: DATA packet (HEADER_2 addressed to our transport)
     ///   - interfaceId: Interface that received the packet
     public func forwardDataPacket(_ packet: Packet, from interfaceId: String) async {
-        let destHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+        let destHex = { packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined() }
 
         // Look up path to the actual destination
         guard let pathEntry = await pathTable.lookup(destinationHash: packet.destination) else {
-            onDiagnostic?("[TRANSPORT] No path to dest=\(destHex) for DATA forwarding, dropping")
+            onDiagnostic?("[TRANSPORT] No path to dest=\(destHex()) for DATA forwarding, dropping")
             return
         }
 
@@ -417,8 +423,8 @@ extension ReticulumTransport {
             try await sendToInterface(forwardedRaw, interfaceId: outboundInterfaceId)
             // D12: Touch path table timestamp after successful forwarding
             await pathTable.touch(destinationHash: packet.destination)
-            onDiagnostic?("[TRANSPORT] Forwarded DATA dest=\(destHex) → \(outboundInterfaceId) hops=\(newHops)")
-            transportExtLogger.info("Forwarded DATA dest=\(destHex) via=\(outboundInterfaceId) hops=\(newHops)")
+            onDiagnostic?("[TRANSPORT] Forwarded DATA dest=\(destHex()) → \(outboundInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded DATA dest=\(destHex()) via=\(outboundInterfaceId) hops=\(newHops)")
         } catch {
             reverseTable.removeValue(forKey: packetHash)
             onDiagnostic?("[TRANSPORT] Failed to forward DATA: \(error)")
@@ -434,12 +440,13 @@ extension ReticulumTransport {
     ///   - reverseEntry: The reverse table entry for routing
     ///   - interfaceId: Interface that received the proof
     public func forwardDataProof(_ packet: Packet, reverseEntry: ReverseTableEntry, from interfaceId: String) async {
-        let proofDestHex = packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+        // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
+        let proofDestHex = { packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined() }
 
         // D10: Proof must arrive on the outbound interface (the direction data was forwarded)
         // Python reference: Transport.py line 2093
         guard interfaceId == reverseEntry.outboundInterfaceId else {
-            onDiagnostic?("[TRANSPORT] DATA PROOF for \(proofDestHex) arrived on wrong interface (\(interfaceId) != \(reverseEntry.outboundInterfaceId))")
+            onDiagnostic?("[TRANSPORT] DATA PROOF for \(proofDestHex()) arrived on wrong interface (\(interfaceId) != \(reverseEntry.outboundInterfaceId))")
             return
         }
 
@@ -448,8 +455,8 @@ extension ReticulumTransport {
 
         do {
             try await sendToInterface(forwardedRaw, interfaceId: reverseEntry.receivingInterfaceId)
-            onDiagnostic?("[TRANSPORT] Forwarded DATA PROOF \(proofDestHex) → \(reverseEntry.receivingInterfaceId) hops=\(newHops)")
-            transportExtLogger.info("Forwarded DATA PROOF \(proofDestHex) via=\(reverseEntry.receivingInterfaceId) hops=\(newHops)")
+            onDiagnostic?("[TRANSPORT] Forwarded DATA PROOF \(proofDestHex()) → \(reverseEntry.receivingInterfaceId) hops=\(newHops)")
+            transportExtLogger.info("Forwarded DATA PROOF \(proofDestHex()) via=\(reverseEntry.receivingInterfaceId) hops=\(newHops)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward DATA PROOF: \(error)")
         }

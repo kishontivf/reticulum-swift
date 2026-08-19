@@ -5,17 +5,17 @@ Divergence of `kishontivf/reticulum-swift` (`origin/master`) from `torlando-tech
 
 | | |
 |---|---|
-| Fork HEAD | `36b9d20` — *Crash fix* |
+| Fork HEAD | `63e3336` — *Merge pull request #7 from kishontivf/feature/deep-messaging-test-fixes* |
 | Upstream base | `52e2a9a` — *Merge pull request #25 from torlando-tech/feat/rnode-ble-uuid-identity* |
-| Relationship | **Fast-forward ahead.** 16 commits ahead, **0 behind** — the fork contains all of `upstream/main`, no upstream work is missing and no divergent history exists |
-| Net diff | 14 files changed, 1021 insertions(+), 46 deletions(-) |
-| Date range | 2026-05-30 → 2026-07-14 |
+| Relationship | **Ahead, one behind.** 19 commits ahead, **1 behind** — `e23dc0c` *Disable scheduled conformance tests* is the single upstream commit not yet merged (CI-only, no source impact) |
+| Net diff | 16 files changed, 1766 insertions(+), 46 deletions(-) |
+| Date range | 2026-05-30 → 2026-08-19 |
 
 Reproduce with:
 
 ```sh
 git fetch upstream
-git rev-list --left-right --count upstream/main...HEAD   # → 0  16
+git rev-list --left-right --count upstream/main...HEAD   # → 1  19
 git diff 52e2a9a..HEAD
 ```
 
@@ -36,8 +36,8 @@ git diff 52e2a9a..HEAD
 |---|---|---|
 | `Sources/ReticulumSwift/Routing/PathTable.swift` | +272 | Fallback-interface routing model (new domain state) |
 | `Sources/ReticulumSwift/Interfaces/MPC/MPCInterface.swift` | +149/−10 | Deterministic invite direction, reconnect, half-open session healing |
-| `Sources/ReticulumSwift/Logging/NetworkLog.swift` | +135 (new file) | New opt-in routing diagnostic log |
-| `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` | +93 | Dual-dispatch send, link establishment watchdog, connected-interface push |
+| `Sources/ReticulumSwift/Logging/NetworkLog.swift` | +211 (new file) | Routing diagnostic log, opt-in via environment flag |
+| `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` | +161 | Dual-dispatch send, link establishment watchdog, connected-interface push, transmit/interface diagnostics |
 | `Sources/ReticulumSwift/Routing/AnnounceHandler.swift` | +89/−7 | Known-key collision guard, null next-hop fix, throttled snapshots |
 | `Sources/ReticulumSwift/Protocol/AnnounceValidator.swift` | +51 | Destination-hash binding (announce spoofing fix) |
 | `Sources/ReticulumSwift/Crypto/Identity.swift` | +45/−12 | Keychain accessibility + non-destructive write |
@@ -47,6 +47,7 @@ git diff 52e2a9a..HEAD
 | `Sources/ReticulumSwift/Interfaces/TCPInterface.swift` | +8/−2 | Reconnect backoff cap |
 | `Tests/…/AnnounceBindingTests.swift` | +91 (new) | Announce binding tests |
 | `Tests/…/MessagePackHardeningTests.swift` | +47 (new) | Width/depth bomb tests |
+| `Tests/…/NetworkLogGateTests.swift` | +36 (new) | Network log stays off without the environment flag |
 | `.gitignore` | +3 | Ignore `Derived/`, `*.xcodeproj`, `*.xcworkspace` |
 
 Untouched relative to upstream: `README.md`, `port-deviations.md`, `Package.swift`, `codecov.yml`,
@@ -76,20 +77,24 @@ withheld. See [2.4](#24-row-lifecycle-changes-in-the-paths-table).
 
 `Sources/ReticulumSwift/Logging/NetworkLog.swift` (new file, new `Logging/` directory).
 
-A public, opt-in, file-backed diagnostic log dedicated to *following routing decisions*, kept
-separate from the `os.Logger` firehose.
+A public, file-backed diagnostic log dedicated to *following routing decisions*, kept separate
+from the `os.Logger` firehose. **Opt-in via the process environment** — see `environmentKey`.
 
 | Member | Kind | Notes |
 |---|---|---|
-| `configure(directory:fileName:)` | `public static func` | Enables the log; default file `reticulum-network.log` |
+| `environmentKey` | `public static let String` | `"RETICULUM_NETWORK_LOG"`. Set to `1`/`true`/`yes` in the launched process to enable the log; anything else, including absent, leaves it off end to end |
+| `configure(directory:fileName:)` | `public static func` | Enables the log; default file `reticulum-network.log`. **No-ops unless `environmentKey` is set**, so an unflagged process never opens a file |
 | `disable()` | `public static func` | Back to no-op |
 | `isEnabled` | `public static var` (get) | Cheap guard for expensive snapshot building |
-| `debugScaffolding` | `public static var` | **Defaults to `true`**; master switch for the temporary `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK]` markers |
+| `debugScaffolding` | `public static var` | **Defaults to whatever `environmentKey` says** (so: off in any normal run); master switch for the temporary `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK]`/`[TX]`/`[TXSTAT]`/`[IFACE]` markers. Settable at runtime, but forcing it on without the flag writes nothing — `configure` will not have opened a file |
 | `log(_:)` / `debug(_:)` | `public static func` | `@autoclosure`; `debug` additionally gated on `debugScaffolding` |
+| `mark(_:)` | `public static func` | `>>>`-prefixed banner for correlating the log against out-of-process events; routed through `debug` |
+| `ms(since:)`, `bytes(_:)`, `rate(_:since:)` | `public static func` | Duration / size / throughput formatting for the field-test markers. `ms` and `rate` use `ContinuousClock`, deliberately not wall clock — these durations are read to decide whether something *blocked*, and a wall-clock delta absorbs the NTP steps that follow a coverage change |
 | `describe(_ entry: PathEntry)` | `public static func` | One-line path-entry summary |
 | `hex8(_:)`, `hasZeroNextHop(_:)` | `public static func` | Formatting / null-next-hop predicate |
 
-Storage side effects (new persisted artifacts on disk):
+Storage side effects (new persisted artifacts on disk) — **only in a process that set
+`environmentKey`**; without it nothing below happens:
 
 - Creates `<directory>/reticulum-network.log`.
 - Rolls one generation aside to `<directory>/reticulum-network.prev.log` on each `configure`.
@@ -155,6 +160,10 @@ own `timestamp` as its startup liveness proxy (`PathTable.swift:350`).
 | `lastConnectedInterfaceSet` | new `private var Set<String>` | 3292 | Change-detection so the connected set is only pushed/logged on change |
 | `refreshConnectedInterfaces()` | new `private func` | 3298 | Recomputes and pushes the connected set to `PathTable` |
 | `closeIfUnestablished(linkId:)` | new `private func` | 3255 | Closes a responder link stuck in `.handshake` past the establishment timeout |
+| `txTally` | new `private var [String: (packets: Int, bytes: Int, failures: Int)]` | — | **[TEMPORARY]** Per-interface transmit counters behind the `[TXSTAT]` marker |
+| `txTallyLastFlush` / `txTallyInterval` | new `private var` / `private static let Duration` | — | **[TEMPORARY]** 10-second flush window for the tally, so a busy link produces one line per 10 s rather than one per packet |
+| `recordTransmit(interfaceId:bytes:failed:)` | new `private func` | — | **[TEMPORARY]** Accumulates the tally and emits the flushed summary |
+| `interfaceStateSince` | new `private var [String: (state: InterfaceState, since: ContinuousClock.Instant)]` | — | **[TEMPORARY]** Previous-state dwell time behind the `[IFACE]` marker |
 
 #### `MPCInterface`
 
@@ -458,6 +467,9 @@ Commit `ebda44b` *Logs and improvements* plus markers added throughout later com
 | `[FALLBACK]` | `PathTable.swift`, `ReticulumTransport.swift` | register / REJECT / ACCEPT / PROMOTE, and the connected-interface set |
 | `ROUTE` | `ReticulumTransport.swift:1455-1486`, `1853-1856` | HEADER_2 routed vs HEADER_1 direct vs no-path broadcast, and send failures |
 | `[DUAL]` | `ReticulumTransport.swift:1893` | Dual-dispatch carrier copy sent / skipped / failed |
+| `[TX]` | `ReticulumTransport.swift` | Transmit failures, and the silent drop when no interface is registered at all |
+| `[TXSTAT]` | `ReticulumTransport.swift` | Rolling per-interface packet / byte / failure tally, one line per 10 s |
+| `[IFACE]` | `ReticulumTransport.swift` | Interface state transitions, with time held in the previous state |
 
 **Performance note captured in-code:** running the full path-table snapshot per announce serialized
 on the `AnnounceHandler` actor throttled announce processing to ~0.5/s under a reconnect flood,
@@ -468,12 +480,40 @@ The in-code comments mark the `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBAC
 markers, `NetworkLog.debugScaffolding`, and the `refreshConnectedInterfaces` log line as
 **temporary scaffolding slated for removal** once the offline/return behaviour is signed off.
 
+**Opt-in gate (`a7909a0`).** The whole log — file included — is off unless the process was launched
+with `NetworkLog.environmentKey` (`RETICULUM_NETWORK_LOG`) set. `configure(directory:)` returns
+early without it, so `isEnabled` stays false, no file is created, and every `debug(_:)` call folds
+away without building its string. `debugScaffolding` defaults to the same value.
+
+This matters beyond tidiness: before the gate, `configure` was called unconditionally by the
+embedder, so *release* builds were opening and appending to the log — which contradicted this
+type's own "no-op until configured" contract and put destination hashes and display names in an
+unprotected file on every user's device.
+
+The one consumer that needs the log — the on-device automated test fleet — sets the variable in the
+host's shared UI-test launch defaults, so it costs one line there and nothing anywhere else. That
+line, `grep -rn '\[TEMPORARY\]'`, and `NetworkLog.` are the complete removal checklist.
+
+Downstream, `LXMF-swift` routes its own `[QUEUE]`/`[LINK]`/`[RES]`/`[PROOF]` markers through this
+same type, so this single flag governs the diagnostics in both forks — there is no second switch.
+
+**Diagnostics that cost when switched off.** A gate only helps if the *work behind* the log line is
+also skipped. `NetworkLog.log`/`debug` take `@autoclosure`, so a marker's string is free, but
+`ReticulumTransport.onDiagnostic` is a plain `(String) -> Void` — its argument is built eagerly by
+whichever emitter calls it. The receive-side emitters in
+`ReticulumTransport+Transport.swift` (30 of them: LINKREQUEST forwarding, LINKPROOF validation,
+link DATA) additionally computed their `destHex`/`linkIdHex`/`nextHopHex`/`proofDestHex` at the head
+of the function, before any early return. Those seven bindings are now lazy closures evaluated at
+the point of interpolation, so a path that returns early pays nothing, and an embedder that leaves
+`onDiagnostic` nil — which Intercom now does unless the scaffolding is on — pays nothing at all.
+
 ### 3.7 Tests
 
 | File | Coverage |
 |---|---|
 | `Tests/ReticulumSwiftTests/AnnounceBindingTests.swift` | 4 tests: correctly-bound announce passes; spoofed announce rejected with `.hashMismatch`; wrong name hash rejected; PLAIN announce skips binding |
 | `Tests/ReticulumSwiftTests/MessagePackHardeningTests.swift` | 4 tests: array32 and map32 width bombs throw instead of allocating; 200-deep nesting rejected; 8-deep nesting accepted |
+| `Tests/ReticulumSwiftTests/NetworkLogGateTests.swift` | 1 test: without `RETICULUM_NETWORK_LOG`, `debugScaffolding` is false, `configure` leaves `isEnabled` false, and no file is created. Skips itself if the variable *is* set |
 
 Both files carry the upstream MPL-2.0 header and `Copyright (c) 2026 Torlando Tech LLC`.
 
@@ -504,9 +544,11 @@ consumed via SwiftPM and the Xcode project is a local artifact. No tracked file 
 | `bc483ec` | 2026-07-13 | Keeping up multiple active interfaces | [2.2](#22-new-domain-properties), [3.2](#32-routing-fallback-interfaces-and-message-delivery) |
 | `2e11b59` | 2026-07-13 | Improving message sending | [2.2](#22-new-domain-properties), [2.4](#24-row-lifecycle-changes-in-the-paths-table), [3.2](#32-routing-fallback-interfaces-and-message-delivery) |
 | `36b9d20` | 2026-07-14 | Crash fix | [2.2](#22-new-domain-properties), [3.4](#34-concurrency-and-crash-fixes) |
+| `d412b86` | 2026-08-02 | Divergence collection | This document; no source change |
+| `a7909a0` | 2026-08-19 | Deep messaging test fixes | [2.1](#21-new-domain-objects), [2.2](#22-new-domain-properties), [3.6](#36-diagnostics), [3.7](#37-tests) |
 
 Merge commits `318a0fb` (#5), `15232eb` (#6), `aa5f0b6` (#4), `49cc82e` (#3), `b3e5b64` (#2),
-`7e68ab6` (upstream merge) carry no changes of their own.
+`63e3336` (#7), `7e68ab6` (upstream merge) carry no changes of their own.
 
 ---
 
@@ -534,11 +576,14 @@ Interoperability with the Python RNS reference is unaffected or improved by ever
 2. **Ratchet files are excluded from backup on a best-effort basis** (`try?`). Ratchets no longer
    survive a device restore. Acceptable for ephemeral forward-secrecy state, but it is a
    behavioural change.
-3. **`NetworkLog.debugScaffolding` defaults to `true`.** Once `configure(directory:)` is called, the
-   temporary scaffolding markers write destination hashes, interface IDs, and peer display names to
-   an unprotected, non-backup-excluded file. The log is a no-op until configured, so release builds
-   that never configure it are unaffected — but any build that does configure it gets the full
-   scaffolding by default.
+3. **The network log is off by default, and that now holds in practice** (`a7909a0`). It was not
+   previously: `debugScaffolding` defaulted to `true` and the embedder called
+   `configure(directory:)` unconditionally, so release builds wrote destination hashes, interface
+   IDs and peer display names to an unprotected, non-backup-excluded file. Both the file and the
+   markers are now gated on `NetworkLog.environmentKey`. Residual risk: the gate is a process
+   environment variable, so anything that sets it — a debug launch profile, a CI runner exporting it
+   globally — turns the full log back on for that process, and the file still carries no protection
+   class. `NetworkLogGateTests` guards the default; nothing guards the file's attributes.
 4. **Fallback routing state is entirely non-persistent.** After a restart the embedder must
    re-register fallback interfaces and re-apply pins, and liveness history is empty. Nothing in the
    library enforces or reminds; a host that registers once at first launch will silently lose the
@@ -552,14 +597,16 @@ Interoperability with the Python RNS reference is unaffected or improved by ever
    dispatch, MPC reconnect, link watchdog, and `TCPTransport` locking are untested; their
    justification lives in in-code comments referencing field sessions that are not reproducible from
    this repository.
-8. **Scaffolding marked for removal is still present.** The in-code comments commit to removing the
-   `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK] register` markers and the
-   `refreshConnectedInterfaces` diagnostic once the offline/return behaviour is signed off; that
-   cleanup has not happened.
+8. **Scaffolding marked for removal is still present, and grew.** The in-code comments commit to
+   removing the `[MSG]`/`[ROUTE]`/`[ANNDROP]`/`[RECORD]`/`[FALLBACK] register` markers and the
+   `refreshConnectedInterfaces` diagnostic once the offline/return behaviour is signed off; the
+   field-test round added `[TX]`/`[TXSTAT]`/`[IFACE]` here and `[QUEUE]`/`[LINK]`/`[RES]`/`[PROOF]`
+   in `LXMF-swift` under the same switch. None of it has been removed. The gate makes it inert
+   rather than gone — it is still carried into every upstream merge.
 9. **Upstream merge risk is concentrated in `PathTable.record()`.** The fork inserts several
    decision branches into the middle of a function upstream actively maintains; any upstream change
    to path-selection ordering will conflict there first.
 
 ---
 
-*Generated 2026-08-02 against `36b9d20` vs `upstream/main` @ `52e2a9a`.*
+*Generated 2026-08-02 against `36b9d20`; updated 2026-08-19 against `63e3336` vs `upstream/main` @ `52e2a9a`.*
