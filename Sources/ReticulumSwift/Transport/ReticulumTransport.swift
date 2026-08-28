@@ -3266,6 +3266,10 @@ public actor ReticulumTransport {
                     }
 
                     logger.debug("Retransmitted announce for \(destHex, privacy: .public)... via \(id, privacy: .public)")
+                    // ⚠️ TEMPORARY / DEV-ONLY — surface announce relays in the transport-events log;
+                    // `from=` ingress + `hops=` so the announce propagation path can be reconstructed; revert.
+                    let recvFrom = action.receivingInterfaceId ?? "local"
+                    onDiagnostic?("[TRANSPORT] Forwarded ANNOUNCE dest=\(destHex) from=\(recvFrom) via \(id) hops=\(action.hops)")
                 } catch {
                     logger.warning("Failed to retransmit announce to \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -3306,6 +3310,10 @@ public actor ReticulumTransport {
                 queue.remove(at: oldest.offset)
                 do {
                     try await interfaces[id]?.send(entry.encoded)
+                    // ⚠️ TEMPORARY / DEV-ONLY — surface queued-announce relays in the transport-events log;
+                    // no ingress here (queued entries don't store it), but `hops=` gives path position; revert.
+                    let entryDestHex = entry.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    onDiagnostic?("[TRANSPORT] Forwarded ANNOUNCE dest=\(entryDestHex) via \(id) hops=\(entry.hops)")
                     let bitrate = interfaces[id]?.config.bitrate ?? 0
                     if bitrate > 0 {
                         let txTime = Double(entry.encoded.count * 8) / Double(bitrate)
