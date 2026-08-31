@@ -453,6 +453,15 @@ accrues failed attempts while offline, so the default scheduled the next retry 3
 internet returned. Trade-off accepted in-code: more frequent retries against a genuinely dead
 endpoint, in exchange for ≤10 s recovery.
 
+`ReticulumTransport.swift` `sendAnnounceFiltered(_:)` — the per-interface announce bandwidth cap
+and its `announceAllowedAt` update are now guarded by `packet.header.hopCount > 0`, exempting
+locally-originated announces. This *closes* a port divergence rather than creating one: Python
+guards the whole block with `if packet.hops > 0:` (`Transport.py:1272-1275`). Latent upstream
+while every interface defaults to `bitrate = 0`; live as soon as a low-bandwidth interface is
+given a real bitrate to rate-shape relayed announces, which is what Intercom does for `icBle0`.
+Full rationale in `port-deviations.md` → *Resolved deviations*. Upstream-worthy: this is a fix to
+torlando-tech's port, not a KVF-specific behaviour, and should be offered upstream.
+
 ### 3.6 Diagnostics
 
 Commit `ebda44b` *Logs and improvements* plus markers added throughout later commits.

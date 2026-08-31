@@ -183,7 +183,8 @@ extension ReticulumTransport {
             await pathTable.touch(destinationHash: packet.destination)
             // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
             let nextHopHex = { pathEntry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "direct" }
-            onDiagnostic?("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex()) → \(outboundInterfaceId) nextHop=\(nextHopHex()) hops=\(newHops)")
+            // ⚠️ TEMPORARY / DEV-ONLY — `from=` ingress added for the transport-events log path reconstruction; revert with the feature.
+            onDiagnostic?("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex()) from=\(interfaceId) → \(outboundInterfaceId) nextHop=\(nextHopHex()) hops=\(newHops)")
             transportExtLogger.info("Forwarded LINKREQUEST link=\(linkIdHex()) dest=\(destHex()) via=\(outboundInterfaceId) hops=\(newHops)")
         } catch {
             // Failed to forward — remove link table entry
@@ -360,7 +361,8 @@ extension ReticulumTransport {
 
         do {
             try await sendToInterface(forwardedRaw, interfaceId: targetInterfaceId)
-            onDiagnostic?("[TRANSPORT] Forwarded link DATA link=\(linkIdHex()) → \(targetInterfaceId) hops=\(hopsPostIncrement)")
+            // ⚠️ TEMPORARY / DEV-ONLY — `from=` ingress added for the transport-events log path reconstruction; revert with the feature.
+            onDiagnostic?("[TRANSPORT] Forwarded link DATA link=\(linkIdHex()) from=\(interfaceId) → \(targetInterfaceId) hops=\(hopsPostIncrement)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward link DATA: \(error)")
         }
@@ -423,7 +425,11 @@ extension ReticulumTransport {
             try await sendToInterface(forwardedRaw, interfaceId: outboundInterfaceId)
             // D12: Touch path table timestamp after successful forwarding
             await pathTable.touch(destinationHash: packet.destination)
-            onDiagnostic?("[TRANSPORT] Forwarded DATA dest=\(destHex()) → \(outboundInterfaceId) hops=\(newHops)")
+            // ⚠️ TEMPORARY / DEV-ONLY — `from=` ingress + `hash=` (the packet's truncated hash, which
+            // is also the returning PROOF's destination) added for transport-events log path
+            // reconstruction; revert with the feature.
+            let hashHex = packetHash.map { String(format: "%02x", $0) }.joined()
+            onDiagnostic?("[TRANSPORT] Forwarded DATA dest=\(destHex()) hash=\(hashHex) from=\(interfaceId) → \(outboundInterfaceId) hops=\(newHops)")
             transportExtLogger.info("Forwarded DATA dest=\(destHex()) via=\(outboundInterfaceId) hops=\(newHops)")
         } catch {
             reverseTable.removeValue(forKey: packetHash)
@@ -442,6 +448,9 @@ extension ReticulumTransport {
     public func forwardDataProof(_ packet: Packet, reverseEntry: ReverseTableEntry, from interfaceId: String) async {
         // [TEMPORARY] Lazy: every consumer is a diagnostic that may not run.
         let proofDestHex = { packet.destination.prefix(8).map { String(format: "%02x", $0) }.joined() }
+        // ⚠️ TEMPORARY / DEV-ONLY — full proof destination (the truncated hash of the DATA packet this
+        // proves) so the transport-events log can pair a data forward with its returning proof; revert.
+        let proofForHex = { packet.destination.map { String(format: "%02x", $0) }.joined() }
 
         // D10: Proof must arrive on the outbound interface (the direction data was forwarded)
         // Python reference: Transport.py line 2093
@@ -455,7 +464,9 @@ extension ReticulumTransport {
 
         do {
             try await sendToInterface(forwardedRaw, interfaceId: reverseEntry.receivingInterfaceId)
-            onDiagnostic?("[TRANSPORT] Forwarded DATA PROOF \(proofDestHex()) → \(reverseEntry.receivingInterfaceId) hops=\(newHops)")
+            // ⚠️ TEMPORARY / DEV-ONLY — `from=` ingress + full proof-for hash (matches the DATA
+            // packet's `hash=`) for transport-events log path reconstruction; revert with the feature.
+            onDiagnostic?("[TRANSPORT] Forwarded DATA PROOF proofFor=\(proofForHex()) from=\(interfaceId) → \(reverseEntry.receivingInterfaceId) hops=\(newHops)")
             transportExtLogger.info("Forwarded DATA PROOF \(proofDestHex()) via=\(reverseEntry.receivingInterfaceId) hops=\(newHops)")
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward DATA PROOF: \(error)")

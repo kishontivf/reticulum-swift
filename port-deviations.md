@@ -1802,3 +1802,32 @@ remote process-aborts from any authenticated peer, reachable even on a `resource
 node. The fixes make hostile input a clean decode-failure / dropped-advertisement (mirroring RNS's
 graceful drop) and are NO-OPS for every valid value, so behaviour matches RNS for all reachable
 non-malicious inputs. Found by a proactive bug-class sweep, not by a reviewer.
+
+### Announce bandwidth cap applied to locally-originated announces (resolved 2026-08-19)
+
+**Site:** `Sources/ReticulumSwift/Transport/ReticulumTransport.swift` —
+`sendAnnounceFiltered(_:)`, the per-interface cap gate and the
+`announceAllowedAt` update.
+
+**Python reference:** `RNS/Transport.py:1272-1275` — inside `Transport.outbound`'s
+announce branch, the whole `announce_cap` / `announce_allowed_at` / `announce_queue`
+block is guarded by `if packet.hops > 0:`, with the explicit comment "Currently,
+annouces originating locally are always allowed, and do not conform to bandwidth
+caps."
+
+**Bug:** the swift port applied the cap unconditionally — a locally-originated
+announce both waited for `announceAllowedAt` (and was queued instead of sent when
+blocked) and consumed the interface's announce budget. This was latent while every
+interface used the default `bitrate = 0`, because all three cap branches are
+`if bitrate > 0`. It becomes live the moment a low-bandwidth interface is given a
+real bitrate to rate-shape *relayed* announce churn: Intercom sets `icBle0` to
+9600 bps for exactly that purpose, at which point a ~300-byte own-announce blocks
+the interface for `(2400/9600)/0.02` = 12.5 s. The announce most affected is the
+coalesced rising-edge presence announce emitted when a peer appears — i.e. the one
+nearby-peer discovery over BLE depends on — and under relaying the budget is
+being consumed by relayed announces at the same time.
+
+**Fix:** both the cap gate and the budget update are now guarded by
+`packet.header.hopCount > 0`, so a local announce neither waits for nor consumes
+the budget, and the cap shapes only forwarded announces. Mirrors
+`Transport.py:1275`. No wire-format change.

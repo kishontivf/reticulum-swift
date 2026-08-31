@@ -1789,8 +1789,17 @@ public actor ReticulumTransport {
                 continue
             }
 
-            // Per-interface announce bandwidth cap (C14)
-            if let allowedAt = announceAllowedAt[id], now < allowedAt {
+            // Per-interface announce bandwidth cap (C14).
+            //
+            // Locally-originated announces (hops == 0) are EXEMPT, matching Python
+            // `Transport.outbound` (Transport.py:1272-1275, `if packet.hops > 0:` with the comment
+            // "annouces originating locally are always allowed, and do not conform to bandwidth
+            // caps"). Without this guard, giving a low-bandwidth interface a non-zero `bitrate` to
+            // rate-shape *relayed* announce churn also throttles the node's own announce on that
+            // interface — on `icBle0` at 9600 bps a ~300-byte announce blocks the next for
+            // (2400/9600)/0.02 = 12.5 s and is queued instead of sent, delaying exactly the
+            // rising-edge presence announce that nearby-peer discovery depends on.
+            if packet.header.hopCount > 0, let allowedAt = announceAllowedAt[id], now < allowedAt {
                 // Queue announce for later delivery (E5) with dedup by destination
                 var queue = announceQueues[id] ?? []
                 let emitted = AnnounceQueueEntry.announceEmitted(from: packet.data)
@@ -1818,9 +1827,11 @@ public actor ReticulumTransport {
                 try await interface.send(transmitData)
                 successCount += 1
 
-                // Update bandwidth tracking
+                // Update bandwidth tracking. Skipped for locally-originated announces for the
+                // same reason as the cap check above — a local announce neither waits for the
+                // budget nor consumes it (Python Transport.py:1275).
                 let bitrate = interface.config.bitrate
-                if bitrate > 0 {
+                if packet.header.hopCount > 0, bitrate > 0 {
                     let txTime = Double(encoded.count * 8) / Double(bitrate)
                     let waitTime = txTime / TransportConstants.ANNOUNCE_CAP
                     announceAllowedAt[id] = now.addingTimeInterval(waitTime)
@@ -3255,6 +3266,10 @@ public actor ReticulumTransport {
                     }
 
                     logger.debug("Retransmitted announce for \(destHex, privacy: .public)... via \(id, privacy: .public)")
+                    // ⚠️ TEMPORARY / DEV-ONLY — surface announce relays in the transport-events log;
+                    // `from=` ingress + `hops=` so the announce propagation path can be reconstructed; revert.
+                    let recvFrom = action.receivingInterfaceId ?? "local"
+                    onDiagnostic?("[TRANSPORT] Forwarded ANNOUNCE dest=\(destHex) from=\(recvFrom) via \(id) hops=\(action.hops)")
                 } catch {
                     logger.warning("Failed to retransmit announce to \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -3295,6 +3310,10 @@ public actor ReticulumTransport {
                 queue.remove(at: oldest.offset)
                 do {
                     try await interfaces[id]?.send(entry.encoded)
+                    // ⚠️ TEMPORARY / DEV-ONLY — surface queued-announce relays in the transport-events log;
+                    // no ingress here (queued entries don't store it), but `hops=` gives path position; revert.
+                    let entryDestHex = entry.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
+                    onDiagnostic?("[TRANSPORT] Forwarded ANNOUNCE dest=\(entryDestHex) via \(id) hops=\(entry.hops)")
                     let bitrate = interfaces[id]?.config.bitrate ?? 0
                     if bitrate > 0 {
                         let txTime = Double(entry.encoded.count * 8) / Double(bitrate)
