@@ -104,6 +104,27 @@ Storage side effects (new persisted artifacts on disk) — **only in a process t
   ([2.5](#25-persisted-storage-attribute-changes)). Log content includes destination hashes (first
   8 bytes), interface IDs, hop counts, and node display names (control characters stripped).
 
+#### `PathTable.InterfaceSighting` — new public nested type (2026-09-01)
+
+`Sources/ReticulumSwift/Routing/PathTable.swift`. The value type of `lastHeardByInterface`, widened
+from a bare `Date` so a *losing* candidate's distance survives ranking.
+
+| Member | Kind | Notes |
+|---|---|---|
+| `at` | `public let Date` | Local wall-clock arrival time — what the map held before |
+| `hopCount` | `public let UInt8` | Hops as recorded, i.e. `PathEntry.hopCount` |
+| `isDirect` | `public var Bool` (get) | `hopCount <= 1`. **Not `== 0`**: a peer's own announce is `0` on the wire but is recorded as `1` for a directly reachable destination |
+
+**Why it exists.** `record(entry:)` is the only point where every candidate route for a destination
+is still visible — it picks one winner for `paths` and discards the rest. "Which carriers can reach
+X, and which of those are *direct*?" is unanswerable afterwards from any other surface. The host app
+relays for others (transport-node mode), so an announce arriving on a carrier interface may have
+come through a third device; its routing policy defines peer-to-peer as *carrier interface AND
+`hopCount <= 1`*, which the previous `Date`-only map could not express.
+
+**Storage impact: none.** `lastHeardByInterface` is in-memory only and never persisted, so this is
+not a schema, migration or storage-attribute change. Pruning is unchanged.
+
 ### 2.2 New domain properties
 
 #### `PathTable` — the fallback-interface / liveness model
@@ -119,7 +140,7 @@ New instance state (all **in-memory only — none of it is persisted to SQLite**
 |---|---|---|---|
 | `fallbackInterfaceIds` | `Set<String>` | 73 | Interfaces the embedder marked low-priority fallback/carrier |
 | `fallbackPinnedDestinations` | `Set<Data>` | 97 | Destinations pinned to the carrier; announces from normal interfaces are rejected while pinned |
-| `lastHeardByInterface` | `[Data: [String: Date]]` | 103 | Per-destination, per-interface wall-clock last-announce time — the liveness signal |
+| `lastHeardByInterface` | `[Data: [String: InterfaceSighting]]` | 103 | Per-destination, per-interface record of the last announce: arrival time **and hop count**. The liveness signal, plus the candidate-distance evidence (see 2.1) |
 | `connectedInterfaces` | `Set<String>` | 117 | Interfaces whose transport link is `.connected`, pushed by the transport |
 
 New static configuration (public, mutable, process-wide):
@@ -201,6 +222,7 @@ crash fix described in [3.4](#34-concurrency-and-crash-fixes).)
 | Symbol | File:line | Notes |
 |---|---|---|
 | `AnnounceValidator.validateDestinationBinding(parsed:)` | `AnnounceValidator.swift:263` | New `public static func`. Also now called from inside `validate(parsed:)`, so *existing* callers get the stricter check automatically |
+| `PathTable.heardInterfaces(for:)` | `PathTable.swift` | New `public func` returning `[String: InterfaceSighting]` — every interface a destination's announces arrived on, with when and how far. Read-only; no state added beyond the widened value type in 2.1. Empty dictionary for an unheard destination |
 
 No public symbol was removed or renamed anywhere in the fork.
 
@@ -215,7 +237,7 @@ that determine whether a row is written at all. Behavioural delta versus upstrea
 | Carrier takeover (`:417-469`) | new | A fallback-interface announce replaces the incumbent row **only** when the normal path is silent past `fallbackTakeoverGraceSeconds`, its interface is disconnected, or the path is marked unresponsive |
 | Normal-over-fallback promotion (`:470-495`) | new | A normal-interface announce **unconditionally** replaces a fallback incumbent (unpinned destinations), writes the row, and resets `pathState` to `PATH_STATE_UNKNOWN` |
 | Shorter-hop upgrade, "Path 2b" (`:515-529`) | new | A strictly-shorter-hop copy of an **already-held** announce (same random blob) now upgrades the row, preserving the existing `randomBlobs`/timebase. Upstream ignored this case and kept the worse, often dead-next-hop route |
-| `lastHeardByInterface` write (`:388`) | new | Recorded **before** any early return, so duplicate-blob arrivals still refresh liveness (in-memory only) |
+| `lastHeardByInterface` write (`:388`) | new | Recorded **before** any early return, so duplicate-blob arrivals still refresh liveness (in-memory only). Since 2026-09-01 stores `InterfaceSighting(at:hopCount:)` rather than a bare `Date` |
 
 Net effect: for a single-interface deployment the persisted rows are identical to upstream except
 for the Path 2b shorter-hop upgrade. For a deployment that registers a fallback interface, row

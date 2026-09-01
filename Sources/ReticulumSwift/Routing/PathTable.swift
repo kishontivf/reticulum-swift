@@ -96,11 +96,37 @@ public actor PathTable {
     /// transport node may keep re-announcing) and unpins it when that's no longer true.
     private var fallbackPinnedDestinations: Set<Data> = []
 
-    /// Per-destination, per-interface wall-clock time of the last announce received on that interface.
+    /// One announce arrival, as this table remembers it after ranking has thrown the rest away.
+    ///
+    /// **PORT DEVIATION** — python RNS keeps only the arrival *time* here. The hop count is added
+    /// because `record()` is the single place every candidate route is still visible: it decides a
+    /// winner and discards the losers, so anything a caller might later want to know about a losing
+    /// candidate has to be captured on the way past or it is gone. Distance is the specific thing
+    /// an embedder cannot recover afterwards, and "is this route direct or relayed" cannot be
+    /// answered without it. See `port-deviations.md`.
+    public struct InterfaceSighting: Sendable, Equatable {
+        /// Local wall-clock time the announce arrived.
+        public let at: Date
+        /// Hops to the destination as recorded, i.e. `PathEntry.hopCount`. `1` means directly
+        /// reachable — a peer's own announce is `0` on the wire but is recorded as `1` — so
+        /// `<= 1` is the directness test and `>= 2` means the announce came through a relay.
+        public let hopCount: UInt8
+
+        public init(at: Date, hopCount: UInt8) {
+            self.at = at
+            self.hopCount = hopCount
+        }
+
+        public var isDirect: Bool { hopCount <= 1 }
+    }
+
+    /// Per-destination, per-interface record of the last announce received on that interface.
     /// Drives the liveness-based carrier takeover (see `fallbackTakeoverGraceSeconds`): the normal
     /// path counts as "alive" while some non-fallback interface here was heard within the takeover
     /// window, regardless of how often the carrier re-announces. Pruned alongside `paths`.
-    private var lastHeardByInterface: [Data: [String: Date]] = [:]
+    ///
+    /// In memory only — never persisted — so widening it carries no schema or migration cost.
+    private var lastHeardByInterface: [Data: [String: InterfaceSighting]] = [:]
 
     /// Interface IDs whose transport link is currently `.connected`, pushed periodically by the
     /// transport (`setConnectedInterfaces`). Used as a *connectivity* liveness signal for the
@@ -326,12 +352,22 @@ public actor PathTable {
         Array(fallbackInterfaceIds)
     }
 
+    /// Every interface `destination`'s announces have arrived on, with when and how far away.
+    ///
+    /// The candidate set Reticulum's own ranking discards: `paths` keeps one winner per
+    /// destination, so without this an embedder can see which route was chosen but not which
+    /// routes were *available*, nor whether any of them was direct. Returns an empty dictionary
+    /// for a destination never heard from.
+    public func heardInterfaces(for destination: Data) -> [String: InterfaceSighting] {
+        lastHeardByInterface[destination] ?? [:]
+    }
+
     /// Whether `destination`'s announce was heard on `interfaceId` within the given window — i.e.
     /// the peer is currently reachable over that specific (e.g. carrier) interface. Used to gate a
     /// dual-dispatch carrier copy so it's only sent to a peer that is actually nearby on the carrier.
     public func wasHeardOnInterface(_ destination: Data, interfaceId: String, within seconds: TimeInterval) -> Bool {
-        guard let at = lastHeardByInterface[destination]?[interfaceId] else { return false }
-        return Date().timeIntervalSince(at) <= seconds
+        guard let sighting = lastHeardByInterface[destination]?[interfaceId] else { return false }
+        return Date().timeIntervalSince(sighting.at) <= seconds
     }
 
     /// Whether the destination's current best path already routes over a fallback (carrier)
@@ -357,8 +393,8 @@ public actor PathTable {
     private func normalInterfaceHeardRecently(_ destination: Data, within seconds: UInt64) -> Bool {
         guard let heard = lastHeardByInterface[destination] else { return false }
         let cutoff = Date().addingTimeInterval(-Double(seconds))
-        for (interfaceId, at) in heard where !fallbackInterfaceIds.contains(interfaceId) {
-            if at >= cutoff { return true }
+        for (interfaceId, sighting) in heard where !fallbackInterfaceIds.contains(interfaceId) {
+            if sighting.at >= cutoff { return true }
         }
         return false
     }
@@ -385,7 +421,8 @@ public actor PathTable {
         // Track when we last heard this destination on each interface (local wall-clock). This is the
         // liveness signal the carrier-takeover decision uses instead of announce-emission freshness —
         // recorded before any early return so it captures every arrival, including duplicate blobs.
-        lastHeardByInterface[key, default: [:]][entry.interfaceId] = Date()
+        lastHeardByInterface[key, default: [:]][entry.interfaceId] =
+            InterfaceSighting(at: Date(), hopCount: entry.hopCount)
 
         guard let existing = paths[key] else {
             // Path 1: Unknown destination → accept

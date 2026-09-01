@@ -63,6 +63,47 @@ wired for `TCPInterface`; extended to `RNodeInterface` so a Model-B RNode
 surfaces reasons like "Invalid configuration — TX power may exceed device
 limits" instead of a bare offline flag.
 
+### `PathTable.lastHeardByInterface` carries hop count + `heardInterfaces(for:)` reader (feat/per-contact-routing 2026-09-01)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — `lastHeardByInterface` widened from
+`[Data: [String: Date]]` to `[Data: [String: InterfaceSighting]]`, where the new public
+`PathTable.InterfaceSighting` is `(at: Date, hopCount: UInt8)` with an `isDirect` helper
+(`hopCount <= 1`); new public reader `heardInterfaces(for:) -> [String: InterfaceSighting]`.
+Internal readers (`wasHeardOnInterface`, `normalInterfaceHeardRecently`) updated to read
+`sighting.at`. Tests: `Tests/ReticulumSwiftTests/PathTableHeardInterfacesTests.swift`.
+
+**Python reference:** `RNS.Transport` keeps no per-destination × per-interface arrival map at all;
+the swift port's `lastHeardByInterface` is itself already a port addition (it drives the
+carrier-takeover liveness signal). Python therefore has neither the time nor the hop half of this.
+
+**Reason:** Category (b) — new feature for the swift app surface, and one that can only be
+implemented here. `record(entry:)` is the single point at which *every* candidate route for a
+destination is still visible: it runs the 5-path decision tree, keeps one winner in `paths`, and
+discards the losers. An embedder asking "what are my options for reaching X, and which of them are
+direct?" cannot reconstruct that afterwards from any public surface — the losing candidates are
+gone, and the surviving arrival map answered a time window (`wasHeardOnInterface`) but not a
+distance.
+
+Distance is the load-bearing part. The host app (Analog) acts as a Reticulum transport node, so an
+announce arriving on a carrier interface may have been relayed by a third device — the fleet logs
+503 arrivals at `hops=2` and 149 at `hops=3` on Bluetooth carrier children. Its routing policy is
+"carry as much as possible peer-to-peer", and *peer-to-peer* means carrier interface **and**
+`hopCount <= 1`. Without the hop count on non-winning candidates, that policy cannot be expressed:
+it can see which route was chosen but not whether the alternatives were direct.
+
+`hopCount <= 1` rather than `== 0` is deliberate and matches the port: a peer's own announce is
+`hops = 0` on the wire, but `PathEntry.hopCount` records `1` for a directly reachable destination
+(`ReticulumTransport.swift:1513` sends HEADER_1 when `entry.hopCount == 1`).
+
+**Cost:** In-memory only — `lastHeardByInterface` is never persisted, so there is no schema change,
+no migration and no `KVF` storage impact. The map already existed and was already pruned alongside
+`paths`; this widens its value type and adds one read-only accessor. No behaviour change to ranking,
+rebroadcast or persistence.
+
+**Upstream-worthy:** Yes, as the accessor at least — "what are my candidate routes" is a general
+question and the data is already being collected on the way past. Flagged for the next upstream
+conversation.
+
 ### `TCPInterface.beginTunnelMode(send:)` / `endTunnelMode()` — VPN-extension hook (new feature)
 
 **Sites:** `Sources/ReticulumSwift/Interfaces/TCPInterface.swift` —
