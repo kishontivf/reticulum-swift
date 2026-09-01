@@ -223,6 +223,8 @@ crash fix described in [3.4](#34-concurrency-and-crash-fixes).)
 |---|---|---|
 | `AnnounceValidator.validateDestinationBinding(parsed:)` | `AnnounceValidator.swift:263` | New `public static func`. Also now called from inside `validate(parsed:)`, so *existing* callers get the stricter check automatically |
 | `PathTable.heardInterfaces(for:)` | `PathTable.swift` | New `public func` returning `[String: InterfaceSighting]` — every interface a destination's announces arrived on, with when and how far. Read-only; no state added beyond the widened value type in 2.1. Empty dictionary for an unheard destination |
+| `PathTable.setInterfaceGravity(_:_:)` / `gravity(of:)` / `defaultGravity` | `PathTable.swift` | New `public func`s and a `public static let`. Back-port of Python RNS `Interface.gravity` (absent from the swift upstream too) — per-interface pathing affinity, consulted only as the tiebreak when the *same* announce arrives on two interfaces. In-memory, embedder-configured like `fallbackInterfaceIds`; schema unchanged, and a table configured with nothing behaves as before |
+| `PathTable.onRecordDecision` | `PathTable.swift` | **[TEMPORARY]** New `public nonisolated(unsafe) static var (@Sendable (String) -> Void)?`. Observation only — receives one line per route-*moving* decision in `record(entry:)`, naming the rule that accepted or rejected it. Nil by default; no behavioural effect either way, and no state persisted. Field-test scaffolding, removed with Phase 1 |
 
 No public symbol was removed or renamed anywhere in the fork.
 

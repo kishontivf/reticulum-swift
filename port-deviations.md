@@ -63,6 +63,78 @@ wired for `TCPInterface`; extended to `RNodeInterface` so a Model-B RNode
 surfaces reasons like "Invalid configuration — TX power may exceed device
 limits" instead of a bare offline flag.
 
+### `Interface.gravity` back-ported from Python RNS (feat/per-contact-routing 2026-09-01)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `interfaceGravity: [String: Int]`
+store, `public static let defaultGravity = 0`, `setInterfaceGravity(_:_:)` / `gravity(of:)`, and a
+new accept branch in `record(entry:)` (**path 2c**) inside the equal-or-better-hops arm. Tests:
+`Tests/ReticulumSwiftTests/PathTableGravityTests.swift`.
+
+**Python reference:** `RNS.Transport.received_announce()`, the `announce_gravity > current_gravity`
+branch — *"If the same announce is received later on an interface with higher gravity, allow
+updating the path table to use this interface instead."* Backed by `Interface.gravity = 0`
+(`RNS/Interfaces/Interface.py:100`), the documented per-interface `gravity` config option, and the
+`default_gravity` / `autoconnect_interface_gravity` globals (`RNS/Reticulum.py`). Verified against
+Python RNS **1.4.2** (`3rdParty/Reticulum`, `b48b96e6`); introduced upstream in `5577e781`,
+*"Basic gravity processing for announces"*.
+
+**Reason:** Category (c) — **a gap in the port, not a deviation from Python.** The swift port was
+written against a Python revision predating gravity, and the mechanism is absent from
+`torlando-tech/reticulum-swift` as well (`git grep -i gravity upstream/main -- Sources` → nothing),
+so this is a back-port rather than a merge.
+
+It is load-bearing here. Once per-peer carrier children exist, a peer is commonly reachable over
+two carriers at the *same* hop count, and the same announce arrives on both. With no affinity term
+the winner is whichever copy landed first — measured across a fleet session as an even split (WiFi
+30 / WebRTC 29 for one peer, 27 / 30 for another, 19 / 11 for a third). The embedder's tier order
+therefore existed only in its own policy layer and never reached routing.
+
+**Deliberately narrow, matching Python.** The branch is gated on `announceEmitted == pathTimebase`,
+so it only ever chooses between two arrivals of one announce. It cannot beat a fresher announce
+(path 2 has already run), cannot beat a shorter path (path 2b has already run), and never touches
+the worse-hops arm — a 3-hop route on a high-affinity interface still loses to a 1-hop route on a
+low-affinity one. Blobs are left untouched, since the announce is one already held; path state is
+reset, as on every accept.
+
+**Storage:** none. Gravity lives in memory and is configured by the embedder at interface
+registration, exactly as `fallbackInterfaceIds` is. The `paths` schema is unchanged, and a table
+whose embedder configures nothing behaves precisely as it did before (every interface reads 0).
+
+**Upstream-worthy:** yes, unreservedly — it is upstream Python behaviour the swift port is missing,
+and it should go to `torlando-tech/reticulum-swift` rather than live here.
+
+### `PathTable.onRecordDecision` route-decision trace [TEMPORARY] (feat/per-contact-routing 2026-09-01)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public nonisolated(unsafe)
+static var onRecordDecision: (@Sendable (String) -> Void)?` plus a private `noteDecision(...)`
+called at all 13 return points of `record(entry:)`. Tests:
+`Tests/ReticulumSwiftTests/PathTableRecordDecisionTests.swift`.
+
+**Python reference:** `RNS.Transport.received_announce()` logs its accept/reject reasoning through
+the shared `RNS.log` firehose at `LOG_DEBUG`. There is no separate sink and no filtering, so the
+lines are unusable in the field: they arrive interleaved with everything else the stack says.
+
+**Reason:** Category (b) — an observation hook for the embedder, with no behavioural effect. The
+port already had `NetworkLog.debug("[RECORD] ...")` at most of these points, but gated two ways:
+on the `RETICULUM_NETWORK_LOG` environment flag (off in fleet builds, since field phones are not
+launched from a harness) and on `newIsFallback || existingIsFallback` (silent whenever both
+candidates are carriers, which is the common case once per-peer children exist). Field sessions
+03-07 therefore recorded *which* route won — a device sitting on a 3-hop detour for eight minutes
+while a live 1-hop link was in its own candidate set — with no way to tell which of the five rules
+installed it. Accept-on-Path-4 and never-hearing-the-1-hop-copy produce the same table and want
+opposite fixes.
+
+The sink is nil by default, so a build that does not opt in pays one optional check per announce
+and builds no strings. Emission is filtered to candidates arriving on a *different* interface than
+the incumbent: `record` runs on every inbound announce and same-interface refreshes dominate it
+without saying anything about route selection.
+
+**Upstream-worthy:** partly. The filtering and the separate sink are the useful parts and would
+suit any embedder; the specific rule names are this port's own (Python has no "Path 2b").
+
+**Remove when:** Phase 1 of the per-contact routing work closes. This is field-test scaffolding and
+goes with the routing log — one grep for `onRecordDecision` and `noteDecision`.
+
 ### `PathTable.lastHeardByInterface` carries hop count + `heardInterfaces(for:)` reader (feat/per-contact-routing 2026-09-01)
 
 **Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — `lastHeardByInterface` widened from
