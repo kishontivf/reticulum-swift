@@ -103,6 +103,100 @@ whose embedder configures nothing behaves precisely as it did before (every inte
 **Upstream-worthy:** yes, unreservedly — it is upstream Python behaviour the swift port is missing,
 and it should go to `torlando-tech/reticulum-swift` rather than live here.
 
+### `PathTable.path4IncumbentSilenceSeconds` — worse-hop takeover requires a silent incumbent (feat/per-contact-routing 2026-09-02)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public static var
+path4IncumbentSilenceSeconds: UInt64 = 75`, checked at the head of path 4 in `record(entry:)`.
+Tests: `Tests/ReticulumSwiftTests/PathTableWorseHopSilenceTests.swift`; two pre-existing tests that
+used path 4 as a vehicle were updated (`PathTableHeardInterfacesTests`,
+`PathTableRecordDecisionTests`), and a trace test for the refusal added.
+
+**Python reference:** `RNS/Transport.py` path 4 accepts *any* worse-hop announce carrying a fresher
+emission, unbounded. This is a genuine divergence from the upstream decision tree, not a guard on a
+port addition — the first one in this table that changes a rule Python actually has.
+
+**Reason:** Category (b), field-driven. Freshness alone does not establish that the shorter route
+died; it routinely just means the longer copy arrived first. Session10
+(`AutomatedTests/Results/manual-log-pulls/Session10`) measured **66** path-4 takeovers across five
+devices in four minutes:
+
+| jump | count |
+|---|---|
+| 1h → 2h | 33 |
+| **1h → 3h** | **21** |
+| 2h → 3h | 7 |
+| **2h → 4h** | **4** |
+| 3h → 4h | 1 |
+
+25 of 66 discarded a route for one two or more hops longer. The worked example: a device holding a
+live 1-hop WebRTC link to a peer took a 3-hop WiFi detour on an announce 21 s newer
+(`08:15:56.326 ACCEPT icWifi0-bc524452/3h vs icWebrtc0-1f2ad1ee/1h — path 4 · WORSE HOPS ... emitΔ=21`)
+purely because the direct link had not yet relayed that particular announce. It sat there 29 s
+until `fallbackMaxHopPenalty` rescued it through Bluetooth.
+
+**Design:** the rule keeps working for the case it exists to serve. A peer that genuinely moved
+stops announcing over the old interface, the window is crossed, and path 4 follows it — it just
+demands the evidence first. The liveness signal is `lastHeardByInterface`, written for **every**
+arrival before any early return (including rejected duplicates), so it is a true "is this interface
+still carrying announces" reading rather than "did it last win".
+
+**Skipped on the incumbent's own interface.** A same-interface hop change is exactly the "peer
+moved" case, and that arrival refreshes the sighting itself a few lines earlier, so the check could
+never pass. Without the exemption the rule would freeze every path at its first-seen hop count.
+
+**Why 75 s:** matches `fallbackTakeoverGraceSeconds`, which is already tuned and load-bearing for
+the same judgement ("has this route actually stopped working"). Comfortably above the 21 s gap that
+produced the measured regression. `0` restores Python's unbounded behaviour exactly, and is what the
+trace tests use so they exercise the trace rather than the policy.
+
+**Storage:** none; a static tunable, no schema change.
+
+**Upstream-worthy:** unclear, and deliberately flagged as such. It is a real improvement for a fleet
+with heterogeneous carriers, and it is a behavioural change to a documented Python rule. It should
+not go upstream without a discussion of whether RNS wants hop-aware ranking at all.
+
+### `PathTable.fallbackMaxHopPenalty` — hop bound on the fallback rules (feat/per-contact-routing 2026-09-02)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public static var
+fallbackMaxHopPenalty: Int = 1`, consulted at the head of both arms of the fallback branch in
+`record(entry:)`. Tests: `Tests/ReticulumSwiftTests/PathTableFallbackHopGuardTests.swift`.
+
+**Python reference:** none, and none possible. `RNS.Transport` has no concept of a fallback or
+carrier interface, so it has no rule for this to bound. This is a guard on an existing port
+addition (`fallbackInterfaceIds`), not a divergence from an upstream behaviour.
+
+**Reason:** Category (b). The fallback rules resolve carrier-vs-normal by liveness and freshness
+and are deliberately hop-blind — correct while the two paths are comparable in distance, wrong when
+the normal path is a detour. Session09 (`AutomatedTests/Results/manual-log-pulls/Session09`) caught
+the failure: with the internet-lost pin disabled, a device discarded a live **1-hop** carrier route
+for a **3-hop** normal one on the *same announce* (`emitΔ=0`, decision trace
+`fallback · normal promoted over carrier`), then refused three subsequent 1-hop carrier arrivals
+with `fallback · normal still live (interface connected)`. The 3-hop route pointed at a neighbour
+whose own route pointed back — a two-node forwarding loop that stood for the rest of the session,
+leaving the fleet with no working route to that peer at all.
+
+The guard bounds both directions: a carrier shorter by more than the penalty takes the route before
+any liveness reasoning, and a normal path worse by more than it cannot promote. The promote refusal
+returns `false` rather than falling through, because path 4 would otherwise accept the same
+worse-hop announce on freshness alone.
+
+**Why `1`:** it is the smallest value that separates the two observed cases. 2-hop normal over
+1-hop carrier still promotes — that is the ordinary relayed-TCP-vs-adjacent-BLE case and the entire
+reason for having a fallback set; 3-hop over 1-hop no longer does. A larger value re-admits the
+detour; `0` would let the carrier hold the route for every nearby peer and defeat the fallback
+concept.
+
+**Relationship to [[gravity]]:** disjoint. `Interface.gravity` arbitrates *equal-hop* ties between
+two arrivals of one announce and never reaches the worse-hops arm; this bounds the *carrier-vs-
+normal* rules, which run earlier and are hop-blind. Session09 measured gravity firing 2 times
+fleet-wide against 434 fallback decisions, so on this fleet the fallback rules — not gravity, not
+hop count — are what actually choose the carrier.
+
+**Storage:** none; a static tunable, no schema change, default preserves prior behaviour for any
+table whose embedder registers no fallback interfaces.
+
+**Upstream-worthy:** only alongside `fallbackInterfaceIds` itself, which is a port addition.
+
 ### `PathTable.onRecordDecision` route-decision trace [TEMPORARY] (feat/per-contact-routing 2026-09-01)
 
 **Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public nonisolated(unsafe)

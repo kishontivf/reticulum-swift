@@ -98,6 +98,38 @@ public actor PathTable {
     /// removed; the pin (offline hold) and the 75s liveness window (anti-flap) are the real guards.
     public static var fallbackPromoteMaxLagSeconds: UInt64 = 90
 
+    /// How many extra hops a normal (non-fallback) path may cost, relative to a carrier path for the
+    /// same destination, and still out-rank it.
+    ///
+    /// The fallback rules below are deliberately hop-blind — freshness and liveness decide — which is
+    /// right while the two paths are comparable in distance. It is wrong when the normal path is a
+    /// long detour: Session09 saw a device discard a live 1-hop carrier route for a 3-hop normal one
+    /// on the *same announce* (`emitΔ=0`), then refuse to go back while that 3-hop route pointed at a
+    /// neighbour whose own route pointed back — a two-node forwarding loop that stood for the rest of
+    /// the session. A carrier shorter by more than this penalty wins outright, and a normal path
+    /// worse by more than it cannot promote.
+    ///
+    /// `1` keeps the ordinary case intact (a 2-hop relayed normal path still beats a 1-hop carrier —
+    /// the whole point of calling one of them a fallback) while refusing the pathological one.
+    public static var fallbackMaxHopPenalty: Int = 1
+
+    /// How long the incumbent's interface must have been SILENT for this destination before a
+    /// worse-hop announce may take the route (path 4).
+    ///
+    /// Python accepts any worse-hop announce that carries a fresher emission, unbounded
+    /// (`RNS/Transport.py` path 4). That is reasonable upstream, where every link is roughly
+    /// equivalent, and wrong for a carrier fleet where a 1-hop adjacent link and a 3-hop relay chain
+    /// are not. Session10 measured 66 path-4 takeovers, of which 21 replaced a **1-hop** route with a
+    /// **3-hop** one and 4 replaced 2 hops with 4 — including a device that dropped a live 1-hop
+    /// WebRTC link to a peer for a 3-hop WiFi detour on an announce only 21s newer, purely because
+    /// the direct link had not relayed that particular announce yet.
+    ///
+    /// Freshness alone does not establish that the shorter route is gone; silence does. A peer that
+    /// genuinely moved stops announcing over the old interface, so the window is still crossed and
+    /// path 4 still follows it — it just demands the evidence first. Set to `0` to restore Python's
+    /// unbounded behaviour.
+    public static var path4IncumbentSilenceSeconds: UInt64 = 75
+
     /// Destinations pinned to their fallback interface: while pinned, announces from NON-fallback
     /// interfaces are rejected, so the destination stays on the fallback path and can't be pulled
     /// back onto a stale/relayed normal-interface route. The embedder pins a peer it knows is only
@@ -509,6 +541,26 @@ public actor PathTable {
         if newIsFallback != existingIsFallback {
             let emitDelta = Int64(bitPattern: announceEmitted) - Int64(bitPattern: pathTimebase)
             if newIsFallback {
+                // Hop guard (see `fallbackMaxHopPenalty`): before any liveness reasoning, a carrier
+                // that is shorter than the incumbent normal path by more than the allowed penalty
+                // takes the route. Liveness cannot justify holding a long detour over a demonstrably
+                // direct link.
+                if Int(entry.hopCount) + Self.fallbackMaxHopPenalty < Int(existing.hopCount) {
+                    markPathUnknownState(key)
+                    var updated = entry
+                    updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
+                    updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                    paths[key] = updated
+                    saveToDatabase(updated)
+                    let detail = "carrier \(entry.interfaceId) \(entry.hopCount)h decisively shorter than"
+                        + " normal \(existing.interfaceId) \(existing.hopCount)h"
+                        + " (penalty \(Self.fallbackMaxHopPenalty))"
+                    noteDecision("ACCEPT", keyHex, entry, existing, "fallback · \(detail)")
+                    logger.info("Adopted \(keyHex): \(detail)")
+                    NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): \(detail) → carrier takes over")
+                    pathUpdateContinuation?.yield(updated)
+                    return true
+                }
                 // Candidate = carrier, incumbent = normal. Take over only once the normal path has
                 // gone SILENT — no announce on any non-fallback interface for the takeover window.
                 // Liveness beats freshness: the carrier re-announces far more often than the periodic
@@ -563,6 +615,19 @@ public actor PathTable {
                 NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): normal \(existing.interfaceId) \(takeoverReason) "
                     + "→ carrier \(entry.interfaceId) takes over")
             } else {
+                // Hop guard (see `fallbackMaxHopPenalty`): the promote below is deliberately
+                // unconditional, which is right when the normal path is a comparable route and wrong
+                // when it is a detour. Refuse outright rather than falling through — Path 4 would
+                // otherwise accept the same worse-hop announce on freshness alone.
+                if Int(entry.hopCount) > Int(existing.hopCount) + Self.fallbackMaxHopPenalty {
+                    let detail = "normal \(entry.interfaceId) \(entry.hopCount)h is a detour around"
+                        + " carrier \(existing.interfaceId) \(existing.hopCount)h"
+                        + " (penalty \(Self.fallbackMaxHopPenalty))"
+                    noteDecision("IGNORE", keyHex, entry, existing, "fallback · \(detail)")
+                    logger.debug("Ignored \(keyHex): \(detail)")
+                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): \(detail) → keep carrier")
+                    return false
+                }
                 // Candidate = normal, incumbent = fallback (carrier). Reaching here means the dest is
                 // NOT pinned (a pinned dest's normal announces are rejected at the top of record), i.e.
                 // the peer is considered ONLINE — so TCP reclaims the route from the carrier
@@ -701,6 +766,28 @@ public actor PathTable {
         // Path 4: Not expired + fresher emission + new blob
         if announceEmitted > pathTimebase {
             if isNewBlob {
+                // Silence requirement (see `path4IncumbentSilenceSeconds`): a fresher announce that
+                // took a LONGER route is not evidence the shorter one died — it is routinely just the
+                // copy that arrived first. Require the incumbent's interface to have stopped carrying
+                // this destination's announces before handing the route to a longer path.
+                //
+                // Skipped when the candidate arrives on the incumbent's own interface: the sighting
+                // was refreshed by this very arrival a few lines above, so the check could never pass,
+                // and a same-interface hop change is exactly the "peer moved" case path 4 is for.
+                if entry.interfaceId != existing.interfaceId,
+                   Self.path4IncumbentSilenceSeconds > 0,
+                   wasHeardOnInterface(key, interfaceId: existing.interfaceId,
+                                       within: Double(Self.path4IncumbentSilenceSeconds)) {
+                    noteDecision("IGNORE", keyHex, entry, existing,
+                                 "path 4 · worse hops (\(existing.hopCount)h→\(entry.hopCount)h) but "
+                                    + "incumbent \(existing.interfaceId) still heard within "
+                                    + "\(Self.path4IncumbentSilenceSeconds)s")
+                    logger.debug("Ignored \(keyHex): worse-hop takeover refused, incumbent still live")
+                    NetworkLog.log("[RECORD] REJECT \(keyHex): \(entry.interfaceId) "
+                        + "\(entry.hopCount)h vs incumbent \(existing.interfaceId) "
+                        + "\(existing.hopCount)h — incumbent not silent")
+                    return false
+                }
                 markPathUnknownState(key)
                 let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
                 var updated = entry

@@ -49,14 +49,18 @@ final class PathTableHeardInterfacesTests: XCTestCase {
         XCTAssertEqual(heard["icWifi0"]?.isDirect, true)
         XCTAssertEqual(heard["icBle0"]?.isDirect, false, "3 hops came through a relay")
 
-        // And note WHICH one Reticulum chose: the *relayed* one, because its announce was fresher.
-        // That is the path table's Path-4 rule (a fresher announce is accepted even when worse),
-        // and it is the motivating case for keeping the losers — the chosen route is three hops
-        // away over Bluetooth while a direct LAN route was known a moment earlier. Without the hop
-        // count on the loser there is no way to see that from outside.
+        // And note WHICH one Reticulum chose: the direct one. The relayed copy carried a fresher
+        // announce, which under Python's unbounded Path 4 would have taken the route — three hops
+        // over Bluetooth while a direct LAN route was known a moment earlier. That takeover is now
+        // gated on the incumbent having gone silent (`path4IncumbentSilenceSeconds`), and it has
+        // not: its announce landed a millisecond ago.
+        //
+        // The loser is still the point of this test. Whichever way ranking goes, the rejected
+        // candidate and its distance survive in `heardInterfaces` — that is the only place an
+        // embedder can see that a 3-hop relay was available and passed over.
         let chosen = await table.lookup(destinationHash: destination)
-        XCTAssertEqual(chosen?.interfaceId, "icBle0")
-        XCTAssertEqual(chosen?.hopCount, 3)
+        XCTAssertEqual(chosen?.interfaceId, "icWifi0")
+        XCTAssertEqual(chosen?.hopCount, 1)
     }
 
     /// `1` is direct, not `0`: a peer's own announce is `hops = 0` on the wire but is recorded as

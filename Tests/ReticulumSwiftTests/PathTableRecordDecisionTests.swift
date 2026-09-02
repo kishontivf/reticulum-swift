@@ -18,6 +18,12 @@ import XCTest
 
 final class PathTableRecordDecisionTests: XCTestCase {
 
+    override func tearDown() {
+        PathTable.onRecordDecision = nil
+        PathTable.path4IncumbentSilenceSeconds = 75
+        super.tearDown()
+    }
+
     private let destination = Data(repeating: 0xD2, count: 16)
 
     private func entry(interfaceId: String, hopCount: UInt8, emitted: UInt64) -> PathEntry {
@@ -49,9 +55,14 @@ final class PathTableRecordDecisionTests: XCTestCase {
     }
 
     /// The motivating case: a fresher announce arriving further away takes the route from a live,
-    /// nearer one. Path 4 does this with no hop penalty and no grace window, and the trace has to
-    /// name it — otherwise the outcome is visible in the path table but the cause is not.
+    /// nearer one. The trace has to name it — otherwise the outcome is visible in the path table but
+    /// the cause is not.
+    ///
+    /// Path 4 now requires the incumbent to have gone silent first, so the requirement is switched
+    /// off here: this test is about what the trace *says* when path 4 fires, not about when it fires.
+    /// `testPathFourRefusalNamesTheLiveIncumbent` covers the gate itself.
     func testPathFourTakeoverIsNamedInTheTrace() async throws {
+        PathTable.path4IncumbentSilenceSeconds = 0
         let table = try PathTable()
         let lines = await trace {
             _ = await table.record(entry: entry(interfaceId: "icWebrtc0-direct", hopCount: 1, emitted: 1_000))
@@ -74,6 +85,27 @@ final class PathTableRecordDecisionTests: XCTestCase {
 
         let chosen = await table.lookup(destinationHash: destination)
         XCTAssertEqual(chosen?.interfaceId, "icWebrtc0-relay")
+    }
+
+    /// And the refusal has to be just as legible: a reader seeing a device sit on a 1-hop route
+    /// while fresher 3-hop copies arrive needs the line to say the incumbent was still being heard.
+    func testPathFourRefusalNamesTheLiveIncumbent() async throws {
+        let table = try PathTable()
+        let lines = await trace {
+            _ = await table.record(entry: entry(interfaceId: "icWebrtc0-direct", hopCount: 1, emitted: 1_000))
+            _ = await table.record(entry: entry(interfaceId: "icWebrtc0-relay", hopCount: 3, emitted: 1_001))
+        }
+
+        XCTAssertEqual(lines.count, 2)
+        let refusal = lines[1]
+        XCTAssertTrue(refusal.contains("IGNORE"), refusal)
+        XCTAssertTrue(refusal.contains("path 4"), refusal)
+        XCTAssertTrue(refusal.contains("1h→3h"), refusal)
+        XCTAssertTrue(refusal.contains("still heard"), refusal)
+        XCTAssertTrue(refusal.contains("icWebrtc0-direct"), refusal)
+
+        let chosen = await table.lookup(destinationHash: destination)
+        XCTAssertEqual(chosen?.interfaceId, "icWebrtc0-direct", "the live direct route keeps it")
     }
 
     /// A strictly shorter copy is ALWAYS adopted, freshness be damned — Path 2b exists precisely so
@@ -141,8 +173,9 @@ final class PathTableRecordDecisionTests: XCTestCase {
     func testNoSinkMeansNoWork() async throws {
         PathTable.onRecordDecision = nil
         let table = try PathTable()
-        _ = await table.record(entry: entry(interfaceId: "icWifi0-a", hopCount: 1, emitted: 4_000))
-        let accepted = await table.record(entry: entry(interfaceId: "icWifi0-b", hopCount: 3, emitted: 4_001))
+        // A shorter copy landing after a longer one — path 2b, whose outcome depends on no tunable.
+        _ = await table.record(entry: entry(interfaceId: "icWifi0-a", hopCount: 3, emitted: 4_000))
+        let accepted = await table.record(entry: entry(interfaceId: "icWifi0-b", hopCount: 1, emitted: 4_001))
         XCTAssertTrue(accepted, "routing behaviour must be identical with the trace off")
     }
 }
