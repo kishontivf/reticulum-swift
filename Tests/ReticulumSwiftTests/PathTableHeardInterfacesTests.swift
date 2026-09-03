@@ -52,7 +52,7 @@ final class PathTableHeardInterfacesTests: XCTestCase {
         // And note WHICH one Reticulum chose: the direct one. The relayed copy carried a fresher
         // announce, which under Python's unbounded Path 4 would have taken the route — three hops
         // over Bluetooth while a direct LAN route was known a moment earlier. That takeover is now
-        // gated on the incumbent having gone silent (`path4IncumbentSilenceSeconds`), and it has
+        // gated on the incumbent having gone silent (`incumbentSilenceSeconds`), and it has
         // not: its announce landed a millisecond ago.
         //
         // The loser is still the point of this test. Whichever way ranking goes, the rejected

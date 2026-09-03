@@ -54,7 +54,7 @@ final class PathTableFallbackHopGuardTests: XCTestCase {
     }
 
     override func tearDown() {
-        PathTable.fallbackMaxHopPenalty = 1
+        PathTable.fallbackMaxHopPenalty = 0
         super.tearDown()
     }
 
@@ -79,14 +79,31 @@ final class PathTableFallbackHopGuardTests: XCTestCase {
 
     /// The guard must not swallow the reason a fallback set exists: one extra hop on the normal path
     /// is the ordinary case (relayed TCP vs adjacent BLE) and the normal path keeps the route.
-    func testCarrierOneHopShorterDoesNotDisplaceLiveNormalPath() async throws {
+    /// One hop shorter is the case the fleet actually meets — carrier-strictly-shorter announces
+    /// were refused 217 times in session22 alone, 74 of them keeping a 2-hop relay route over a
+    /// 1-hop Bluetooth link to a phone in the same room. At penalty 0 the shorter link takes it.
+    func testCarrierOneHopShorterTakesTheRouteFromALiveNormalPath() async throws {
         let table = try armedTable()
         await arm(table)
         let announce = sameAnnounce(emitted: 5_000)
 
         _ = await table.record(entry: announce(normal, 2))
         let took = await table.record(entry: announce(carrier, 1))
-        XCTAssertFalse(took, "1h carrier vs 2h normal is within the penalty — the normal path holds")
+        XCTAssertTrue(took, "1h carrier is strictly shorter than 2h normal and must take the route")
+        let path = await table.lookup(destinationHash: destination)
+        XCTAssertEqual(path?.interfaceId, carrier)
+    }
+
+    /// Equal hops is where liveness and gravity decide, not this guard — a carrier must not
+    /// displace a live normal path it only matches. This is the boundary penalty 0 draws.
+    func testCarrierAtEqualHopsStillDoesNotDisplaceALiveNormalPath() async throws {
+        let table = try armedTable()
+        await arm(table)
+        let announce = sameAnnounce(emitted: 5_000)
+
+        _ = await table.record(entry: announce(normal, 2))
+        let took = await table.record(entry: announce(carrier, 2))
+        XCTAssertFalse(took, "equal hops is not shorter — the live normal path holds")
         let path = await table.lookup(destinationHash: destination)
         XCTAssertEqual(path?.interfaceId, normal)
     }
@@ -108,16 +125,48 @@ final class PathTableFallbackHopGuardTests: XCTestCase {
         XCTAssertEqual(path?.hopCount, 1)
     }
 
-    /// Within the penalty the promote stays unconditional, including on an equal emission — the
-    /// behaviour the fallback design depends on to get back off the carrier promptly.
-    func testNormalPathWithinPenaltyStillPromotesUnconditionally() async throws {
+    /// The mirror of `testCarrierOneHopShorterTakesTheRouteFromALiveNormalPath`, and the half that
+    /// makes the result stable: a route the carrier won by a hop is one the normal path cannot take
+    /// straight back. At penalty 1 it could, which is why a carrier could never hold such a route.
+    func testNormalPathOneHopLongerCannotPromoteOverACarrier() async throws {
         let table = try armedTable()
         await arm(table)
         let announce = sameAnnounce(emitted: 5_000)
 
         _ = await table.record(entry: announce(carrier, 1))
         let promoted = await table.record(entry: announce(normal, 2))
-        XCTAssertTrue(promoted, "2h normal over 1h carrier is the ordinary promote and must still fire")
+        XCTAssertFalse(promoted, "2h normal is longer than the 1h carrier it would displace")
+        let path = await table.lookup(destinationHash: destination)
+        XCTAssertEqual(path?.interfaceId, carrier)
+    }
+
+    /// The promote stays unconditional at equal hops — the behaviour the fallback design depends on
+    /// to get back off the carrier promptly once a comparable normal path exists again.
+    func testNormalPathAtEqualHopsStillPromotesUnconditionally() async throws {
+        let table = try armedTable()
+        await arm(table)
+        let announce = sameAnnounce(emitted: 5_000)
+
+        _ = await table.record(entry: announce(carrier, 2))
+        let promoted = await table.record(entry: announce(normal, 2))
+        XCTAssertTrue(promoted, "an equal-hop normal path is the ordinary promote and must still fire")
+        let path = await table.lookup(destinationHash: destination)
+        XCTAssertEqual(path?.interfaceId, normal)
+    }
+
+    /// A demoted carrier route must not strand the destination. The refusal above returns before
+    /// path 5 (`same emission, incumbent unresponsive`) is ever reached, so without an escape the
+    /// one announce that could replace a dead route is the one turned away — and `checkPath`
+    /// marking the path unresponsive is exactly the report that it is dead.
+    func testALongerNormalPathReclaimsARouteFromAnUnresponsiveCarrier() async throws {
+        let table = try armedTable()
+        await arm(table)
+        let announce = sameAnnounce(emitted: 5_000)
+
+        _ = await table.record(entry: announce(carrier, 1))
+        await table.markPathUnresponsive(destination)
+        let promoted = await table.record(entry: announce(normal, 3))
+        XCTAssertTrue(promoted, "a demoted carrier route must yield to the path that still works")
         let path = await table.lookup(destinationHash: destination)
         XCTAssertEqual(path?.interfaceId, normal)
     }

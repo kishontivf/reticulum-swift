@@ -103,10 +103,10 @@ whose embedder configures nothing behaves precisely as it did before (every inte
 **Upstream-worthy:** yes, unreservedly — it is upstream Python behaviour the swift port is missing,
 and it should go to `torlando-tech/reticulum-swift` rather than live here.
 
-### `PathTable.path4IncumbentSilenceSeconds` — worse-hop takeover requires a silent incumbent (feat/per-contact-routing 2026-09-02)
+### `PathTable.incumbentSilenceSeconds` — worse-hop takeover requires a silent incumbent (feat/per-contact-routing 2026-09-02)
 
 **Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public static var
-path4IncumbentSilenceSeconds: UInt64 = 75`, checked at the head of path 4 in `record(entry:)`.
+incumbentSilenceSeconds: UInt64 = 75`, checked at the head of path 4 in `record(entry:)`.
 Tests: `Tests/ReticulumSwiftTests/PathTableWorseHopSilenceTests.swift`; two pre-existing tests that
 used path 4 as a vehicle were updated (`PathTableHeardInterfacesTests`,
 `PathTableRecordDecisionTests`), and a trace test for the refusal added.

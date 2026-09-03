@@ -20,7 +20,7 @@ final class PathTableRecordDecisionTests: XCTestCase {
 
     override func tearDown() {
         PathTable.onRecordDecision = nil
-        PathTable.path4IncumbentSilenceSeconds = 75
+        PathTable.incumbentSilenceSeconds = 75
         super.tearDown()
     }
 
@@ -62,7 +62,7 @@ final class PathTableRecordDecisionTests: XCTestCase {
     /// off here: this test is about what the trace *says* when path 4 fires, not about when it fires.
     /// `testPathFourRefusalNamesTheLiveIncumbent` covers the gate itself.
     func testPathFourTakeoverIsNamedInTheTrace() async throws {
-        PathTable.path4IncumbentSilenceSeconds = 0
+        PathTable.incumbentSilenceSeconds = 0
         let table = try PathTable()
         let lines = await trace {
             _ = await table.record(entry: entry(interfaceId: "icWebrtc0-direct", hopCount: 1, emitted: 1_000))

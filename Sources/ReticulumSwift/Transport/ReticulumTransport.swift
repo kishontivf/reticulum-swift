@@ -110,6 +110,9 @@ struct AnnounceQueueEntry {
     let hops: UInt8             // Hop count at time of queuing
     let emitted: UInt64         // Emission timestamp from random blob bytes[5:10]
     let encoded: Data           // Full encoded packet bytes
+    /// ⚠️ LOCAL DIVERGENCE — whether this is our own announce, so the drain below can attribute
+    /// the send without the ingress interface (which a queued entry does not carry).
+    var isOwnAnnounce: Bool = false
 
     /// Extract emission timestamp from an announce packet's data payload.
     /// Python: Transport.announce_emitted(packet) reads random_blob at
@@ -452,6 +455,26 @@ public actor ReticulumTransport {
     /// Set the diagnostic callback (actor-isolated setter for cross-actor access).
     public func setOnDiagnostic(_ callback: @escaping @Sendable (String) -> Void) {
         self.onDiagnostic = callback
+    }
+
+    /// ⚠️ LOCAL DIVERGENCE from upstream — re-apply after an upstream refresh. Typed announce
+    /// traffic for host-side tallies (see `AnnounceTrafficEvent`). Deliberately not folded into
+    /// `onDiagnostic`: that one is dev-only string scaffolding, this counts in shipping builds.
+    private var onAnnounceTraffic: (@Sendable (AnnounceTrafficEvent) -> Void)?
+
+    /// Set the announce-traffic callback. Nil (the default) makes every emission a nil check.
+    public func setOnAnnounceTraffic(_ callback: (@Sendable (AnnounceTrafficEvent) -> Void)?) {
+        self.onAnnounceTraffic = callback
+    }
+
+    /// ⚠️ LOCAL DIVERGENCE from upstream — re-apply after an upstream refresh. Typed relay
+    /// traffic for host-side tallies (see `RelayTrafficEvent`), on the same terms as
+    /// `onAnnounceTraffic`: typed, always installable, no string built per packet.
+    var onRelayTraffic: (@Sendable (RelayTrafficEvent) -> Void)?
+
+    /// Set the relay-traffic callback. Nil (the default) makes every emission a nil check.
+    public func setOnRelayTraffic(_ callback: (@Sendable (RelayTrafficEvent) -> Void)?) {
+        self.onRelayTraffic = callback
     }
 
     /// Whether single-packet PROOFs emitted by this transport use the IMPLICIT
@@ -1808,13 +1831,15 @@ public actor ReticulumTransport {
                     if emitted > queue[existingIdx].emitted {
                         queue[existingIdx] = AnnounceQueueEntry(
                             destination: packet.destination, time: now,
-                            hops: packet.header.hopCount, emitted: emitted, encoded: encoded
+                            hops: packet.header.hopCount, emitted: emitted, encoded: encoded,
+                            isOwnAnnounce: packet.header.hopCount == 0
                         )
                     }
                 } else if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
                     queue.append(AnnounceQueueEntry(
                         destination: packet.destination, time: now,
-                        hops: packet.header.hopCount, emitted: emitted, encoded: encoded
+                        hops: packet.header.hopCount, emitted: emitted, encoded: encoded,
+                        isOwnAnnounce: packet.header.hopCount == 0
                     ))
                 }
                 announceQueues[id] = queue
@@ -1837,6 +1862,12 @@ public actor ReticulumTransport {
                     announceAllowedAt[id] = now.addingTimeInterval(waitTime)
                 }
 
+                // ⚠️ LOCAL DIVERGENCE — this is the direct announce path (our own announce, and
+                // path responses); the announce table's retry loop counts separately.
+                onAnnounceTraffic?(AnnounceTrafficEvent(
+                    direction: .sent(packet.header.hopCount == 0 ? .own : .relayed),
+                    interfaceId: id,
+                    destinationHash: packet.destination))
                 logger.debug("Sent announce for \(destHex) via '\(id)'")
             } catch {
                 lastError = error
@@ -2940,6 +2971,18 @@ public actor ReticulumTransport {
     ///   - packet: Announce packet to process
     ///   - interfaceId: ID of interface that received the announce
     private func processAnnounce(packet: Packet, from interfaceId: String) async {
+        // ⚠️ LOCAL DIVERGENCE — announce-traffic tally (see `AnnounceTrafficEvent`). Set by the
+        // accepting paths below and emitted on whichever exit is taken; announces dropped before
+        // acceptance (ingress limit, own destination, `.ignored`) leave it nil and count nothing.
+        var disposition: AnnounceTrafficEvent.Disposition?
+        defer {
+            if let disposition {
+                onAnnounceTraffic?(AnnounceTrafficEvent(direction: .received(disposition),
+                                                        interfaceId: interfaceId,
+                                                        destinationHash: packet.destination))
+            }
+        }
+
         // L6: Apply ingress storm detection only for unknown destinations
         // Known destinations are legitimate updates and should not be rate-limited
         let hasPath = await pathTable.hasPath(for: packet.destination)
@@ -2984,6 +3027,7 @@ public actor ReticulumTransport {
             logger.debug("Announce ignored (\(String(describing: reason), privacy: .public)) for \(hexPrefix, privacy: .public)...")
 
         case .recorded(let destHash):
+            disposition = .kept
             // RNS Transport.py:2034-2086 — dispatch every accepted announce
             // (should_add==True) to externally-registered announce handlers. This
             // runs for EVERY accepted announce regardless of transport_enabled (it
@@ -3025,6 +3069,7 @@ public actor ReticulumTransport {
             await processPendingPackets(for: destHash)
 
         case .recordedAndRebroadcast(let destHash, let rebroadcastPacket):
+            disposition = .kept
             let hexPrefix = destHash.prefix(4).map { String(format: "%02x", $0) }.joined()
             let isLocal = isLocalDestination(destHash)
 
@@ -3116,6 +3161,7 @@ public actor ReticulumTransport {
                         data: rebroadcastPacket.data
                     )
                     try? await sendToAllInterfaces(prPacket)
+                    disposition = .relayed
                     logger.info("PATH_RESPONSE for \(hexPrefix, privacy: .public)... sent immediately")
                 } else {
                     // Queue for retransmission via AnnounceTable
@@ -3133,6 +3179,7 @@ public actor ReticulumTransport {
                         receivedFrom: receivedFrom,
                         receivingInterfaceId: interfaceId
                     )
+                    disposition = .relayed
                     logger.info("Announce for \(hexPrefix, privacy: .public)... queued for retransmission")
                 }
             } else if let _ = pendingLocalPathRequests.removeValue(forKey: destHash) {
@@ -3151,6 +3198,7 @@ public actor ReticulumTransport {
                     isLocalClient: true,
                     receivingInterfaceId: interfaceId
                 )
+                disposition = .relayed
             } else {
                 logger.debug("Transport disabled, not rebroadcasting \(hexPrefix, privacy: .public)...")
             }
@@ -3222,13 +3270,15 @@ public actor ReticulumTransport {
                         if emitted > queue[existingIdx].emitted {
                             queue[existingIdx] = AnnounceQueueEntry(
                                 destination: action.destinationHash, time: Date(),
-                                hops: action.hops, emitted: emitted, encoded: encoded
+                                hops: action.hops, emitted: emitted, encoded: encoded,
+                                isOwnAnnounce: action.receivingInterfaceId == nil
                             )
                         }
                     } else if queue.count < TransportConstants.MAX_QUEUED_ANNOUNCES {
                         queue.append(AnnounceQueueEntry(
                             destination: action.destinationHash, time: Date(),
-                            hops: action.hops, emitted: emitted, encoded: encoded
+                            hops: action.hops, emitted: emitted, encoded: encoded,
+                            isOwnAnnounce: action.receivingInterfaceId == nil
                         ))
                     }
                     announceQueues[id] = queue
@@ -3270,6 +3320,13 @@ public actor ReticulumTransport {
                     // `from=` ingress + `hops=` so the announce propagation path can be reconstructed; revert.
                     let recvFrom = action.receivingInterfaceId ?? "local"
                     onDiagnostic?("[TRANSPORT] Forwarded ANNOUNCE dest=\(destHex) from=\(recvFrom) via \(id) hops=\(action.hops)")
+                    // ⚠️ LOCAL DIVERGENCE — one emission per interface actually written to, which
+                    // is what a per-interface tally wants: an announce with no receiving interface
+                    // is ours, anything else is another node's that we are carrying.
+                    onAnnounceTraffic?(AnnounceTrafficEvent(
+                        direction: .sent(action.receivingInterfaceId == nil ? .own : .relayed),
+                        interfaceId: id,
+                        destinationHash: action.destinationHash))
                 } catch {
                     logger.warning("Failed to retransmit announce to \(id, privacy: .public): \(error.localizedDescription, privacy: .public)")
                 }
@@ -3314,6 +3371,11 @@ public actor ReticulumTransport {
                     // no ingress here (queued entries don't store it), but `hops=` gives path position; revert.
                     let entryDestHex = entry.destination.prefix(8).map { String(format: "%02x", $0) }.joined()
                     onDiagnostic?("[TRANSPORT] Forwarded ANNOUNCE dest=\(entryDestHex) via \(id) hops=\(entry.hops)")
+                    // ⚠️ LOCAL DIVERGENCE — a bandwidth-deferred send still went out; count it.
+                    onAnnounceTraffic?(AnnounceTrafficEvent(
+                        direction: .sent(entry.isOwnAnnounce ? .own : .relayed),
+                        interfaceId: id,
+                        destinationHash: entry.destination))
                     let bitrate = interfaces[id]?.config.bitrate ?? 0
                     if bitrate > 0 {
                         let txTime = Double(entry.encoded.count * 8) / Double(bitrate)

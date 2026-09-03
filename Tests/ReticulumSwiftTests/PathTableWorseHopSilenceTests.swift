@@ -8,7 +8,7 @@
 //  PathTableWorseHopSilenceTests.swift
 //  ReticulumSwiftTests
 //
-//  Path 4 accepts a worse-hop route on a fresher announce. `path4IncumbentSilenceSeconds` requires
+//  Path 4 accepts a worse-hop route on a fresher announce. `incumbentSilenceSeconds` requires
 //  the incumbent's interface to have gone quiet first — a fresher announce down a longer road is not
 //  evidence the short road closed. Session10 measured 21 takeovers that replaced a 1-hop route with
 //  a 3-hop one on that reasoning alone.
@@ -35,7 +35,7 @@ final class PathTableWorseHopSilenceTests: XCTestCase {
     }
 
     override func tearDown() {
-        PathTable.path4IncumbentSilenceSeconds = 75
+        PathTable.incumbentSilenceSeconds = 75
         super.tearDown()
     }
 
@@ -62,7 +62,7 @@ final class PathTableWorseHopSilenceTests: XCTestCase {
         XCTAssertFalse(refused)
 
         // No silence required == the incumbent counts as quiet.
-        PathTable.path4IncumbentSilenceSeconds = 0
+        PathTable.incumbentSilenceSeconds = 0
         let took = await table.record(entry: entry(detour, 3, emitted: 1_042))
         XCTAssertTrue(took, "with the incumbent quiet, the longer route is the only one left")
         let path = await table.lookup(destinationHash: destination)
@@ -83,7 +83,7 @@ final class PathTableWorseHopSilenceTests: XCTestCase {
 
     /// Zero restores Python's unbounded path 4, so the divergence can be switched off wholesale.
     func testZeroRestoresUnboundedPythonBehaviour() async throws {
-        PathTable.path4IncumbentSilenceSeconds = 0
+        PathTable.incumbentSilenceSeconds = 0
         let table = try PathTable()
         _ = await table.record(entry: entry(direct, 1, emitted: 1_000))
 

@@ -109,9 +109,13 @@ public actor PathTable {
     /// the session. A carrier shorter by more than this penalty wins outright, and a normal path
     /// worse by more than it cannot promote.
     ///
-    /// `1` keeps the ordinary case intact (a 2-hop relayed normal path still beats a 1-hop carrier —
-    /// the whole point of calling one of them a fallback) while refusing the pathological one.
-    public static var fallbackMaxHopPenalty: Int = 1
+    /// `0` — strictly shorter wins, in both directions.
+    ///
+    /// At `0` the two arms are exact mirrors and hop count decides, w  hich is also what makes the
+    /// result stable rather than flapping: the shorter path is refused entry from one side and
+    /// refuses displacement from the other. Session09's forwarding loop is still excluded — a 3-hop
+    /// normal path against a 1-hop carrier is more of a detour at `0` than it was at `1`.
+    public static var fallbackMaxHopPenalty: Int = 0
 
     /// How long the incumbent's interface must have been SILENT for this destination before a
     /// worse-hop announce may take the route (path 4).
@@ -119,16 +123,12 @@ public actor PathTable {
     /// Python accepts any worse-hop announce that carries a fresher emission, unbounded
     /// (`RNS/Transport.py` path 4). That is reasonable upstream, where every link is roughly
     /// equivalent, and wrong for a carrier fleet where a 1-hop adjacent link and a 3-hop relay chain
-    /// are not. Session10 measured 66 path-4 takeovers, of which 21 replaced a **1-hop** route with a
-    /// **3-hop** one and 4 replaced 2 hops with 4 — including a device that dropped a live 1-hop
-    /// WebRTC link to a peer for a 3-hop WiFi detour on an announce only 21s newer, purely because
-    /// the direct link had not relayed that particular announce yet.
-    ///
+    /// are not.
     /// Freshness alone does not establish that the shorter route is gone; silence does. A peer that
     /// genuinely moved stops announcing over the old interface, so the window is still crossed and
     /// path 4 still follows it — it just demands the evidence first. Set to `0` to restore Python's
     /// unbounded behaviour.
-    public static var path4IncumbentSilenceSeconds: UInt64 = 75
+    public static var incumbentSilenceSeconds: UInt64 = 75
 
     /// Destinations pinned to their fallback interface: while pinned, announces from NON-fallback
     /// interfaces are rejected, so the destination stays on the fallback path and can't be pulled
@@ -619,7 +619,13 @@ public actor PathTable {
                 // unconditional, which is right when the normal path is a comparable route and wrong
                 // when it is a detour. Refuse outright rather than falling through — Path 4 would
                 // otherwise accept the same worse-hop announce on freshness alone.
-                if Int(entry.hopCount) > Int(existing.hopCount) + Self.fallbackMaxHopPenalty {
+                // ...but only while the carrier route is still believed to work. A demoted
+                // incumbent is precisely the case `checkPath` exists to report, and refusing here
+                // returns before path 5 (`same emission, incumbent unresponsive`) is ever reached
+                // — so without this escape a dead carrier route strands the destination until the
+                // silence gate expires, with the one announce that could replace it turned away.
+                if Int(entry.hopCount) > Int(existing.hopCount) + Self.fallbackMaxHopPenalty,
+                   !isPathUnresponsive(key) {
                     let detail = "normal \(entry.interfaceId) \(entry.hopCount)h is a detour around"
                         + " carrier \(existing.interfaceId) \(existing.hopCount)h"
                         + " (penalty \(Self.fallbackMaxHopPenalty))"
@@ -766,7 +772,7 @@ public actor PathTable {
         // Path 4: Not expired + fresher emission + new blob
         if announceEmitted > pathTimebase {
             if isNewBlob {
-                // Silence requirement (see `path4IncumbentSilenceSeconds`): a fresher announce that
+                // Silence requirement (see `incumbentSilenceSeconds`): a fresher announce that
                 // took a LONGER route is not evidence the shorter one died — it is routinely just the
                 // copy that arrived first. Require the incumbent's interface to have stopped carrying
                 // this destination's announces before handing the route to a longer path.
@@ -775,13 +781,13 @@ public actor PathTable {
                 // was refreshed by this very arrival a few lines above, so the check could never pass,
                 // and a same-interface hop change is exactly the "peer moved" case path 4 is for.
                 if entry.interfaceId != existing.interfaceId,
-                   Self.path4IncumbentSilenceSeconds > 0,
+                   Self.incumbentSilenceSeconds > 0,
                    wasHeardOnInterface(key, interfaceId: existing.interfaceId,
-                                       within: Double(Self.path4IncumbentSilenceSeconds)) {
+                                       within: Double(Self.incumbentSilenceSeconds)) {
                     noteDecision("IGNORE", keyHex, entry, existing,
                                  "path 4 · worse hops (\(existing.hopCount)h→\(entry.hopCount)h) but "
                                     + "incumbent \(existing.interfaceId) still heard within "
-                                    + "\(Self.path4IncumbentSilenceSeconds)s")
+                                    + "\(Self.incumbentSilenceSeconds)s")
                     logger.debug("Ignored \(keyHex): worse-hop takeover refused, incumbent still live")
                     NetworkLog.log("[RECORD] REJECT \(keyHex): \(entry.interfaceId) "
                         + "\(entry.hopCount)h vs incumbent \(existing.interfaceId) "
