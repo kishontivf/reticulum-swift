@@ -103,6 +103,48 @@ whose embedder configures nothing behaves precisely as it did before (every inte
 **Upstream-worthy:** yes, unreservedly — it is upstream Python behaviour the swift port is missing,
 and it should go to `torlando-tech/reticulum-swift` rather than live here.
 
+### Path 5 refuses a hop downgrade — unresponsive is not evidence about hop count (2026-09-03)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — a guard at the head of path 5 in
+`record(entry:)`. Test: `PathTableFallbackHopGuardTests.testAnUnresponsiveIncumbentIsNotReplacedByALongerNormalRoute`.
+
+**Python reference:** `RNS/Transport.py` path 5 accepts a same-emission announce whenever the path
+is marked unresponsive, comparing no hop counts at all. A genuine divergence from the upstream
+decision tree, the second in this table after the path-4 guard above.
+
+**Reason:** Category (b), field-driven. Session30
+(`AutomatedTests/Results/manual-log-pulls/Session30`), Apone → Hicks. A path check timed out while
+Hicks's WiFi stack was briefly down (its `NWBrowser` had died 7 s earlier with `-65569
+DefunctConnection`, dropping every WiFi peer at once), which demoted the route:
+
+```
+14:33:30.433 [PATHCHECK] 5e576d02 UNCONFIRMED — path demoted
+14:33:31.646 [RECORD] ACCEPT 5e576d02: icWifi0-af8163e2/3h vs icWifi0-ef8beb19/2h — path 5 · same emission, incumbent unresponsive
+14:33:31.787 [RECORD] ACCEPT 5e576d02: icBle0-ef8beb19/2h vs icWifi0-af8163e2/3h — fallback · carrier 2h decisively shorter than normal 3h
+```
+
+The 3-hop copy took the row from a live 2-hop one; the carrier rule then correctly preferred a 2-hop
+BLE route over that 3-hop incumbent. The device sent over Bluetooth for the rest of the capture with
+`icWifi0-ef8beb19/2h/fresh` sitting unused in the candidate list — equal hops never displace, so it
+could not win the route back. `markPathUnresponsive` reports that the destination did not answer; it
+says nothing about which route is shorter, and a same-emission copy arriving over a longer route is
+not evidence the shorter one died — it is the same announce, later.
+
+**Design:** three ways past the guard, so the rule keeps serving what it exists for. Equal or better
+hops pass (a lateral move or an improvement). The incumbent's own interface passes — a hop change on
+the same link is the peer moving, not a competing copy. And a normal route reclaiming from a demoted
+**carrier** incumbent passes, which is the escape hatch that keeps a dead fallback route from
+stranding a destination (`testALongerNormalPathReclaimsARouteFromAnUnresponsiveCarrier`); the
+carrier/normal rules return before path 5, so that announce is the only one that can rescue it.
+
+Worth knowing: equal- and better-hop copies of the same emission are rejected earlier, by path 2's
+duplicate-blob/`emitΔ=0` branch, so in practice path 5 is only ever reached with worse hops or on the
+incumbent's own interface. The hop comparison is kept explicit anyway rather than resting on path 2
+continuing to catch them.
+
+**Upstream-worthy:** yes, on the same footing as the path-4 guard — it corrects a rule that trades a
+working route for a longer one on a signal that carries no hop information.
+
 ### `PathTable.incumbentSilenceSeconds` — worse-hop takeover requires a silent incumbent (feat/per-contact-routing 2026-09-02)
 
 **Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public static var

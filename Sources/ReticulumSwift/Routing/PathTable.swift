@@ -820,6 +820,35 @@ public actor PathTable {
 
         // Path 5: Same emission + unresponsive path
         if announceEmitted == pathTimebase && isPathUnresponsive(key) {
+            // Hop guard (Session30). `markPathUnresponsive` reports that the destination did not
+            // answer — it says nothing about hop counts, and a same-emission copy arriving over a
+            // LONGER route is not evidence the shorter one died: it is the same announce, later.
+            // Without this, the first duplicate to arrive took the row however much worse it was.
+            // On Apone a path check timed out while the peer's WiFi stack was briefly down, a 3h
+            // copy replaced the live 2h incumbent, and a 2h carrier route then beat the 3h one as
+            // "decisively shorter" — leaving BLE chosen with the 2h WiFi route still fresh in the
+            // table and unable to win it back (equal hops never displace).
+            //
+            // Three ways past it, in the order they matter:
+            //   • equal or better hops — a lateral move or an improvement, never a downgrade;
+            //   • the incumbent's own interface — a hop change on the same link, which is the
+            //     peer moving rather than a competing copy;
+            //   • a normal route reclaiming from a demoted CARRIER incumbent — the escape hatch
+            //     that keeps a dead fallback route from stranding the destination, since the
+            //     carrier/normal rules above return before path 5 is ever reached.
+            let isDowngrade = entry.hopCount > existing.hopCount
+                && entry.interfaceId != existing.interfaceId
+                && !(existingIsFallback && !newIsFallback)
+            if isDowngrade {
+                noteDecision("IGNORE", keyHex, entry, existing,
+                             "path 5 · unresponsive but WORSE HOPS "
+                                + "(\(existing.hopCount)h→\(entry.hopCount)h) on the same emission")
+                logger.debug("Ignored \(keyHex): unresponsive incumbent, but candidate is a hop downgrade")
+                NetworkLog.log("[RECORD] REJECT \(keyHex): \(entry.interfaceId) "
+                    + "\(entry.hopCount)h vs unresponsive \(existing.interfaceId) "
+                    + "\(existing.hopCount)h — downgrade refused")
+                return false
+            }
             var updated = entry
             updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
             updated.pathState = TransportConstants.PATH_STATE_UNKNOWN

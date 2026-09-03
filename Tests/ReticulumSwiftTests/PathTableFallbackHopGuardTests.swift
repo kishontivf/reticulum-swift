@@ -171,6 +171,27 @@ final class PathTableFallbackHopGuardTests: XCTestCase {
         XCTAssertEqual(path?.interfaceId, normal)
     }
 
+    /// Session30: a path check timed out for a contact whose WiFi had briefly collapsed, and the
+    /// next same-emission copy — three hops, on a different normal interface — took the row from a
+    /// live 2-hop one, because path 5 compared no hops at all. A 2h carrier route then beat the 3h
+    /// incumbent as "decisively shorter", so the device sent over BLE while the 2h WiFi route sat
+    /// fresh and unused. The unresponsive flag says the destination did not answer; it says nothing
+    /// about which route is shorter.
+    func testAnUnresponsiveIncumbentIsNotReplacedByALongerNormalRoute() async throws {
+        let table = try armedTable()
+        await arm(table)
+        let announce = sameAnnounce(emitted: 9_000)
+        let otherNormal = "icWifi0-other"
+
+        _ = await table.record(entry: announce(normal, 2))
+        await table.markPathUnresponsive(destination)
+        let taken = await table.record(entry: announce(otherNormal, 3))
+        XCTAssertFalse(taken, "a longer normal route must not take the row from a shorter one")
+        let path = await table.lookup(destinationHash: destination)
+        XCTAssertEqual(path?.interfaceId, normal, "the 2-hop incumbent keeps the route")
+        XCTAssertEqual(path?.hopCount, 2)
+    }
+
     /// The penalty is a tunable, and tightening it to 0 makes any longer normal path lose.
     func testPenaltyIsTunable() async throws {
         PathTable.fallbackMaxHopPenalty = 0
