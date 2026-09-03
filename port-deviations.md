@@ -63,6 +63,213 @@ wired for `TCPInterface`; extended to `RNodeInterface` so a Model-B RNode
 surfaces reasons like "Invalid configuration — TX power may exceed device
 limits" instead of a bare offline flag.
 
+### `Interface.gravity` back-ported from Python RNS (feat/per-contact-routing 2026-09-01)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `interfaceGravity: [String: Int]`
+store, `public static let defaultGravity = 0`, `setInterfaceGravity(_:_:)` / `gravity(of:)`, and a
+new accept branch in `record(entry:)` (**path 2c**) inside the equal-or-better-hops arm. Tests:
+`Tests/ReticulumSwiftTests/PathTableGravityTests.swift`.
+
+**Python reference:** `RNS.Transport.received_announce()`, the `announce_gravity > current_gravity`
+branch — *"If the same announce is received later on an interface with higher gravity, allow
+updating the path table to use this interface instead."* Backed by `Interface.gravity = 0`
+(`RNS/Interfaces/Interface.py:100`), the documented per-interface `gravity` config option, and the
+`default_gravity` / `autoconnect_interface_gravity` globals (`RNS/Reticulum.py`). Verified against
+Python RNS **1.4.2** (`3rdParty/Reticulum`, `b48b96e6`); introduced upstream in `5577e781`,
+*"Basic gravity processing for announces"*.
+
+**Reason:** Category (c) — **a gap in the port, not a deviation from Python.** The swift port was
+written against a Python revision predating gravity, and the mechanism is absent from
+`torlando-tech/reticulum-swift` as well (`git grep -i gravity upstream/main -- Sources` → nothing),
+so this is a back-port rather than a merge.
+
+It is load-bearing here. Once per-peer carrier children exist, a peer is commonly reachable over
+two carriers at the *same* hop count, and the same announce arrives on both. With no affinity term
+the winner is whichever copy landed first — measured across a fleet session as an even split (WiFi
+30 / WebRTC 29 for one peer, 27 / 30 for another, 19 / 11 for a third). The embedder's tier order
+therefore existed only in its own policy layer and never reached routing.
+
+**Deliberately narrow, matching Python.** The branch is gated on `announceEmitted == pathTimebase`,
+so it only ever chooses between two arrivals of one announce. It cannot beat a fresher announce
+(path 2 has already run), cannot beat a shorter path (path 2b has already run), and never touches
+the worse-hops arm — a 3-hop route on a high-affinity interface still loses to a 1-hop route on a
+low-affinity one. Blobs are left untouched, since the announce is one already held; path state is
+reset, as on every accept.
+
+**Storage:** none. Gravity lives in memory and is configured by the embedder at interface
+registration, exactly as `fallbackInterfaceIds` is. The `paths` schema is unchanged, and a table
+whose embedder configures nothing behaves precisely as it did before (every interface reads 0).
+
+**Upstream-worthy:** yes, unreservedly — it is upstream Python behaviour the swift port is missing,
+and it should go to `torlando-tech/reticulum-swift` rather than live here.
+
+### `PathTable.incumbentSilenceSeconds` — worse-hop takeover requires a silent incumbent (feat/per-contact-routing 2026-09-02)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public static var
+incumbentSilenceSeconds: UInt64 = 75`, checked at the head of path 4 in `record(entry:)`.
+Tests: `Tests/ReticulumSwiftTests/PathTableWorseHopSilenceTests.swift`; two pre-existing tests that
+used path 4 as a vehicle were updated (`PathTableHeardInterfacesTests`,
+`PathTableRecordDecisionTests`), and a trace test for the refusal added.
+
+**Python reference:** `RNS/Transport.py` path 4 accepts *any* worse-hop announce carrying a fresher
+emission, unbounded. This is a genuine divergence from the upstream decision tree, not a guard on a
+port addition — the first one in this table that changes a rule Python actually has.
+
+**Reason:** Category (b), field-driven. Freshness alone does not establish that the shorter route
+died; it routinely just means the longer copy arrived first. Session10
+(`AutomatedTests/Results/manual-log-pulls/Session10`) measured **66** path-4 takeovers across five
+devices in four minutes:
+
+| jump | count |
+|---|---|
+| 1h → 2h | 33 |
+| **1h → 3h** | **21** |
+| 2h → 3h | 7 |
+| **2h → 4h** | **4** |
+| 3h → 4h | 1 |
+
+25 of 66 discarded a route for one two or more hops longer. The worked example: a device holding a
+live 1-hop WebRTC link to a peer took a 3-hop WiFi detour on an announce 21 s newer
+(`08:15:56.326 ACCEPT icWifi0-bc524452/3h vs icWebrtc0-1f2ad1ee/1h — path 4 · WORSE HOPS ... emitΔ=21`)
+purely because the direct link had not yet relayed that particular announce. It sat there 29 s
+until `fallbackMaxHopPenalty` rescued it through Bluetooth.
+
+**Design:** the rule keeps working for the case it exists to serve. A peer that genuinely moved
+stops announcing over the old interface, the window is crossed, and path 4 follows it — it just
+demands the evidence first. The liveness signal is `lastHeardByInterface`, written for **every**
+arrival before any early return (including rejected duplicates), so it is a true "is this interface
+still carrying announces" reading rather than "did it last win".
+
+**Skipped on the incumbent's own interface.** A same-interface hop change is exactly the "peer
+moved" case, and that arrival refreshes the sighting itself a few lines earlier, so the check could
+never pass. Without the exemption the rule would freeze every path at its first-seen hop count.
+
+**Why 75 s:** matches `fallbackTakeoverGraceSeconds`, which is already tuned and load-bearing for
+the same judgement ("has this route actually stopped working"). Comfortably above the 21 s gap that
+produced the measured regression. `0` restores Python's unbounded behaviour exactly, and is what the
+trace tests use so they exercise the trace rather than the policy.
+
+**Storage:** none; a static tunable, no schema change.
+
+**Upstream-worthy:** unclear, and deliberately flagged as such. It is a real improvement for a fleet
+with heterogeneous carriers, and it is a behavioural change to a documented Python rule. It should
+not go upstream without a discussion of whether RNS wants hop-aware ranking at all.
+
+### `PathTable.fallbackMaxHopPenalty` — hop bound on the fallback rules (feat/per-contact-routing 2026-09-02)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public static var
+fallbackMaxHopPenalty: Int = 1`, consulted at the head of both arms of the fallback branch in
+`record(entry:)`. Tests: `Tests/ReticulumSwiftTests/PathTableFallbackHopGuardTests.swift`.
+
+**Python reference:** none, and none possible. `RNS.Transport` has no concept of a fallback or
+carrier interface, so it has no rule for this to bound. This is a guard on an existing port
+addition (`fallbackInterfaceIds`), not a divergence from an upstream behaviour.
+
+**Reason:** Category (b). The fallback rules resolve carrier-vs-normal by liveness and freshness
+and are deliberately hop-blind — correct while the two paths are comparable in distance, wrong when
+the normal path is a detour. Session09 (`AutomatedTests/Results/manual-log-pulls/Session09`) caught
+the failure: with the internet-lost pin disabled, a device discarded a live **1-hop** carrier route
+for a **3-hop** normal one on the *same announce* (`emitΔ=0`, decision trace
+`fallback · normal promoted over carrier`), then refused three subsequent 1-hop carrier arrivals
+with `fallback · normal still live (interface connected)`. The 3-hop route pointed at a neighbour
+whose own route pointed back — a two-node forwarding loop that stood for the rest of the session,
+leaving the fleet with no working route to that peer at all.
+
+The guard bounds both directions: a carrier shorter by more than the penalty takes the route before
+any liveness reasoning, and a normal path worse by more than it cannot promote. The promote refusal
+returns `false` rather than falling through, because path 4 would otherwise accept the same
+worse-hop announce on freshness alone.
+
+**Why `1`:** it is the smallest value that separates the two observed cases. 2-hop normal over
+1-hop carrier still promotes — that is the ordinary relayed-TCP-vs-adjacent-BLE case and the entire
+reason for having a fallback set; 3-hop over 1-hop no longer does. A larger value re-admits the
+detour; `0` would let the carrier hold the route for every nearby peer and defeat the fallback
+concept.
+
+**Relationship to [[gravity]]:** disjoint. `Interface.gravity` arbitrates *equal-hop* ties between
+two arrivals of one announce and never reaches the worse-hops arm; this bounds the *carrier-vs-
+normal* rules, which run earlier and are hop-blind. Session09 measured gravity firing 2 times
+fleet-wide against 434 fallback decisions, so on this fleet the fallback rules — not gravity, not
+hop count — are what actually choose the carrier.
+
+**Storage:** none; a static tunable, no schema change, default preserves prior behaviour for any
+table whose embedder registers no fallback interfaces.
+
+**Upstream-worthy:** only alongside `fallbackInterfaceIds` itself, which is a port addition.
+
+### `PathTable.onRecordDecision` route-decision trace [TEMPORARY] (feat/per-contact-routing 2026-09-01)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — new `public nonisolated(unsafe)
+static var onRecordDecision: (@Sendable (String) -> Void)?` plus a private `noteDecision(...)`
+called at all 13 return points of `record(entry:)`. Tests:
+`Tests/ReticulumSwiftTests/PathTableRecordDecisionTests.swift`.
+
+**Python reference:** `RNS.Transport.received_announce()` logs its accept/reject reasoning through
+the shared `RNS.log` firehose at `LOG_DEBUG`. There is no separate sink and no filtering, so the
+lines are unusable in the field: they arrive interleaved with everything else the stack says.
+
+**Reason:** Category (b) — an observation hook for the embedder, with no behavioural effect. The
+port already had `NetworkLog.debug("[RECORD] ...")` at most of these points, but gated two ways:
+on the `RETICULUM_NETWORK_LOG` environment flag (off in fleet builds, since field phones are not
+launched from a harness) and on `newIsFallback || existingIsFallback` (silent whenever both
+candidates are carriers, which is the common case once per-peer children exist). Field sessions
+03-07 therefore recorded *which* route won — a device sitting on a 3-hop detour for eight minutes
+while a live 1-hop link was in its own candidate set — with no way to tell which of the five rules
+installed it. Accept-on-Path-4 and never-hearing-the-1-hop-copy produce the same table and want
+opposite fixes.
+
+The sink is nil by default, so a build that does not opt in pays one optional check per announce
+and builds no strings. Emission is filtered to candidates arriving on a *different* interface than
+the incumbent: `record` runs on every inbound announce and same-interface refreshes dominate it
+without saying anything about route selection.
+
+**Upstream-worthy:** partly. The filtering and the separate sink are the useful parts and would
+suit any embedder; the specific rule names are this port's own (Python has no "Path 2b").
+
+**Remove when:** Phase 1 of the per-contact routing work closes. This is field-test scaffolding and
+goes with the routing log — one grep for `onRecordDecision` and `noteDecision`.
+
+### `PathTable.lastHeardByInterface` carries hop count + `heardInterfaces(for:)` reader (feat/per-contact-routing 2026-09-01)
+
+**Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — `lastHeardByInterface` widened from
+`[Data: [String: Date]]` to `[Data: [String: InterfaceSighting]]`, where the new public
+`PathTable.InterfaceSighting` is `(at: Date, hopCount: UInt8)` with an `isDirect` helper
+(`hopCount <= 1`); new public reader `heardInterfaces(for:) -> [String: InterfaceSighting]`.
+Internal readers (`wasHeardOnInterface`, `normalInterfaceHeardRecently`) updated to read
+`sighting.at`. Tests: `Tests/ReticulumSwiftTests/PathTableHeardInterfacesTests.swift`.
+
+**Python reference:** `RNS.Transport` keeps no per-destination × per-interface arrival map at all;
+the swift port's `lastHeardByInterface` is itself already a port addition (it drives the
+carrier-takeover liveness signal). Python therefore has neither the time nor the hop half of this.
+
+**Reason:** Category (b) — new feature for the swift app surface, and one that can only be
+implemented here. `record(entry:)` is the single point at which *every* candidate route for a
+destination is still visible: it runs the 5-path decision tree, keeps one winner in `paths`, and
+discards the losers. An embedder asking "what are my options for reaching X, and which of them are
+direct?" cannot reconstruct that afterwards from any public surface — the losing candidates are
+gone, and the surviving arrival map answered a time window (`wasHeardOnInterface`) but not a
+distance.
+
+Distance is the load-bearing part. The host app (Analog) acts as a Reticulum transport node, so an
+announce arriving on a carrier interface may have been relayed by a third device — the fleet logs
+503 arrivals at `hops=2` and 149 at `hops=3` on Bluetooth carrier children. Its routing policy is
+"carry as much as possible peer-to-peer", and *peer-to-peer* means carrier interface **and**
+`hopCount <= 1`. Without the hop count on non-winning candidates, that policy cannot be expressed:
+it can see which route was chosen but not whether the alternatives were direct.
+
+`hopCount <= 1` rather than `== 0` is deliberate and matches the port: a peer's own announce is
+`hops = 0` on the wire, but `PathEntry.hopCount` records `1` for a directly reachable destination
+(`ReticulumTransport.swift:1513` sends HEADER_1 when `entry.hopCount == 1`).
+
+**Cost:** In-memory only — `lastHeardByInterface` is never persisted, so there is no schema change,
+no migration and no `KVF` storage impact. The map already existed and was already pruned alongside
+`paths`; this widens its value type and adds one read-only accessor. No behaviour change to ranking,
+rebroadcast or persistence.
+
+**Upstream-worthy:** Yes, as the accessor at least — "what are my candidate routes" is a general
+question and the data is already being collected on the way past. Flagged for the next upstream
+conversation.
+
 ### `TCPInterface.beginTunnelMode(send:)` / `endTunnelMode()` — VPN-extension hook (new feature)
 
 **Sites:** `Sources/ReticulumSwift/Interfaces/TCPInterface.swift` —

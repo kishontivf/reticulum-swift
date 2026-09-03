@@ -72,6 +72,15 @@ public actor PathTable {
     /// behaviour is unaffected.
     private var fallbackInterfaceIds: Set<String> = []
 
+    /// Per-interface *pathing affinity*, mirroring `Interface.gravity` in Python RNS. Higher wins.
+    /// Unset interfaces read as `Self.defaultGravity` (0), which is Python's default, so an
+    /// embedder that configures nothing keeps the old behaviour exactly.
+    ///
+    /// Only ever consulted for the SAME announce arriving on two interfaces — see `record`. It is
+    /// a tiebreak, never an override: it cannot beat a shorter path, a fresher announce, or the
+    /// fallback rules.
+    private var interfaceGravity: [String: Int] = [:]
+
     /// How long (wall-clock seconds) a destination's normal interface may go *silent* — no announce
     /// received on any non-fallback interface — before the carrier is allowed to take the route over.
     /// Liveness, not freshness: while the peer's normal announces keep arriving (even though the
@@ -89,6 +98,38 @@ public actor PathTable {
     /// removed; the pin (offline hold) and the 75s liveness window (anti-flap) are the real guards.
     public static var fallbackPromoteMaxLagSeconds: UInt64 = 90
 
+    /// How many extra hops a normal (non-fallback) path may cost, relative to a carrier path for the
+    /// same destination, and still out-rank it.
+    ///
+    /// The fallback rules below are deliberately hop-blind — freshness and liveness decide — which is
+    /// right while the two paths are comparable in distance. It is wrong when the normal path is a
+    /// long detour: Session09 saw a device discard a live 1-hop carrier route for a 3-hop normal one
+    /// on the *same announce* (`emitΔ=0`), then refuse to go back while that 3-hop route pointed at a
+    /// neighbour whose own route pointed back — a two-node forwarding loop that stood for the rest of
+    /// the session. A carrier shorter by more than this penalty wins outright, and a normal path
+    /// worse by more than it cannot promote.
+    ///
+    /// `0` — strictly shorter wins, in both directions.
+    ///
+    /// At `0` the two arms are exact mirrors and hop count decides, w  hich is also what makes the
+    /// result stable rather than flapping: the shorter path is refused entry from one side and
+    /// refuses displacement from the other. Session09's forwarding loop is still excluded — a 3-hop
+    /// normal path against a 1-hop carrier is more of a detour at `0` than it was at `1`.
+    public static var fallbackMaxHopPenalty: Int = 0
+
+    /// How long the incumbent's interface must have been SILENT for this destination before a
+    /// worse-hop announce may take the route (path 4).
+    ///
+    /// Python accepts any worse-hop announce that carries a fresher emission, unbounded
+    /// (`RNS/Transport.py` path 4). That is reasonable upstream, where every link is roughly
+    /// equivalent, and wrong for a carrier fleet where a 1-hop adjacent link and a 3-hop relay chain
+    /// are not.
+    /// Freshness alone does not establish that the shorter route is gone; silence does. A peer that
+    /// genuinely moved stops announcing over the old interface, so the window is still crossed and
+    /// path 4 still follows it — it just demands the evidence first. Set to `0` to restore Python's
+    /// unbounded behaviour.
+    public static var incumbentSilenceSeconds: UInt64 = 75
+
     /// Destinations pinned to their fallback interface: while pinned, announces from NON-fallback
     /// interfaces are rejected, so the destination stays on the fallback path and can't be pulled
     /// back onto a stale/relayed normal-interface route. The embedder pins a peer it knows is only
@@ -96,11 +137,37 @@ public actor PathTable {
     /// transport node may keep re-announcing) and unpins it when that's no longer true.
     private var fallbackPinnedDestinations: Set<Data> = []
 
-    /// Per-destination, per-interface wall-clock time of the last announce received on that interface.
+    /// One announce arrival, as this table remembers it after ranking has thrown the rest away.
+    ///
+    /// **PORT DEVIATION** — python RNS keeps only the arrival *time* here. The hop count is added
+    /// because `record()` is the single place every candidate route is still visible: it decides a
+    /// winner and discards the losers, so anything a caller might later want to know about a losing
+    /// candidate has to be captured on the way past or it is gone. Distance is the specific thing
+    /// an embedder cannot recover afterwards, and "is this route direct or relayed" cannot be
+    /// answered without it. See `port-deviations.md`.
+    public struct InterfaceSighting: Sendable, Equatable {
+        /// Local wall-clock time the announce arrived.
+        public let at: Date
+        /// Hops to the destination as recorded, i.e. `PathEntry.hopCount`. `1` means directly
+        /// reachable — a peer's own announce is `0` on the wire but is recorded as `1` — so
+        /// `<= 1` is the directness test and `>= 2` means the announce came through a relay.
+        public let hopCount: UInt8
+
+        public init(at: Date, hopCount: UInt8) {
+            self.at = at
+            self.hopCount = hopCount
+        }
+
+        public var isDirect: Bool { hopCount <= 1 }
+    }
+
+    /// Per-destination, per-interface record of the last announce received on that interface.
     /// Drives the liveness-based carrier takeover (see `fallbackTakeoverGraceSeconds`): the normal
     /// path counts as "alive" while some non-fallback interface here was heard within the takeover
     /// window, regardless of how often the carrier re-announces. Pruned alongside `paths`.
-    private var lastHeardByInterface: [Data: [String: Date]] = [:]
+    ///
+    /// In memory only — never persisted — so widening it carries no schema or migration cost.
+    private var lastHeardByInterface: [Data: [String: InterfaceSighting]] = [:]
 
     /// Interface IDs whose transport link is currently `.connected`, pushed periodically by the
     /// transport (`setConnectedInterfaces`). Used as a *connectivity* liveness signal for the
@@ -287,6 +354,34 @@ public actor PathTable {
         pathStates[destinationHash] = TransportConstants.PATH_STATE_RESPONSIVE
     }
 
+    // MARK: - Record decision trace [TEMPORARY]
+
+    /// Sink for the per-announce route decision, so a field session can be replayed rather than
+    /// believed. Nil by default — the embedder points it at its own log (Intercom: the routing
+    /// log). A normal build pays one optional check per announce.
+    ///
+    /// Deliberately NOT `NetworkLog`: that one is gated on the `RETICULUM_NETWORK_LOG` environment
+    /// flag and is off in fleet builds, which is exactly why the record decisions were invisible
+    /// across field sessions 03-07 — we could see which route won but never which rule installed
+    /// it. Delete alongside the routing log.
+    public nonisolated(unsafe) static var onRecordDecision: (@Sendable (String) -> Void)?
+
+    /// Emit one decision line — but only for a candidate that could actually MOVE the route, i.e.
+    /// one arriving on a different interface than the incumbent. Same-interface refreshes are the
+    /// overwhelming majority of `record` calls and say nothing about route selection; logging them
+    /// would bury the handful of lines that matter and roll the log generation in minutes.
+    private func noteDecision(_ verdict: String,
+                              _ keyHex: String,
+                              _ entry: PathEntry,
+                              _ existing: PathEntry?,
+                              _ rule: String) {
+        guard let sink = Self.onRecordDecision else { return }
+        guard existing?.interfaceId != entry.interfaceId else { return }
+        let incumbent = existing.map { "\($0.interfaceId)/\($0.hopCount)h" } ?? "none"
+        sink("[RECORD] \(verdict) \(keyHex): \(entry.interfaceId)/\(entry.hopCount)h"
+            + " vs \(incumbent) — \(rule)")
+    }
+
     // MARK: - Record (Python 5-path decision tree)
 
     /// Record a path entry using Python-compatible acceptance logic.
@@ -303,6 +398,24 @@ public actor PathTable {
     ///
     /// - Parameter entry: Path entry to record
     /// - Returns: true if path was recorded, false if rejected
+    /// Python RNS default for an interface that was never configured (`Interface.gravity = 0`).
+    public static let defaultGravity = 0
+
+    /// Set an interface's pathing affinity. Positive values increase it, negative decrease it,
+    /// matching the `gravity` interface option in Python RNS. See `interfaceGravity`.
+    public func setInterfaceGravity(_ interfaceId: String, _ gravity: Int) {
+        if gravity == Self.defaultGravity {
+            interfaceGravity.removeValue(forKey: interfaceId)
+        } else {
+            interfaceGravity[interfaceId] = gravity
+        }
+    }
+
+    /// An interface's pathing affinity, or the default when it was never configured.
+    public func gravity(of interfaceId: String) -> Int {
+        interfaceGravity[interfaceId] ?? Self.defaultGravity
+    }
+
     /// Mark (or unmark) an interface as a low-priority fallback. See `fallbackInterfaceIds`.
     public func setFallbackInterface(_ interfaceId: String, isFallback: Bool = true) {
         if isFallback {
@@ -326,12 +439,22 @@ public actor PathTable {
         Array(fallbackInterfaceIds)
     }
 
+    /// Every interface `destination`'s announces have arrived on, with when and how far away.
+    ///
+    /// The candidate set Reticulum's own ranking discards: `paths` keeps one winner per
+    /// destination, so without this an embedder can see which route was chosen but not which
+    /// routes were *available*, nor whether any of them was direct. Returns an empty dictionary
+    /// for a destination never heard from.
+    public func heardInterfaces(for destination: Data) -> [String: InterfaceSighting] {
+        lastHeardByInterface[destination] ?? [:]
+    }
+
     /// Whether `destination`'s announce was heard on `interfaceId` within the given window — i.e.
     /// the peer is currently reachable over that specific (e.g. carrier) interface. Used to gate a
     /// dual-dispatch carrier copy so it's only sent to a peer that is actually nearby on the carrier.
     public func wasHeardOnInterface(_ destination: Data, interfaceId: String, within seconds: TimeInterval) -> Bool {
-        guard let at = lastHeardByInterface[destination]?[interfaceId] else { return false }
-        return Date().timeIntervalSince(at) <= seconds
+        guard let sighting = lastHeardByInterface[destination]?[interfaceId] else { return false }
+        return Date().timeIntervalSince(sighting.at) <= seconds
     }
 
     /// Whether the destination's current best path already routes over a fallback (carrier)
@@ -357,8 +480,8 @@ public actor PathTable {
     private func normalInterfaceHeardRecently(_ destination: Data, within seconds: UInt64) -> Bool {
         guard let heard = lastHeardByInterface[destination] else { return false }
         let cutoff = Date().addingTimeInterval(-Double(seconds))
-        for (interfaceId, at) in heard where !fallbackInterfaceIds.contains(interfaceId) {
-            if at >= cutoff { return true }
+        for (interfaceId, sighting) in heard where !fallbackInterfaceIds.contains(interfaceId) {
+            if sighting.at >= cutoff { return true }
         }
         return false
     }
@@ -377,6 +500,7 @@ public actor PathTable {
         // taking over (the 90s+ takeover seen when only silence-timeout drove it). While pinned only
         // the carrier can hold the route; the embedder clears the pin when the peer signals it's back.
         if fallbackPinnedDestinations.contains(key), !fallbackInterfaceIds.contains(entry.interfaceId) {
+            noteDecision("IGNORE", keyHex, entry, paths[key], "pin · dest pinned to carrier")
             logger.debug("Ignored \(keyHex): dest pinned to carrier, rejecting normal \(entry.interfaceId)")
             NetworkLog.log("[FALLBACK] REJECT \(keyHex): \(entry.interfaceId) — dest PINNED to carrier (peer offline)")
             return false
@@ -385,7 +509,8 @@ public actor PathTable {
         // Track when we last heard this destination on each interface (local wall-clock). This is the
         // liveness signal the carrier-takeover decision uses instead of announce-emission freshness —
         // recorded before any early return so it captures every arrival, including duplicate blobs.
-        lastHeardByInterface[key, default: [:]][entry.interfaceId] = Date()
+        lastHeardByInterface[key, default: [:]][entry.interfaceId] =
+            InterfaceSighting(at: Date(), hopCount: entry.hopCount)
 
         guard let existing = paths[key] else {
             // Path 1: Unknown destination → accept
@@ -393,6 +518,7 @@ public actor PathTable {
             pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
             saveToDatabase(entry)
             let nextHopStr = entry.nextHop?.prefix(8).map { String(format: "%02x", $0) }.joined() ?? "nil"
+            noteDecision("ACCEPT", keyHex, entry, nil, "path 1 · unknown destination")
             logger.info("Recorded NEW path to \(keyHex), hops=\(entry.hopCount), nextHop=\(nextHopStr)")
             pathUpdateContinuation?.yield(entry)
             return true
@@ -415,6 +541,26 @@ public actor PathTable {
         if newIsFallback != existingIsFallback {
             let emitDelta = Int64(bitPattern: announceEmitted) - Int64(bitPattern: pathTimebase)
             if newIsFallback {
+                // Hop guard (see `fallbackMaxHopPenalty`): before any liveness reasoning, a carrier
+                // that is shorter than the incumbent normal path by more than the allowed penalty
+                // takes the route. Liveness cannot justify holding a long detour over a demonstrably
+                // direct link.
+                if Int(entry.hopCount) + Self.fallbackMaxHopPenalty < Int(existing.hopCount) {
+                    markPathUnknownState(key)
+                    var updated = entry
+                    updated.randomBlobs = mergeBlobs(existing: existingBlobs, new: newBlob)
+                    updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                    paths[key] = updated
+                    saveToDatabase(updated)
+                    let detail = "carrier \(entry.interfaceId) \(entry.hopCount)h decisively shorter than"
+                        + " normal \(existing.interfaceId) \(existing.hopCount)h"
+                        + " (penalty \(Self.fallbackMaxHopPenalty))"
+                    noteDecision("ACCEPT", keyHex, entry, existing, "fallback · \(detail)")
+                    logger.info("Adopted \(keyHex): \(detail)")
+                    NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): \(detail) → carrier takes over")
+                    pathUpdateContinuation?.yield(updated)
+                    return true
+                }
                 // Candidate = carrier, incumbent = normal. Take over only once the normal path has
                 // gone SILENT — no announce on any non-fallback interface for the takeover window.
                 // Liveness beats freshness: the carrier re-announces far more often than the periodic
@@ -456,6 +602,7 @@ public actor PathTable {
                     || Date().timeIntervalSince(existing.timestamp) < Double(window))
                 if normalLive {
                     let reason = incumbentNormalConnected ? "interface connected" : "heard < \(window)s ago"
+                    noteDecision("IGNORE", keyHex, entry, existing, "fallback · normal still live (\(reason))")
                     logger.debug("Ignored \(keyHex): normal \(existing.interfaceId) still live; carrier \(entry.interfaceId) stands by")
                     NetworkLog.log("[FALLBACK] REJECT \(keyHex): normal \(existing.interfaceId) \(reason) "
                         + "(alive) → keep TCP, carrier \(entry.interfaceId) stands by")
@@ -468,6 +615,25 @@ public actor PathTable {
                 NetworkLog.log("[FALLBACK] ACCEPT \(keyHex): normal \(existing.interfaceId) \(takeoverReason) "
                     + "→ carrier \(entry.interfaceId) takes over")
             } else {
+                // Hop guard (see `fallbackMaxHopPenalty`): the promote below is deliberately
+                // unconditional, which is right when the normal path is a comparable route and wrong
+                // when it is a detour. Refuse outright rather than falling through — Path 4 would
+                // otherwise accept the same worse-hop announce on freshness alone.
+                // ...but only while the carrier route is still believed to work. A demoted
+                // incumbent is precisely the case `checkPath` exists to report, and refusing here
+                // returns before path 5 (`same emission, incumbent unresponsive`) is ever reached
+                // — so without this escape a dead carrier route strands the destination until the
+                // silence gate expires, with the one announce that could replace it turned away.
+                if Int(entry.hopCount) > Int(existing.hopCount) + Self.fallbackMaxHopPenalty,
+                   !isPathUnresponsive(key) {
+                    let detail = "normal \(entry.interfaceId) \(entry.hopCount)h is a detour around"
+                        + " carrier \(existing.interfaceId) \(existing.hopCount)h"
+                        + " (penalty \(Self.fallbackMaxHopPenalty))"
+                    noteDecision("IGNORE", keyHex, entry, existing, "fallback · \(detail)")
+                    logger.debug("Ignored \(keyHex): \(detail)")
+                    NetworkLog.log("[FALLBACK] REJECT \(keyHex): \(detail) → keep carrier")
+                    return false
+                }
                 // Candidate = normal, incumbent = fallback (carrier). Reaching here means the dest is
                 // NOT pinned (a pinned dest's normal announces are rejected at the top of record), i.e.
                 // the peer is considered ONLINE — so TCP reclaims the route from the carrier
@@ -489,6 +655,7 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
+                noteDecision("ACCEPT", keyHex, entry, existing, "fallback · normal promoted over carrier, emitΔ=\(emitDelta)")
                 logger.info("Promoted \(keyHex): \(entry.interfaceId) (hops \(entry.hopCount)) replaces fallback \(existing.interfaceId)")
                 pathUpdateContinuation?.yield(updated)
                 return true
@@ -505,6 +672,7 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
+                noteDecision("ACCEPT", keyHex, entry, existing, "path 2 · equal/better hops + fresh emit")
                 logger.info("Updated \(keyHex): equal/better hops (\(entry.hopCount) <= \(existing.hopCount)), fresh emit")
                 if newIsFallback || existingIsFallback {
                     NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) equal/better hops (\(entry.hopCount)<=\(existing.hopCount)) + fresh emit")
@@ -525,6 +693,7 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
+                noteDecision("ACCEPT", keyHex, entry, existing, "path 2b · shorter hops, same announce")
                 logger.info("Upgraded \(keyHex): shorter path \(entry.hopCount) < \(existing.hopCount) for the same announce")
                 if newIsFallback || existingIsFallback {
                     NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) shorter path (\(entry.hopCount)<\(existing.hopCount)) same announce")
@@ -532,6 +701,38 @@ public actor PathTable {
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
+            // Path 2c: SAME announce (identical emission timestamp), arriving on an interface with
+            // higher pathing affinity than the incumbent's. Port of Python RNS `received_announce`,
+            // the `announce_gravity > current_gravity` branch: "If the same announce is received
+            // later on an interface with higher gravity, allow updating the path table to use this
+            // interface instead."
+            //
+            // This is the ONLY place carrier preference enters routing. It is a tiebreak and nothing
+            // more: the emission timestamps must match exactly (a staler announce never wins, however
+            // preferred its interface), Path 2 has already taken anything fresher, and Path 2b has
+            // already taken anything strictly nearer. Without it, two carriers reaching the same peer
+            // at the same distance trade the route on arrival order alone — measured across a fleet
+            // session as an even split between WiFi and WebRTC for the same 1-hop peer.
+            //
+            // Blobs are left untouched: the announce is one we already hold, so Python appends
+            // nothing here either. Path state is reset, as it is on every accept.
+            if announceEmitted == pathTimebase,
+               gravity(of: entry.interfaceId) > gravity(of: existing.interfaceId) {
+                noteDecision("ACCEPT", keyHex, entry, existing,
+                             "path 2c · higher gravity (\(gravity(of: existing.interfaceId))"
+                                + "→\(gravity(of: entry.interfaceId))), same announce")
+                markPathUnknownState(key)
+                var updated = entry
+                updated.randomBlobs = existingBlobs
+                updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
+                paths[key] = updated
+                saveToDatabase(updated)
+                logger.info("Updated \(keyHex): higher gravity interface \(entry.interfaceId) for the same announce")
+                pathUpdateContinuation?.yield(updated)
+                return true
+            }
+            noteDecision("IGNORE", keyHex, entry, existing, "path 2 · equal/better hops but duplicate blob or stale emit"
+                + " (isNewBlob=\(isNewBlob) emitΔ=\(Int64(bitPattern: announceEmitted) - Int64(bitPattern: pathTimebase)))")
             logger.debug("Ignored \(keyHex): equal/better hops but duplicate blob or stale emit")
             if newIsFallback || existingIsFallback {
                 NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — equal/better hops but DUPLICATE blob or stale emit")
@@ -552,6 +753,7 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
+                noteDecision("ACCEPT", keyHex, entry, existing, "path 3 · worse hops, incumbent expired")
                 logger.info("Updated \(keyHex): expired path replaced, hops=\(entry.hopCount)")
                 if newIsFallback || existingIsFallback {
                     NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) replaced EXPIRED path hops=\(entry.hopCount)")
@@ -559,6 +761,7 @@ public actor PathTable {
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
+            noteDecision("IGNORE", keyHex, entry, existing, "path 3 · expired but duplicate blob")
             logger.debug("Ignored \(keyHex): expired path but duplicate blob")
             if newIsFallback || existingIsFallback {
                 NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — expired path but DUPLICATE blob")
@@ -569,6 +772,28 @@ public actor PathTable {
         // Path 4: Not expired + fresher emission + new blob
         if announceEmitted > pathTimebase {
             if isNewBlob {
+                // Silence requirement (see `incumbentSilenceSeconds`): a fresher announce that
+                // took a LONGER route is not evidence the shorter one died — it is routinely just the
+                // copy that arrived first. Require the incumbent's interface to have stopped carrying
+                // this destination's announces before handing the route to a longer path.
+                //
+                // Skipped when the candidate arrives on the incumbent's own interface: the sighting
+                // was refreshed by this very arrival a few lines above, so the check could never pass,
+                // and a same-interface hop change is exactly the "peer moved" case path 4 is for.
+                if entry.interfaceId != existing.interfaceId,
+                   Self.incumbentSilenceSeconds > 0,
+                   wasHeardOnInterface(key, interfaceId: existing.interfaceId,
+                                       within: Double(Self.incumbentSilenceSeconds)) {
+                    noteDecision("IGNORE", keyHex, entry, existing,
+                                 "path 4 · worse hops (\(existing.hopCount)h→\(entry.hopCount)h) but "
+                                    + "incumbent \(existing.interfaceId) still heard within "
+                                    + "\(Self.incumbentSilenceSeconds)s")
+                    logger.debug("Ignored \(keyHex): worse-hop takeover refused, incumbent still live")
+                    NetworkLog.log("[RECORD] REJECT \(keyHex): \(entry.interfaceId) "
+                        + "\(entry.hopCount)h vs incumbent \(existing.interfaceId) "
+                        + "\(existing.hopCount)h — incumbent not silent")
+                    return false
+                }
                 markPathUnknownState(key)
                 let merged = mergeBlobs(existing: existingBlobs, new: newBlob)
                 var updated = entry
@@ -576,6 +801,8 @@ public actor PathTable {
                 updated.pathState = TransportConstants.PATH_STATE_UNKNOWN
                 paths[key] = updated
                 saveToDatabase(updated)
+                noteDecision("ACCEPT", keyHex, entry, existing, "path 4 · WORSE HOPS on fresher emission,"
+                    + " emitΔ=\(Int64(bitPattern: announceEmitted) - Int64(bitPattern: pathTimebase))")
                 logger.info("Updated \(keyHex): fresher emission with worse hops (\(entry.hopCount) > \(existing.hopCount))")
                 if newIsFallback || existingIsFallback {
                     NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) fresher emission, worse hops (\(entry.hopCount)>\(existing.hopCount))")
@@ -583,6 +810,7 @@ public actor PathTable {
                 pathUpdateContinuation?.yield(updated)
                 return true
             }
+            noteDecision("IGNORE", keyHex, entry, existing, "path 4 · fresher emission but duplicate blob")
             logger.debug("Ignored \(keyHex): fresher emission but duplicate blob")
             if newIsFallback || existingIsFallback {
                 NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — fresher emission but DUPLICATE blob")
@@ -598,6 +826,7 @@ public actor PathTable {
             paths[key] = updated
             pathStates[key] = TransportConstants.PATH_STATE_UNKNOWN
             saveToDatabase(updated)
+            noteDecision("ACCEPT", keyHex, entry, existing, "path 5 · same emission, incumbent unresponsive")
             logger.info("Updated \(keyHex): same emission but path was unresponsive")
             if newIsFallback || existingIsFallback {
                 NetworkLog.debug("[RECORD] ACCEPT \(keyHex): \(entry.interfaceId) same emission, prior path unresponsive")
@@ -606,6 +835,7 @@ public actor PathTable {
             return true
         }
 
+        noteDecision("IGNORE", keyHex, entry, existing, "no rule · worse hops, not expired/fresher/unresponsive")
         logger.debug("Ignored \(keyHex): worse hops, not expired, not fresher, not unresponsive")
         if newIsFallback || existingIsFallback {
             NetworkLog.debug("[RECORD] IGNORE \(keyHex): \(entry.interfaceId) vs \(existing.interfaceId) — worse hops, not expired/fresher/unresponsive")

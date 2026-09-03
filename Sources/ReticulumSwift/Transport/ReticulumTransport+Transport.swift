@@ -186,6 +186,11 @@ extension ReticulumTransport {
             // ⚠️ TEMPORARY / DEV-ONLY — `from=` ingress added for the transport-events log path reconstruction; revert with the feature.
             onDiagnostic?("[TRANSPORT] Forwarded LINKREQUEST link=\(linkIdHex()) from=\(interfaceId) → \(outboundInterfaceId) nextHop=\(nextHopHex()) hops=\(newHops)")
             transportExtLogger.info("Forwarded LINKREQUEST link=\(linkIdHex()) dest=\(destHex()) via=\(outboundInterfaceId) hops=\(newHops)")
+            // ⚠️ LOCAL DIVERGENCE — typed relay tally; see `RelayTrafficEvent`.
+            onRelayTraffic?(RelayTrafficEvent(kind: .linkRequest,
+                                              ingressInterfaceId: interfaceId,
+                                              egressInterfaceId: outboundInterfaceId,
+                                              bytes: forwardedRaw.count))
         } catch {
             // Failed to forward — remove link table entry
             linkTable.removeValue(forKey: linkId)
@@ -288,6 +293,11 @@ extension ReticulumTransport {
 
             onDiagnostic?("[TRANSPORT] Forwarded LINKPROOF link=\(linkIdHex()) → \(linkEntry.receivingInterfaceId) hops=\(newHops)")
             transportExtLogger.info("Forwarded LINKPROOF link=\(linkIdHex()) via=\(linkEntry.receivingInterfaceId) hops=\(newHops)")
+            // ⚠️ LOCAL DIVERGENCE — typed relay tally; see `RelayTrafficEvent`.
+            onRelayTraffic?(RelayTrafficEvent(kind: .linkProof,
+                                              ingressInterfaceId: interfaceId,
+                                              egressInterfaceId: linkEntry.receivingInterfaceId,
+                                              bytes: forwardedRaw.count))
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward LINKPROOF: \(error)")
         }
@@ -363,6 +373,11 @@ extension ReticulumTransport {
             try await sendToInterface(forwardedRaw, interfaceId: targetInterfaceId)
             // ⚠️ TEMPORARY / DEV-ONLY — `from=` ingress added for the transport-events log path reconstruction; revert with the feature.
             onDiagnostic?("[TRANSPORT] Forwarded link DATA link=\(linkIdHex()) from=\(interfaceId) → \(targetInterfaceId) hops=\(hopsPostIncrement)")
+            // ⚠️ LOCAL DIVERGENCE — typed relay tally; see `RelayTrafficEvent`.
+            onRelayTraffic?(RelayTrafficEvent(kind: .linkData,
+                                              ingressInterfaceId: interfaceId,
+                                              egressInterfaceId: targetInterfaceId,
+                                              bytes: forwardedRaw.count))
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward link DATA: \(error)")
         }
@@ -431,6 +446,11 @@ extension ReticulumTransport {
             let hashHex = packetHash.map { String(format: "%02x", $0) }.joined()
             onDiagnostic?("[TRANSPORT] Forwarded DATA dest=\(destHex()) hash=\(hashHex) from=\(interfaceId) → \(outboundInterfaceId) hops=\(newHops)")
             transportExtLogger.info("Forwarded DATA dest=\(destHex()) via=\(outboundInterfaceId) hops=\(newHops)")
+            // ⚠️ LOCAL DIVERGENCE — typed relay tally; see `RelayTrafficEvent`.
+            onRelayTraffic?(RelayTrafficEvent(kind: .dataPacket,
+                                              ingressInterfaceId: interfaceId,
+                                              egressInterfaceId: outboundInterfaceId,
+                                              bytes: forwardedRaw.count))
         } catch {
             reverseTable.removeValue(forKey: packetHash)
             onDiagnostic?("[TRANSPORT] Failed to forward DATA: \(error)")
@@ -468,6 +488,11 @@ extension ReticulumTransport {
             // packet's `hash=`) for transport-events log path reconstruction; revert with the feature.
             onDiagnostic?("[TRANSPORT] Forwarded DATA PROOF proofFor=\(proofForHex()) from=\(interfaceId) → \(reverseEntry.receivingInterfaceId) hops=\(newHops)")
             transportExtLogger.info("Forwarded DATA PROOF \(proofDestHex()) via=\(reverseEntry.receivingInterfaceId) hops=\(newHops)")
+            // ⚠️ LOCAL DIVERGENCE — typed relay tally; see `RelayTrafficEvent`.
+            onRelayTraffic?(RelayTrafficEvent(kind: .dataProof,
+                                              ingressInterfaceId: interfaceId,
+                                              egressInterfaceId: reverseEntry.receivingInterfaceId,
+                                              bytes: forwardedRaw.count))
         } catch {
             onDiagnostic?("[TRANSPORT] Failed to forward DATA PROOF: \(error)")
         }
