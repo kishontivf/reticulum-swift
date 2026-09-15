@@ -1,5 +1,17 @@
 # ReticulumSwift
 
+This repo is an experimental swift port of reticulum. It's almost completely AI generated. You probably shouldn't use this.
+
+When I first set out to create this port, development of reticulum had slowed significantly, and was even declared to be mostly done. Since then, development pace has picked up considerably, and as a result there is no longer a long-static version to aim at for parity. I simply haven't had the time I thought I would to close the parity gaps that existed against older versions of RNS, much less to implement the newer features. I will still update this when I can, especially to close known discrepancies against the reference implementation, but it will not be in my top 3 focuses for some considerable time.
+
+Additionally, I have since discovered Beeware as a viable method to embed python (and RNS) into iOS apps. The iOS version of Columba currently uses this method. If for some reason I run into blockers using python in Columba-iOS, I am more likely to use atterman's microReticulum as an alternative than this reticulum-swift implementation.
+
+If you'd like to contribute fixes to this repo, please also see the reticulum-conformance suite linked in the action badge below; I have been capturing as much as I can in that suite so that it may someday act as a comprehensive, language-agnostic test suite for any one else foolhardy enough to attempt vibe coding a reticulum port in their language of choice.
+
+Thanks for reading. The rest of this page is written by the LLM and is probably full of inaccuracies.
+
+\- Torlando
+
 [![CI](https://github.com/torlando-tech/reticulum-swift/actions/workflows/ci.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift/actions/workflows/ci.yml)
 [![Conformance](https://github.com/torlando-tech/reticulum-swift/actions/workflows/conformance.yml/badge.svg)](https://github.com/torlando-tech/reticulum-swift/actions/workflows/conformance.yml)
 
