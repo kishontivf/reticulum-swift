@@ -103,6 +103,17 @@ whose embedder configures nothing behaves precisely as it did before (every inte
 **Upstream-worthy:** yes, unreservedly — it is upstream Python behaviour the swift port is missing,
 and it should go to `torlando-tech/reticulum-swift` rather than live here.
 
+### `sendFallbackCopy` skips a direct best route (2026-09-21)
+
+**Sites:** `ReticulumTransport.sendFallbackCopy` — returns early when the best path's
+`hopCount <= 1`. Tests: `TransportFallbackCopyTests.swift`.
+
+**Reason:** the carrier copy (no Python counterpart — the whole method is ours) exists for a
+*relayed* path that resolves but never delivers (5G behind CGNAT). A direct normal route (WiFi /
+WebRTC child) has no relay to fail, so copying onto BLE only spent BLE airtime on every message.
+
+**Upstream-worthy:** no — the dual-dispatch feature itself is embedder-specific.
+
 ### Path 5 refuses a hop downgrade — unresponsive is not evidence about hop count (2026-09-03)
 
 **Sites:** `Sources/ReticulumSwift/Routing/PathTable.swift` — a guard at the head of path 5 in

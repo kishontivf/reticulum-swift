@@ -63,13 +63,10 @@ public actor PathTable {
     /// Paths indexed by destination hash (in-memory cache)
     private var paths: [Data: PathEntry] = [:]
 
-    /// Interfaces treated as low-priority *fallback* links (configured by the embedder). A path on
-    /// a normal interface always out-ranks a path on a fallback interface for the same destination
-    /// — regardless of hop count — and a fallback path is only kept while it's the sole path.
-    /// This is a generic routing knob; the embedder decides which interfaces are fallback (e.g. an
-    /// app's virtual BLE carrier, so TCP is preferred when it exists and the carrier is used only
-    /// when there's no other route). Hop counts are never altered, so direct-vs-routed send
-    /// behaviour is unaffected.
+    /// Interfaces treated as low-priority *fallback* links (configured by the embedder, e.g. an
+    /// app's virtual BLE carrier). Against a normal interface: strictly fewer hops wins (see
+    /// `fallbackMaxHopPenalty`); at equal hops the normal path wins and the fallback takes over
+    /// only once the normal path is dead or unresponsive. Hop counts are never altered.
     private var fallbackInterfaceIds: Set<String> = []
 
     /// Per-interface *pathing affinity*, mirroring `Interface.gravity` in Python RNS. Higher wins.

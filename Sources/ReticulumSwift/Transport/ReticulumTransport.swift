@@ -1990,13 +1990,21 @@ public actor ReticulumTransport {
     /// peer even when the normal (TCP) route can't actually deliver to it (e.g. a 5G peer behind
     /// carrier NAT) — without waiting for the delivery-failure demotion to reroute. The receiver
     /// dedups by packet hash, so the duplicate is harmless. Only fires when the destination was
-    /// recently heard on the carrier (peer physically nearby) and the normal route isn't already the
-    /// carrier (else it would just double-send over the same link).
+    /// recently heard on the carrier (peer physically nearby) and the best route is a RELAYED
+    /// normal path (2+ hops) — a direct normal route already reaches the peer, and a carrier
+    /// route would just double-send over the same link.
     public func sendFallbackCopy(packet: Packet, heardWithin: TimeInterval = 120) async {
         let dest = packet.destination
         let destHex = dest.prefix(8).map { String(format: "%02x", $0) }.joined()
         if await pathTable.isBestPathFallback(dest) {
             NetworkLog.debug("[DUAL] \(destHex): skipped — best path already on carrier")
+            return
+        }
+        // The 5G-behind-CGNAT failure this copy covers is a relayed path that resolves but never
+        // delivers. A direct route (e.g. WiFi or WebRTC to the peer) has no relay to fail, so
+        // copying onto the slowest link would only cost BLE airtime.
+        if let entry = await pathTable.lookup(destinationHash: dest), entry.hopCount <= 1 {
+            NetworkLog.debug("[DUAL] \(destHex): skipped — best path \(entry.interfaceId) is direct")
             return
         }
         let fallbackIds = await pathTable.fallbackInterfaceIdsList()
